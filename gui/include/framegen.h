@@ -63,9 +63,9 @@ public:
 
     // Flow backend only: analyse motion at 1/2 instead of 1/4 resolution.
     void setFlowHighQuality(bool high);
-    // DLSS Frame Generation: per-pixel motion vectors from Flow's motion
-    // search (true, default) or zero motion (false). Uses the Flow quality.
-    void setDlssFlowMotion(bool enabled);
+    // DLSS Frame Generation motion vectors: 0 zero motion, 1 Flow's motion
+    // search (default), 2 the same with the opposite sign. Uses the Flow quality.
+    void setDlssMotion(int mode);
     // NVIDIA VFG model: 0 Low, 1 Medium, 2 High.
     void setVfgMode(int mode);
 

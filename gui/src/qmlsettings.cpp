@@ -1156,17 +1156,17 @@ void QmlSettings::setFrameGenFlowHighQuality(bool high)
     emit frameGenFlowHighQualityChanged();
 }
 
-bool QmlSettings::frameGenDlssFlowMotion() const
+int QmlSettings::frameGenDlssMotion() const
 {
-    return settings->GetFrameGenDlssFlowMotion();
+    return settings->GetFrameGenDlssMotion();
 }
 
-void QmlSettings::setFrameGenDlssFlowMotion(bool enabled)
+void QmlSettings::setFrameGenDlssMotion(int mode)
 {
-    if (enabled == settings->GetFrameGenDlssFlowMotion())
+    if (mode == settings->GetFrameGenDlssMotion())
         return;
-    settings->SetFrameGenDlssFlowMotion(enabled);
-    emit frameGenDlssFlowMotionChanged();
+    settings->SetFrameGenDlssMotion(mode);
+    emit frameGenDlssMotionChanged();
 }
 
 bool QmlSettings::frameGenFsrSupported() const

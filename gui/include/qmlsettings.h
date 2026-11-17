@@ -117,7 +117,7 @@ class QmlSettings : public QObject
 	Q_PROPERTY(int rcasStrength READ rcasStrength WRITE setRcasStrength NOTIFY rcasStrengthChanged)
 	Q_PROPERTY(bool ambientBorderSupported READ ambientBorderSupported CONSTANT)
 	Q_PROPERTY(bool frameGenFlowHighQuality READ frameGenFlowHighQuality WRITE setFrameGenFlowHighQuality NOTIFY frameGenFlowHighQualityChanged)
-	Q_PROPERTY(bool frameGenDlssFlowMotion READ frameGenDlssFlowMotion WRITE setFrameGenDlssFlowMotion NOTIFY frameGenDlssFlowMotionChanged)
+	Q_PROPERTY(int frameGenDlssMotion READ frameGenDlssMotion WRITE setFrameGenDlssMotion NOTIFY frameGenDlssMotionChanged)
 	Q_PROPERTY(bool placeboDeinterlaceEnabled READ placeboDeinterlaceEnabled WRITE setPlaceboDeinterlaceEnabled NOTIFY placeboDeinterlaceEnabledChanged)
 	Q_PROPERTY(int placeboDeinterlacePreset READ placeboDeinterlacePreset WRITE setPlaceboDeinterlacePreset NOTIFY placeboDeinterlacePresetChanged)
 	Q_PROPERTY(int placeboDeinterlaceAlgorithm READ placeboDeinterlaceAlgorithm WRITE setPlaceboDeinterlaceAlgorithm NOTIFY placeboDeinterlaceAlgorithmChanged)
@@ -391,8 +391,8 @@ public:
     bool ambientBorderSupported() const;
     bool frameGenFlowHighQuality() const;
     void setFrameGenFlowHighQuality(bool high);
-    bool frameGenDlssFlowMotion() const;
-    void setFrameGenDlssFlowMotion(bool enabled);
+    int frameGenDlssMotion() const;
+    void setFrameGenDlssMotion(int mode);
     void setPlaceboFrameMixer(int mixer);
 
     bool placeboDeinterlaceEnabled() const;
@@ -659,7 +659,7 @@ public:
 
 signals:
     void frameGenFlowHighQualityChanged();
-    void frameGenDlssFlowMotionChanged();
+    void frameGenDlssMotionChanged();
     void frameGenVfgModeChanged();
     void ambientBorderChanged();
     void rcasStrengthChanged();

@@ -145,6 +145,7 @@ struct FrameGen::Impl
     // moving edges). `mvecs_from_flow` tells the backend how to scale them;
     // `mvec_dirty` means `mvec` holds vectors that another backend must not see.
     bool dlss_flow_motion = true;
+    bool dlss_motion_reversed = false;
     std::unique_ptr<FlowInterpolator> motion_flow;
     bool motion_flow_failed = false;
     bool motion_flow_logged = false;
@@ -698,8 +699,9 @@ public:
             fillCamera(opt, color.w, color.h);
             // Flow's vectors are the displacement to the previous frame in
             // pixels; DLSS Frame Generation takes them normalized and reversed.
-            opt.mvecScale[0] = fg.mvecs_from_flow ? -1.0f / static_cast<float>(color.w) : 1.0f;
-            opt.mvecScale[1] = fg.mvecs_from_flow ? -1.0f / static_cast<float>(color.h) : 1.0f;
+            const float sign = fg.dlss_motion_reversed ? 1.0f : -1.0f;
+            opt.mvecScale[0] = fg.mvecs_from_flow ? sign / static_cast<float>(color.w) : 1.0f;
+            opt.mvecScale[1] = fg.mvecs_from_flow ? sign / static_cast<float>(color.h) : 1.0f;
             opt.colorBuffersHDR = false;
             opt.depthInverted = false;
             opt.cameraMotionIncluded = true;
@@ -1204,11 +1206,14 @@ void FrameGen::setVfgMode(int mode)
     impl->vfg_mode = std::clamp(mode, 0, 2);
 }
 
-void FrameGen::setDlssFlowMotion(bool enabled)
+void FrameGen::setDlssMotion(int mode)
 {
-    if (enabled != impl->dlss_flow_motion)
+    const bool enabled = mode != 0;
+    const bool reversed = mode == 2;
+    if (enabled != impl->dlss_flow_motion || reversed != impl->dlss_motion_reversed)
         impl->motion_flow_logged = false;
     impl->dlss_flow_motion = enabled;
+    impl->dlss_motion_reversed = reversed;
 }
 
 void FrameGen::destroy()
@@ -1469,6 +1474,7 @@ bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int mul
             if (written && !d.motion_flow_logged) {
                 d.motion_flow_logged = true;
                 qCInfo(chiakiGui) << "[framegen] DLSS motion vectors: Flow"
+                                  << (d.dlss_motion_reversed ? "(reversed)" : "")
                                   << (d.flow_high_quality ? "(1/2 resolution analysis)" : "(1/4 resolution analysis)");
             }
         }
@@ -1649,7 +1655,7 @@ int FrameGen::maxMultiplier() const { return 1; }
 float FrameGen::gpuTimeMs() const { return 0.0f; }
 void FrameGen::reset() {}
 void FrameGen::setFlowHighQuality(bool) {}
-void FrameGen::setDlssFlowMotion(bool) {}
+void FrameGen::setDlssMotion(int) {}
 void FrameGen::setVfgMode(int) {}
 void FrameGen::destroy() {}
 bool FrameGen::process(const struct pl_frame *, int, int, int, float, std::vector<struct pl_frame> &) { return false; }
