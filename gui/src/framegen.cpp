@@ -1,5 +1,6 @@
 #include "framegen.h"
 #include "flowfg.h"
+#include "vfg.h"
 #include "ngxcore.h"
 #include "gputimer.h"
 #include "vkguard.h"
@@ -116,7 +117,7 @@ struct FrameGen::Impl
 
     FrameGen::Backend backend = FrameGen::Backend::None;
     std::unique_ptr<FgBackendImpl> backend_impl;
-    std::array<bool, 4> backend_failed = {};
+    std::array<bool, 5> backend_failed = {};
     int consecutive_failures = 0;
 
     VkQueue queue = VK_NULL_HANDLE;
@@ -149,6 +150,9 @@ struct FrameGen::Impl
     bool motion_flow_logged = false;
     bool mvecs_from_flow = false;
     bool mvec_dirty = false;
+    // NVIDIA VFG: model quality and which shared input buffer gets the next frame.
+    int vfg_mode = 2;
+    int vfg_parity = 0;
     // The first calls after a backend starts are logged step by step.
     int trace_frames = 0;
 
@@ -177,7 +181,18 @@ struct FrameGen::Impl
     bool fillConstant(FgImage &img, const float value[4], const void *texel, size_t texel_size);
     bool hold(FgImage &img);
     void release(FgImage &img, VkSemaphore sem, uint64_t value);
+    struct SemValue
+    {
+        VkSemaphore sem;
+        uint64_t value;
+    };
     bool submit(VkCommandBuffer cmd, FgImage *const *waits, size_t num_waits);
+    // As submit(), with extra semaphores to wait for and to signal.
+    bool submitEx(VkCommandBuffer cmd, FgImage *const *waits, size_t num_waits,
+                  const SemValue *extra_waits, size_t num_extra_waits,
+                  const SemValue *extra_signals, size_t num_extra_signals);
+    bool processVfg(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
+                    const std::function<void(const char *)> &trace_step);
     static void fillFrame(const FgImage &img, struct pl_frame *frame);
 };
 
@@ -458,32 +473,49 @@ void FrameGen::Impl::release(FgImage &img, VkSemaphore sem, uint64_t value)
 
 bool FrameGen::Impl::submit(VkCommandBuffer cmd, FgImage *const *waits, size_t num_waits)
 {
-    std::vector<VkSemaphore> wait_sems(num_waits);
-    std::vector<uint64_t> wait_values(num_waits);
-    std::vector<VkPipelineStageFlags> wait_stages(num_waits, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    return submitEx(cmd, waits, num_waits, nullptr, 0, nullptr, 0);
+}
+
+bool FrameGen::Impl::submitEx(VkCommandBuffer cmd, FgImage *const *waits, size_t num_waits,
+                              const SemValue *extra_waits, size_t num_extra_waits,
+                              const SemValue *extra_signals, size_t num_extra_signals)
+{
+    std::vector<VkSemaphore> wait_sems;
+    std::vector<uint64_t> wait_values;
     for (size_t i = 0; i < num_waits; i++) {
-        wait_sems[i] = waits[i]->sem;
-        wait_values[i] = waits[i]->value;
+        wait_sems.push_back(waits[i]->sem);
+        wait_values.push_back(waits[i]->value);
     }
+    for (size_t i = 0; i < num_extra_waits; i++) {
+        wait_sems.push_back(extra_waits[i].sem);
+        wait_values.push_back(extra_waits[i].value);
+    }
+    std::vector<VkPipelineStageFlags> wait_stages(wait_sems.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     const uint64_t signal_value = done_value + 1;
+    std::vector<VkSemaphore> signal_sems = { sem_done };
+    std::vector<uint64_t> signal_values = { signal_value };
+    for (size_t i = 0; i < num_extra_signals; i++) {
+        signal_sems.push_back(extra_signals[i].sem);
+        signal_values.push_back(extra_signals[i].value);
+    }
 
     VkTimelineSemaphoreSubmitInfo timeline_info = {};
     timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-    timeline_info.waitSemaphoreValueCount = static_cast<uint32_t>(num_waits);
+    timeline_info.waitSemaphoreValueCount = static_cast<uint32_t>(wait_values.size());
     timeline_info.pWaitSemaphoreValues = wait_values.data();
-    timeline_info.signalSemaphoreValueCount = 1;
-    timeline_info.pSignalSemaphoreValues = &signal_value;
+    timeline_info.signalSemaphoreValueCount = static_cast<uint32_t>(signal_values.size());
+    timeline_info.pSignalSemaphoreValues = signal_values.data();
 
     VkSubmitInfo submit_info = {};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.pNext = &timeline_info;
-    submit_info.waitSemaphoreCount = static_cast<uint32_t>(num_waits);
+    submit_info.waitSemaphoreCount = static_cast<uint32_t>(wait_sems.size());
     submit_info.pWaitSemaphores = wait_sems.data();
     submit_info.pWaitDstStageMask = wait_stages.data();
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd;
-    submit_info.signalSemaphoreCount = 1;
-    submit_info.pSignalSemaphores = &sem_done;
+    submit_info.signalSemaphoreCount = static_cast<uint32_t>(signal_sems.size());
+    submit_info.pSignalSemaphores = signal_sems.data();
 
     vk->lock_queue(vk, queue_family, 0);
     const VkResult res = vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
@@ -978,6 +1010,31 @@ private:
 namespace {
 
 // Runs entirely on libplacebo (no raw Vulkan recording), see FrameGen::process.
+// NVIDIA Video Frame Generation, see vfg.h. Driven by FrameGen::Impl::processVfg.
+class VfgBackend : public FgBackendImpl
+{
+public:
+    std::unique_ptr<VfgRunner> runner;
+
+    bool init(FrameGen::Impl &fg) override
+    {
+        runner = std::make_unique<VfgRunner>(fg.vk, fg.vkGetDeviceProcAddr);
+        return runner->init();
+    }
+    int maxGenerated() const override { return std::min(kMaxGenerated, VfgRunner::kMaxOutputs); }
+    bool record(FrameGen::Impl &, VkCommandBuffer, FgImage &, FgImage *const *, int, bool, float) override
+    {
+        return false;
+    }
+    const char *stage() const override { return runner ? runner->stage() : ""; }
+    void invalidate() override
+    {
+        if (runner)
+            runner->invalidate();
+    }
+    void shutdown() override { runner.reset(); }
+};
+
 class FlowBackend : public FgBackendImpl
 {
 public:
@@ -1018,6 +1075,9 @@ bool FrameGen::backendCompiledIn(Backend backend)
     case Backend::Fsr: return true;
 #endif
     case Backend::Flow: return true;
+#if defined(_WIN32)
+    case Backend::Vfg: return true;
+#endif
     default: return false;
     }
 }
@@ -1028,6 +1088,7 @@ const char *FrameGen::backendName(Backend backend)
     case Backend::Dlss: return "DLSS Frame Generation";
     case Backend::Fsr: return "FSR 3.1 Frame Generation";
     case Backend::Flow: return "Flow Frame Generation";
+    case Backend::Vfg: return "NVIDIA VFG";
     default: return "None";
     }
 }
@@ -1071,6 +1132,9 @@ bool FrameGen::ensureInitialized(pl_vulkan vk, Backend backend)
     case Backend::Fsr: impl_backend = std::make_unique<FsrBackend>(); break;
 #endif
     case Backend::Flow: impl_backend = std::make_unique<FlowBackend>(); break;
+#if defined(_WIN32)
+    case Backend::Vfg: impl_backend = std::make_unique<VfgBackend>(); break;
+#endif
     default: break;
     }
     unsigned long seh_code = 0;
@@ -1113,6 +1177,10 @@ float FrameGen::gpuTimeMs() const
         const auto *flow = static_cast<const FlowBackend *>(impl->backend_impl.get());
         return flow->interp ? flow->interp->gpuTimeMs() : 0.0f;
     }
+    if (impl->backend == Backend::Vfg && impl->backend_impl) {
+        auto *vfg = static_cast<VfgBackend *>(impl->backend_impl.get());
+        return vfg->runner ? vfg->runner->gpuTimeMs() : 0.0f;
+    }
     return impl->timer.averageMs();
 }
 
@@ -1131,6 +1199,11 @@ void FrameGen::setFlowHighQuality(bool high)
     impl->flow_high_quality = high;
 }
 
+void FrameGen::setVfgMode(int mode)
+{
+    impl->vfg_mode = std::clamp(mode, 0, 2);
+}
+
 void FrameGen::setDlssFlowMotion(bool enabled)
 {
     if (enabled != impl->dlss_flow_motion)
@@ -1141,6 +1214,181 @@ void FrameGen::setDlssFlowMotion(bool enabled)
 void FrameGen::destroy()
 {
     impl->shutdownCommon();
+}
+
+// NVIDIA VFG: (1) Vulkan copies the real frame into a buffer shared with
+// CUDA and signals the shared timeline semaphore, (2) CUDA waits for it, runs
+// the model for each generated frame into shared output buffers and signals
+// the next value, (3) Vulkan waits for that and copies the outputs into the
+// generated textures. The two input buffers alternate so the previous frame
+// stays available.
+bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
+                                const std::function<void(const char *)> &trace_step)
+{
+    auto *backend_vfg = static_cast<VfgBackend *>(backend_impl.get());
+    VfgRunner *runner = backend_vfg ? backend_vfg->runner.get() : nullptr;
+    if (!runner)
+        return false;
+    auto disable = [&](const char *why) {
+        qCWarning(chiakiGui) << "[framegen] Disabling" << backendName(backend) << why;
+        backend_failed[static_cast<size_t>(backend)] = true;
+        destroyBackend();
+        return false;
+    };
+    auto fail = [&](const char *what) {
+        qCWarning(chiakiGui) << "[framegen] NVIDIA VFG:" << what;
+        have_history = false;
+        last_real = nullptr;
+        if (++consecutive_failures >= kMaxConsecutiveFailures)
+            return disable("after repeated failures");
+        return false;
+    };
+    auto crashed = [&](unsigned long code) {
+        qCCritical(chiakiGui).nospace() << "[framegen] NVIDIA VFG crashed inside its runtime (exception 0x"
+                                        << Qt::hex << code << Qt::dec << ", in " << runner->stage() << ")";
+        // Its state is unknown: leak it rather than call into it again.
+        backend_failed[static_cast<size_t>(backend)] = true;
+        (void)backend_vfg->runner.release();
+        (void)backend_impl.release();
+        backend = FrameGen::Backend::None;
+        have_history = false;
+        return false;
+    };
+    auto begin_slot = [&]() -> CommandSlot * {
+        CommandSlot &slot = cmd_slots[next_slot];
+        next_slot = (next_slot + 1) % cmd_slots.size();
+        if (!waitDone(slot.done_value) || vkResetCommandBuffer(slot.cmd, 0) != VK_SUCCESS)
+            return nullptr;
+        VkCommandBufferBeginInfo begin_info = {};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        return vkBeginCommandBuffer(slot.cmd, &begin_info) == VK_SUCCESS ? &slot : nullptr;
+    };
+
+    const int w = set.real.w;
+    const int h = set.real.h;
+    if (!runner->sizeMatches(w, h, vfg_mode)) {
+        // The shared buffers are rebuilt: nothing may still use them.
+        if (!waitDone(done_value))
+            return false;
+        unsigned long seh_code = 0;
+        const bool sized = guardedCall([&]() { return runner->ensureSize(w, h, vfg_mode); }, &seh_code);
+        if (seh_code)
+            return crashed(seh_code);
+        if (!sized)
+            return disable("(the effect could not be set up, see above)");
+        reset_pending = true;
+        trace_step("vfg buffers ready");
+    }
+    const bool fresh = reset_pending || !have_history || !last_real;
+    const int cur_slot = vfg_parity;
+    const int prev_slot = 1 - vfg_parity;
+
+    // (1) Real frame -> shared input buffer.
+    CommandSlot *slot = begin_slot();
+    if (!slot)
+        return fail("command buffer unavailable");
+    if (!hold(set.real))
+        return fail("could not take the frame from libplacebo");
+    runner->recordUpload(slot->cmd, set.real.image, cur_slot);
+    bool ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
+    const uint64_t input_value = runner->lastValue() + 1;
+    {
+        FgImage *waits[] = { &set.real };
+        // CUDA has finished with the input buffer being overwritten.
+        const SemValue extra_waits[] = { { runner->semaphore(), runner->lastValue() } };
+        const SemValue input_signal[] = { { runner->semaphore(), input_value } };
+        ok = ok && submitEx(slot->cmd, waits, 1, extra_waits, 1, input_signal, 1);
+    }
+    if (ok) {
+        slot->done_value = done_value;
+        runner->setLastValue(input_value);
+        release(set.real, sem_done, done_value);
+    } else {
+        release(set.real, set.real.sem, set.real.value);
+        return fail("copying the frame failed");
+    }
+    trace_step("vfg input copied");
+
+    vfg_parity = 1 - vfg_parity;
+    if (fresh) {
+        consecutive_failures = 0;
+        have_history = true;
+        reset_pending = false;
+        last_real = &set.real;
+        outputs.emplace_back();
+        fillFrame(set.real, &outputs.back());
+        return true;
+    }
+
+    // (2) CUDA: generate between the previous and this frame.
+    const uint64_t output_value = input_value + 1;
+    bool signalled = false;
+    unsigned long seh_code = 0;
+    const bool generated_ok = guardedCall([&]() {
+        return runner->generate(prev_slot, cur_slot, count, false, input_value, output_value, &signalled);
+    }, &seh_code);
+    if (seh_code)
+        return crashed(seh_code);
+    trace_step(generated_ok ? "vfg generation queued" : "vfg generation failed");
+
+    // (3) Shared output buffers -> generated textures. Runs even after a
+    // failure when CUDA still signals, so the semaphore keeps advancing.
+    slot = begin_slot();
+    if (!slot) {
+        if (signalled)
+            runner->setLastValue(output_value);
+        return fail("command buffer unavailable");
+    }
+    std::array<FgImage *, kMaxGenerated> held = {};
+    size_t num_held = 0;
+    bool holds_ok = true;
+    for (int i = 0; i < count; i++) {
+        FgImage &img = set.generated[static_cast<size_t>(i)];
+        if (!hold(img)) {
+            holds_ok = false;
+            break;
+        }
+        held[num_held++] = &img;
+        if (generated_ok)
+            runner->recordDownload(slot->cmd, img.image, i);
+    }
+    ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
+    {
+        const SemValue extra_waits[] = { { runner->semaphore(), signalled ? output_value : input_value } };
+        const SemValue own_signal[] = { { runner->semaphore(), output_value } };
+        ok = ok && submitEx(slot->cmd, held.data(), num_held, extra_waits, 1,
+                            signalled ? nullptr : own_signal, signalled ? 0 : 1);
+    }
+    if (ok) {
+        slot->done_value = done_value;
+        runner->setLastValue(output_value);
+    } else if (signalled) {
+        runner->setLastValue(output_value);
+    }
+    for (size_t i = 0; i < num_held; i++) {
+        if (ok)
+            release(*held[i], sem_done, done_value);
+        else
+            release(*held[i], held[i]->sem, held[i]->value);
+    }
+    if (!ok)
+        return fail("copying the generated frames failed");
+    if (!generated_ok || !holds_ok)
+        return fail("generation failed");
+    trace_step("vfg frames submitted");
+
+    consecutive_failures = 0;
+    have_history = true;
+    reset_pending = false;
+    last_real = &set.real;
+    for (int i = 0; i < count; i++) {
+        outputs.emplace_back();
+        fillFrame(set.generated[static_cast<size_t>(i)], &outputs.back());
+    }
+    outputs.emplace_back();
+    fillFrame(set.real, &outputs.back());
+    return true;
 }
 
 bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int multiplier,
@@ -1236,6 +1484,9 @@ bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int mul
             return false;
         d.mvec_dirty = false;
     }
+
+    if (d.backend == FrameGen::Backend::Vfg)
+        return d.processVfg(set, count, outputs, trace_step);
 
     if (d.backend == FrameGen::Backend::Flow) {
         auto *flow = static_cast<FlowBackend *>(d.backend_impl.get());
@@ -1399,6 +1650,7 @@ float FrameGen::gpuTimeMs() const { return 0.0f; }
 void FrameGen::reset() {}
 void FrameGen::setFlowHighQuality(bool) {}
 void FrameGen::setDlssFlowMotion(bool) {}
+void FrameGen::setVfgMode(int) {}
 void FrameGen::destroy() {}
 bool FrameGen::process(const struct pl_frame *, int, int, int, float, std::vector<struct pl_frame> &) { return false; }
 

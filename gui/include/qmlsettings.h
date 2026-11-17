@@ -110,6 +110,9 @@ class QmlSettings : public QObject
 	Q_PROPERTY(bool frameGenDlssSupported READ frameGenDlssSupported CONSTANT)
 	Q_PROPERTY(bool frameGenFsrSupported READ frameGenFsrSupported CONSTANT)
 	Q_PROPERTY(bool frameGenFlowSupported READ frameGenFlowSupported CONSTANT)
+	Q_PROPERTY(bool frameGenVfgSupported READ frameGenVfgSupported CONSTANT)
+	Q_PROPERTY(QString frameGenVfgRuntime READ frameGenVfgRuntime CONSTANT)
+	Q_PROPERTY(int frameGenVfgMode READ frameGenVfgMode WRITE setFrameGenVfgMode NOTIFY frameGenVfgModeChanged)
 	Q_PROPERTY(bool ambientBorder READ ambientBorder WRITE setAmbientBorder NOTIFY ambientBorderChanged)
 	Q_PROPERTY(int rcasStrength READ rcasStrength WRITE setRcasStrength NOTIFY rcasStrengthChanged)
 	Q_PROPERTY(bool ambientBorderSupported READ ambientBorderSupported CONSTANT)
@@ -377,6 +380,10 @@ public:
     bool frameGenDlssSupported() const;
     bool frameGenFsrSupported() const;
     bool frameGenFlowSupported() const;
+    bool frameGenVfgSupported() const;
+    QString frameGenVfgRuntime() const;
+    int frameGenVfgMode() const;
+    void setFrameGenVfgMode(int mode);
     bool ambientBorder() const;
     int rcasStrength() const;
     void setRcasStrength(int strength);
@@ -653,6 +660,7 @@ public:
 signals:
     void frameGenFlowHighQualityChanged();
     void frameGenDlssFlowMotionChanged();
+    void frameGenVfgModeChanged();
     void ambientBorderChanged();
     void rcasStrengthChanged();
     void resolutionLocalPS4Changed();

@@ -57,6 +57,25 @@ Settings → Video → **Frame Generation**: pick DLSS, FSR or Flow, then the
 [RTX Video Super Resolution](rtxvideo.md): frames are upscaled first, then
 generated.
 
+### NVIDIA VFG (Windows, experimental)
+
+**NVIDIA VFG** uses the *Video Frame Generation* effect of the NVIDIA Video
+Effects SDK: a model trained on video that only needs the two pictures, so it
+has no motion-vector problem at all. It needs an NVIDIA RTX GPU (40/50 series;
+30 series is not supported by NVIDIA) and is heavy: High costs tens of
+milliseconds per frame pair at 1440p, which fits a 30 fps source (33 ms per
+frame) better than 60 fps. Pick Low or Medium in **NVIDIA VFG Quality** if the
+frame rate drops.
+
+The runtime is not bundled. Install the NVIDIA Video Effects SDK and its
+`nvVFXVideoFrameGeneration` feature (see NVIDIA's VFX SDK documentation), or
+copy the SDK folder (with `NVVideoEffects.dll`, `NVCVImage.dll` and the
+feature's folder) to a `vfx` folder next to `chiaki.exe`. chiaki-ng looks in
+`CHIAKI_VFX_PATH`, `<chiaki folder>\vfx`, `NV_VIDEO_EFFECTS_PATH` and
+`C:\Program Files\NVIDIA Corporation\NVIDIA Video Effects`, in that order. The
+log shows `[framegen] VFG: Video Effects SDK x.y.z from ...` and
+`NVIDIA VFG ready: WxH, quality ...`, or what is missing.
+
 ### DLSS motion vectors
 
 DLSS Frame Generation is made for games, which hand it per-pixel motion

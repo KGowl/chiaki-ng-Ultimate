@@ -61,7 +61,9 @@ set(SOURCE_FILES
 	include/framegen.h
 	src/framegen.cpp
 	include/flowfg.h
+	include/vfg.h
 	src/flowfg.cpp
+	src/vfg.cpp
 	include/systemdinhibit.h
 	src/systemdinhibit.cpp
 	)

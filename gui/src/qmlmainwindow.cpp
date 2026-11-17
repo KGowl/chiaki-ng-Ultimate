@@ -5381,6 +5381,7 @@ renderer_backend_ready:
             QString part = fg_backend_status == static_cast<int>(FrameGen::Backend::Dlss) ? QStringLiteral("DLSS FG")
                 : fg_backend_status == static_cast<int>(FrameGen::Backend::Flow)
                     ? (this->settings && this->settings->GetFrameGenFlowHighQuality() ? QStringLiteral("Flow FG HQ") : QStringLiteral("Flow FG"))
+                : fg_backend_status == static_cast<int>(FrameGen::Backend::Vfg) ? QStringLiteral("NVIDIA VFG")
                 : QStringLiteral("FSR FG");
             const int multiplier = fg_status_multiplier.loadRelaxed();
             if (multiplier > 1) {
@@ -7790,6 +7791,7 @@ void QmlMainWindow::render()
             }
             frame_gen->setFlowHighQuality(settings->GetFrameGenFlowHighQuality());
             frame_gen->setDlssFlowMotion(settings->GetFrameGenDlssFlowMotion());
+            frame_gen->setVfgMode(settings->GetFrameGenVfgMode());
             if (multiplier >= 2 &&
                 frame_gen->process(&direct_render_frame, fg_out_w, fg_out_h, multiplier,
                                    static_cast<float>(source_interval_s * 1000.0), fg_outputs) &&

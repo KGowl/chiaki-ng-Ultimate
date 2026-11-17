@@ -30,6 +30,8 @@ public:
         Dlss = 1,
         Fsr = 2,
         Flow = 3,
+        // NVIDIA Video Frame Generation (Video Effects SDK), Windows only.
+        Vfg = 4,
     };
 
     static bool compiledIn();
@@ -64,6 +66,8 @@ public:
     // DLSS Frame Generation: per-pixel motion vectors from Flow's motion
     // search (true, default) or zero motion (false). Uses the Flow quality.
     void setDlssFlowMotion(bool enabled);
+    // NVIDIA VFG model: 0 Low, 1 Medium, 2 High.
+    void setVfgMode(int mode);
 
     // Waits for in-flight work and releases every Vulkan and backend resource.
     // Must be called before the pl_vulkan device is destroyed.

@@ -1,0 +1,73 @@
+#ifndef CHIAKI_GUI_VFG_H
+#define CHIAKI_GUI_VFG_H
+
+#include <libplacebo/vulkan.h>
+
+#include <QString>
+
+#include <memory>
+
+// NVIDIA Video Frame Generation: the "VideoFrameGeneration" effect of the
+// NVIDIA Video Effects SDK, a video-trained interpolation model that needs
+// only the two pictures (no motion vectors or depth). It runs in CUDA on
+// buffers shared with libplacebo's Vulkan device and synchronised through a
+// shared timeline semaphore.
+//
+// The runtime is not bundled: chiaki-ng uses the user's Video Effects SDK
+// installation with the nvVFXVideoFrameGeneration feature (Windows, NVIDIA
+// RTX GPU), found through CHIAKI_VFX_PATH, a "vfx" folder next to chiaki.exe,
+// NV_VIDEO_EFFECTS_PATH or the SDK's default install folder.
+class VfgRunner
+{
+public:
+    static constexpr int kMaxOutputs = 3;
+
+    // Folder holding NVVideoEffects.dll, or empty if none was found.
+    static QString findRuntime();
+
+    VfgRunner(pl_vulkan vk, PFN_vkGetDeviceProcAddr get_device_proc);
+    ~VfgRunner();
+    VfgRunner(const VfgRunner &) = delete;
+    VfgRunner &operator=(const VfgRunner &) = delete;
+
+    // Loads the runtime and sets up CUDA on the GPU of `vk`; logs why it
+    // cannot run.
+    bool init();
+    // (Re)creates the shared buffers and the effect for this size and
+    // quality (0 Low, 1 Medium, 2 High). No work may be pending.
+    bool ensureSize(int w, int h, int mode);
+    // Whether ensureSize() would keep the current buffers and effect.
+    bool sizeMatches(int w, int h, int mode) const;
+    // Drops the size dependent state. No work may be pending.
+    void invalidate();
+
+    // Timeline semaphore shared with CUDA, and its last value that has been
+    // (or will be) signalled.
+    VkSemaphore semaphore() const;
+    uint64_t lastValue() const;
+    void setLastValue(uint64_t value);
+
+    // Copies `image` (RGBA8, VK_IMAGE_LAYOUT_GENERAL) into input buffer
+    // `slot` (0 or 1), and output buffer `index` into `image`.
+    void recordUpload(VkCommandBuffer cmd, VkImage image, int slot);
+    void recordDownload(VkCommandBuffer cmd, VkImage image, int index);
+
+    // Queues on the CUDA stream: wait for `wait_value`, generate `count`
+    // evenly spaced frames between input `prev_slot` and `cur_slot` into the
+    // output buffers, signal `signal_value`. Returns false on failure;
+    // `signalled` tells whether CUDA will still signal `signal_value` (if not,
+    // the caller has to, or nothing waiting for it ever runs).
+    bool generate(int prev_slot, int cur_slot, int count, bool shot_change,
+                  uint64_t wait_value, uint64_t signal_value, bool *signalled);
+
+    // Average GPU time of the generation per stream frame in milliseconds.
+    float gpuTimeMs();
+    // The runtime call in progress, named in the log if the runtime crashes.
+    const char *stage() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
+#endif // CHIAKI_GUI_VFG_H

@@ -108,7 +108,8 @@ DialogView {
                 model: [qsTr("Off"),
                     Chiaki.settings.frameGenDlssSupported ? qsTr("NVIDIA DLSS Frame Generation") : qsTr("NVIDIA DLSS Frame Generation (not in this build)"),
                     Chiaki.settings.frameGenFsrSupported ? qsTr("AMD FSR 3.1 Frame Generation") : qsTr("AMD FSR 3.1 Frame Generation (not in this build)"),
-                    qsTr("Flow Frame Generation (any GPU)")]
+                    qsTr("Flow Frame Generation (any GPU)"),
+                            Chiaki.settings.frameGenVfgSupported ? (Chiaki.settings.frameGenVfgRuntime.length ? qsTr("NVIDIA VFG (Video Effects SDK)") : qsTr("NVIDIA VFG (Video Effects SDK not found)")) : qsTr("NVIDIA VFG (Windows only)")]
                 currentIndex: Chiaki.settings.frameGenBackend
                 onActivated: index => Chiaki.settings.frameGenBackend = index
                 ToolTip.visible: hovered
@@ -167,6 +168,29 @@ DialogView {
 
             Label {
                 Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.frameGenVfgSupported
+                text: qsTr("NVIDIA VFG Quality:")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.frameGenVfgSupported
+                enabled: Chiaki.settings.frameGenBackend === 4
+                model: [qsTr("Low (fastest)"), qsTr("Medium"), qsTr("High (best, heaviest)")]
+                currentIndex: Chiaki.settings.frameGenVfgMode
+                onActivated: index => Chiaki.settings.frameGenVfgMode = index
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("NVIDIA Video Frame Generation: a video-trained model that needs no motion vectors (RTX 40/50). Uses the NVIDIA Video Effects SDK with its Video Frame Generation feature, which is not bundled: put it in a \"vfx\" folder next to chiaki.exe, set CHIAKI_VFX_PATH, or install the SDK. High costs tens of milliseconds per frame pair at 1440p, so it suits 30 fps sources. Found: %1").arg(Chiaki.settings.frameGenVfgRuntime.length ? Chiaki.settings.frameGenVfgRuntime : qsTr("not found"))
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.frameGenVfgSupported
+                text: qsTr("(High)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
                 visible: Chiaki.settings.frameGenSupported
                 text: qsTr("Frame Generation Multiplier:")
             }
@@ -174,9 +198,9 @@ DialogView {
             C.ComboBox {
                 Layout.preferredWidth: 600
                 visible: Chiaki.settings.frameGenSupported
-                enabled: Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3
-                model: [qsTr("2x"), qsTr("3x (DLSS on RTX 50 series, Flow)"), qsTr("4x (DLSS on RTX 50 series, Flow)")]
-                currentIndex: (Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3) ? Chiaki.settings.frameGenMultiplier - 2 : 0
+                enabled: Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3 || Chiaki.settings.frameGenBackend === 4
+                model: [qsTr("2x"), qsTr("3x (DLSS on RTX 50 series, Flow, VFG)"), qsTr("4x (DLSS on RTX 50 series, Flow, VFG)")]
+                currentIndex: (Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3 || Chiaki.settings.frameGenBackend === 4) ? Chiaki.settings.frameGenMultiplier - 2 : 0
                 onActivated: index => Chiaki.settings.frameGenMultiplier = index + 2
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Output frames per stream frame. FSR always uses 2x; the display refresh rate also limits it.")

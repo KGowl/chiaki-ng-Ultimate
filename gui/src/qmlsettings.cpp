@@ -1,3 +1,4 @@
+#include "vfg.h"
 #include "qmlsettings.h"
 #include "sessionlog.h"
 #include "rtxvsr.h"
@@ -1082,6 +1083,29 @@ bool QmlSettings::frameGenDlssSupported() const
 bool QmlSettings::frameGenFlowSupported() const
 {
     return FrameGen::backendCompiledIn(FrameGen::Backend::Flow);
+}
+
+bool QmlSettings::frameGenVfgSupported() const
+{
+    return FrameGen::backendCompiledIn(FrameGen::Backend::Vfg);
+}
+
+QString QmlSettings::frameGenVfgRuntime() const
+{
+    return VfgRunner::findRuntime();
+}
+
+int QmlSettings::frameGenVfgMode() const
+{
+    return settings->GetFrameGenVfgMode();
+}
+
+void QmlSettings::setFrameGenVfgMode(int mode)
+{
+    if (mode == settings->GetFrameGenVfgMode())
+        return;
+    settings->SetFrameGenVfgMode(mode);
+    emit frameGenVfgModeChanged();
 }
 
 int QmlSettings::rcasStrength() const

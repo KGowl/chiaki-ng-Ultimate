@@ -535,7 +535,7 @@ class Settings : public QObject
 		static int ValidRtxVsrQuality(int q) { return ((q >= 1 && q <= 4) || (q >= 8 && q <= 11) || q == 21 || q == 23) ? q : 0; }
 		// Frame generation backend: 0 = off, 1 = DLSS Frame Generation, 2 = FSR 3.1 Frame Generation,
 		// 3 = Flow (chiaki-ng's own, any GPU / OS)
-		int GetFrameGenBackend() const { return qBound(0, settings.value("settings/frame_gen_backend", 0).toInt(), 3); }
+		int GetFrameGenBackend() const { return qBound(0, settings.value("settings/frame_gen_backend", 0).toInt(), 4); }
 		void SetFrameGenBackend(int backend)
 		{
 			backend = qBound(0, backend, 3);
@@ -544,7 +544,7 @@ class Settings : public QObject
 				settings.setValue("settings/frame_gen_last_backend", backend);
 		}
 		// Backend restored when frame generation is switched back on from the stream menu (0 = never chosen).
-		int GetFrameGenLastBackend() const { return qBound(0, settings.value("settings/frame_gen_last_backend", 0).toInt(), 3); }
+		int GetFrameGenLastBackend() const { return qBound(0, settings.value("settings/frame_gen_last_backend", 0).toInt(), 4); }
 		// AMD RCAS sharpening of the final image: 0 = off, 1-100 = strength in percent
 		int GetRcasStrength() const { return qBound(0, settings.value("settings/rcas_strength", 0).toInt(), 100); }
 		void SetRcasStrength(int strength) { settings.setValue("settings/rcas_strength", qBound(0, strength, 100)); }
@@ -556,6 +556,9 @@ class Settings : public QObject
 		bool GetFrameGenFlowHighQuality() const { return settings.value("settings/frame_gen_flow_high_quality", false).toBool(); }
 		void SetFrameGenFlowHighQuality(bool high) { settings.setValue("settings/frame_gen_flow_high_quality", high); }
 		// DLSS Frame Generation motion vectors from Flow's motion search (true) or zero motion.
+		// NVIDIA VFG model quality: 0 Low, 1 Medium, 2 High.
+		int GetFrameGenVfgMode() const { return qBound(0, settings.value("settings/frame_gen_vfg_mode", 2).toInt(), 2); }
+		void SetFrameGenVfgMode(int mode) { settings.setValue("settings/frame_gen_vfg_mode", qBound(0, mode, 2)); }
 		bool GetFrameGenDlssFlowMotion() const { return settings.value("settings/frame_gen_dlss_flow_motion", true).toBool(); }
 		void SetFrameGenDlssFlowMotion(bool enabled) { settings.setValue("settings/frame_gen_dlss_flow_motion", enabled); }
 		// Output frames per stream frame (2 = one generated frame per real frame)
