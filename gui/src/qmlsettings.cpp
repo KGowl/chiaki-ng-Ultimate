@@ -20,6 +20,8 @@
 #include <qt_windows.h>
 #endif
 
+Q_DECLARE_LOGGING_CATEGORY(chiakiGui)
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
