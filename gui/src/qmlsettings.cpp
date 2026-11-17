@@ -1220,6 +1220,19 @@ void QmlSettings::setFrameGenDlssMotion(int mode)
     emit frameGenDlssMotionChanged();
 }
 
+int QmlSettings::frameGenCleanup() const
+{
+    return settings->GetFrameGenCleanup();
+}
+
+void QmlSettings::setFrameGenCleanup(int mode)
+{
+    if (mode == settings->GetFrameGenCleanup())
+        return;
+    settings->SetFrameGenCleanup(mode);
+    emit frameGenCleanupChanged();
+}
+
 bool QmlSettings::frameGenFsrSupported() const
 {
     return FrameGen::backendCompiledIn(FrameGen::Backend::Fsr);

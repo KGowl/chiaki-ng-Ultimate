@@ -131,7 +131,7 @@ DialogView {
             C.ComboBox {
                 Layout.preferredWidth: 600
                 visible: Chiaki.settings.frameGenFlowSupported
-                enabled: Chiaki.settings.frameGenBackend === 3 || (Chiaki.settings.frameGenBackend === 1 && Chiaki.settings.frameGenDlssMotion > 0)
+                enabled: Chiaki.settings.frameGenBackend === 3 || (Chiaki.settings.frameGenBackend === 1 && Chiaki.settings.frameGenDlssMotion > 0) || (Chiaki.settings.frameGenBackend > 0 && Chiaki.settings.frameGenCleanup > 0) || Chiaki.settings.frameGenBackend === 2
                 model: [qsTr("Performance (1/4 resolution motion analysis)"), qsTr("Quality (1/2 resolution motion analysis)")]
                 currentIndex: Chiaki.settings.frameGenFlowHighQuality ? 1 : 0
                 onActivated: index => Chiaki.settings.frameGenFlowHighQuality = index === 1
@@ -218,6 +218,29 @@ DialogView {
                 visible: Chiaki.settings.frameGenVfgSupported
                 text: Chiaki.settings.vfgRuntimeDownloadState === 3 ? qsTr("Failed, see the console") : Chiaki.settings.frameGenVfgRuntime.length ? qsTr("Found") : qsTr("Not found")
                 color: Chiaki.settings.vfgRuntimeDownloadState === 3 ? "#ef9a9a" : Chiaki.settings.frameGenVfgRuntime.length ? "#a5d6a7" : "#ffe082"
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.frameGenSupported
+                text: qsTr("Generated Frame Clean-up:")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.frameGenSupported
+                enabled: Chiaki.settings.frameGenBackend > 0
+                model: [qsTr("Off"), qsTr("Protect HUD and text"), qsTr("Protect HUD and text + keep detail (less flicker)")]
+                currentIndex: Chiaki.settings.frameGenCleanup
+                onActivated: index => Chiaki.settings.frameGenCleanup = index
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Fixes the generated frames of every backend. HUD and text that stay still are taken from the real frame, so they are not dragged along; where the two frames do not line up (fine detail, foliage, edges of moving objects) the smeared blend is replaced by a sharp pixel, which removes the sharp/blurry flicker while panning. Uses Flow's motion search (Flow Quality applies, about 0.5 ms).")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.frameGenSupported
+                text: qsTr("(+ detail)")
             }
 
             Label {

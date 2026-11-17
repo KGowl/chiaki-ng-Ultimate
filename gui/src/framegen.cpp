@@ -1,5 +1,6 @@
 #include "framegen.h"
 #include "flowfg.h"
+#include "fgfixup.h"
 #include "vfg.h"
 #include "ngxcore.h"
 #include "gputimer.h"
@@ -151,6 +152,12 @@ struct FrameGen::Impl
     bool motion_flow_logged = false;
     bool mvecs_from_flow = false;
     bool mvec_dirty = false;
+    // Clean-up of the generated frames (FgFixup): 0 off, 1 static content
+    // only, 2 static content and detail.
+    int cleanup_mode = 2;
+    std::unique_ptr<FgFixup> fixup;
+    bool fixup_failed = false;
+    bool fixup_logged = false;
     // NVIDIA VFG: model quality and which shared input buffer gets the next frame.
     int vfg_mode = 2;
     int vfg_parity = 0;
@@ -562,6 +569,7 @@ void FrameGen::Impl::shutdownCommon()
         waitDone(done_value);
     destroyBackend();
     motion_flow.reset();
+    fixup.reset();
     if (vkDestroyImageView)
         destroyImages();
     if (pool)
@@ -1216,6 +1224,14 @@ void FrameGen::setDlssMotion(int mode)
     impl->dlss_motion_reversed = reversed;
 }
 
+void FrameGen::setCleanup(int mode)
+{
+    mode = std::clamp(mode, 0, 2);
+    if (mode != impl->cleanup_mode)
+        impl->fixup_logged = false;
+    impl->cleanup_mode = mode;
+}
+
 void FrameGen::destroy()
 {
     impl->shutdownCommon();
@@ -1394,6 +1410,41 @@ bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int mul
                        float frame_interval_ms, std::vector<struct pl_frame> &outputs)
 {
     Impl &d = *impl;
+    // The previous real frame, before processFrames() moves on.
+    pl_tex prev = (d.reset_pending || !d.have_history || !d.last_real) ? nullptr : d.last_real->tex;
+    if (!processFrames(src, out_w, out_h, multiplier, frame_interval_ms, outputs))
+        return false;
+    const size_t generated = outputs.size() > 1 ? outputs.size() - 1 : 0;
+    if (!generated || !prev || !d.fixup || d.cleanup_mode <= 0 || d.fixup_failed)
+        return true;
+    pl_tex cur = outputs.back().planes[0].texture;
+    // DLSS with zero motion keeps its motion texture at zero: no detail pass.
+    pl_tex motion = d.mvecs_from_flow ? d.mvec.tex : nullptr;
+    // Flow's own synthesis already picks one frame where they disagree; on
+    // its output the detail pass only adds sub-pixel misplacements.
+    const bool detail = d.cleanup_mode >= 2 && d.backend != FrameGen::Backend::Flow;
+    for (size_t i = 0; i < generated; i++) {
+        const float t = static_cast<float>(i + 1) / static_cast<float>(generated + 1);
+        if (!d.fixup->after(prev, cur, motion, outputs[i].planes[0].texture, t, detail, true)) {
+            qCWarning(chiakiGui) << "[framegen] Generated frame clean-up failed, turned off";
+            d.fixup.reset();
+            d.fixup_failed = true;
+            break;
+        }
+    }
+    if (!d.fixup_logged && d.fixup) {
+        d.fixup_logged = true;
+        qCInfo(chiakiGui) << "[framegen] Generated frame clean-up:"
+                          << (detail && motion ? "static content + detail" : "static content")
+                          << (motion ? "" : "(no motion vectors)");
+    }
+    return true;
+}
+
+bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, int multiplier,
+                             float frame_interval_ms, std::vector<struct pl_frame> &outputs)
+{
+    Impl &d = *impl;
     outputs.clear();
     if (!d.backend_impl || !src || src->num_planes <= 0 || out_w <= 0 || out_h <= 0)
         return false;
@@ -1445,11 +1496,18 @@ bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int mul
     trace_step("input rendered");
 
     d.mvecs_from_flow = false;
-    if (d.backend == FrameGen::Backend::Dlss && d.dlss_flow_motion && !d.motion_flow_failed) {
+    // Motion from Flow's motion search: for DLSS (unless zero motion is
+    // chosen) and FSR as their motion vectors, and for the clean-up passes.
+    const bool cleanup = d.cleanup_mode > 0 && !d.fixup_failed;
+    const bool motion_for_backend = (d.backend == FrameGen::Backend::Dlss && d.dlss_flow_motion) ||
+                                    d.backend == FrameGen::Backend::Fsr;
+    const bool want_motion = motion_for_backend ||
+                             (cleanup && d.backend != FrameGen::Backend::Dlss && d.backend != FrameGen::Backend::Fsr);
+    if (want_motion && !d.motion_flow_failed) {
         if (!d.motion_flow) {
             d.motion_flow = std::make_unique<FlowInterpolator>(d.log, d.gpu);
             if (!d.motion_flow->init()) {
-                qCWarning(chiakiGui) << "[framegen] Flow motion vectors unavailable, DLSS gets zero motion";
+                qCWarning(chiakiGui) << "[framegen] Flow motion vectors unavailable (zero motion)";
                 d.motion_flow.reset();
                 d.motion_flow_failed = true;
             }
@@ -1459,7 +1517,7 @@ bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int mul
             const bool fresh = d.reset_pending || !d.have_history || !d.last_real;
             bool written = false;
             if (!d.motion_flow->motionVectors(fresh ? nullptr : d.last_real->tex, set.real.tex, d.mvec.tex, &written)) {
-                qCWarning(chiakiGui) << "[framegen] Flow motion vectors failed, DLSS gets zero motion";
+                qCWarning(chiakiGui) << "[framegen] Flow motion vectors failed (zero motion from now on)";
                 d.motion_flow.reset();
                 d.motion_flow_failed = true;
                 written = false;
@@ -1467,12 +1525,30 @@ bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int mul
             d.mvecs_from_flow = written;
             if (written && !d.motion_flow_logged) {
                 d.motion_flow_logged = true;
-                qCInfo(chiakiGui) << "[framegen] DLSS motion vectors: Flow"
-                                  << (d.dlss_motion_reversed ? "(reversed)" : "")
+                qCInfo(chiakiGui) << "[framegen] Motion vectors: Flow"
+                                  << (d.backend == FrameGen::Backend::Dlss && d.dlss_motion_reversed ? "(reversed for DLSS)" : "")
                                   << (d.flow_high_quality ? "(1/2 resolution analysis)" : "(1/4 resolution analysis)");
             }
         }
         trace_step(d.mvecs_from_flow ? "flow motion vectors" : "zero motion vectors");
+    }
+    if (cleanup && !d.fixup) {
+        d.fixup = std::make_unique<FgFixup>(d.log, d.gpu);
+        if (!d.fixup->init()) {
+            qCWarning(chiakiGui) << "[framegen] Generated frame clean-up unavailable";
+            d.fixup.reset();
+            d.fixup_failed = true;
+        }
+    }
+    if (cleanup && d.fixup) {
+        // Static content: counters, and zero motion there before the backend
+        // (DLSS/FSR) sees it.
+        const bool fresh = d.reset_pending || !d.have_history || !d.last_real;
+        if (!d.fixup->before(fresh ? nullptr : d.last_real->tex, set.real.tex, d.mvecs_from_flow ? d.mvec.tex : nullptr)) {
+            qCWarning(chiakiGui) << "[framegen] Generated frame clean-up failed, turned off";
+            d.fixup.reset();
+            d.fixup_failed = true;
+        }
     }
     if (d.mvecs_from_flow) {
         d.mvec_dirty = true;
@@ -1651,6 +1727,7 @@ void FrameGen::reset() {}
 void FrameGen::setFlowHighQuality(bool) {}
 void FrameGen::setDlssMotion(int) {}
 void FrameGen::setVfgMode(int) {}
+void FrameGen::setCleanup(int) {}
 void FrameGen::destroy() {}
 bool FrameGen::process(const struct pl_frame *, int, int, int, float, std::vector<struct pl_frame> &) { return false; }
 

@@ -562,6 +562,9 @@ class Settings : public QObject
 		// 2 = Flow's motion search with the opposite sign (to compare the conventions).
 		int GetFrameGenDlssMotion() const { return qBound(0, settings.value("settings/frame_gen_dlss_motion", 1).toInt(), 2); }
 		void SetFrameGenDlssMotion(int mode) { settings.setValue("settings/frame_gen_dlss_motion", qBound(0, mode, 2)); }
+		// Generated frame clean-up: 0 off, 1 static content (HUD), 2 static content + detail.
+		int GetFrameGenCleanup() const { return qBound(0, settings.value("settings/frame_gen_cleanup", 2).toInt(), 2); }
+		void SetFrameGenCleanup(int mode) { settings.setValue("settings/frame_gen_cleanup", qBound(0, mode, 2)); }
 		// Output frames per stream frame (2 = one generated frame per real frame)
 		int GetFrameGenMultiplier() const { return qBound(2, settings.value("settings/frame_gen_multiplier", 2).toInt(), 4); }
 		void SetFrameGenMultiplier(int multiplier) { settings.setValue("settings/frame_gen_multiplier", qBound(2, multiplier, 4)); }

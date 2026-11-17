@@ -104,6 +104,27 @@ Settings → Video (and Ctrl+O → Enhancement) switches between *Flow* and *Zer
 motion* for comparison; **Flow Quality** sets the analysis resolution
 (Performance ≈0.5 ms). The log shows `DLSS motion vectors: Flow`.
 
+### Generated frame clean-up
+
+**Generated Frame Clean-up** (Settings → Video, or Ctrl+O → Enhancement)
+post-processes the frames of every backend, after an idea of VeyAmux (the
+Linux port of Veyra):
+
+- **Protect HUD and text:** pixels with texture that stayed unchanged for 6
+  real frames count as static (HUD, text, mini-map, logos). They get zero
+  motion before DLSS/FSR run and the real pixel in the generated frames, and
+  moving background next to them is taken from the frame where it is not
+  covered, so text is not dragged along.
+- **+ keep detail** (default): where the two frames, moved along the motion,
+  do not agree (fine detail, foliage, the edge of a moving character), the
+  smeared blend is replaced by the sharper of the two samples. Sharp real
+  frames alternating with smeared generated ones is what reads as flicker
+  while panning. Not applied to Flow, whose synthesis already does this.
+
+Both use Flow's motion search (Flow Quality applies, about 0.5 ms at
+Performance). FSR Frame Generation now also gets these motion vectors
+instead of zero motion.
+
 ### 30 fps games in a 60 fps stream
 
 The console keeps sending 60 frames per second even when the game renders

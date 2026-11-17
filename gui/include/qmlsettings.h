@@ -119,6 +119,7 @@ class QmlSettings : public QObject
 	Q_PROPERTY(bool ambientBorderSupported READ ambientBorderSupported CONSTANT)
 	Q_PROPERTY(bool frameGenFlowHighQuality READ frameGenFlowHighQuality WRITE setFrameGenFlowHighQuality NOTIFY frameGenFlowHighQualityChanged)
 	Q_PROPERTY(int frameGenDlssMotion READ frameGenDlssMotion WRITE setFrameGenDlssMotion NOTIFY frameGenDlssMotionChanged)
+	Q_PROPERTY(int frameGenCleanup READ frameGenCleanup WRITE setFrameGenCleanup NOTIFY frameGenCleanupChanged)
 	Q_PROPERTY(bool placeboDeinterlaceEnabled READ placeboDeinterlaceEnabled WRITE setPlaceboDeinterlaceEnabled NOTIFY placeboDeinterlaceEnabledChanged)
 	Q_PROPERTY(int placeboDeinterlacePreset READ placeboDeinterlacePreset WRITE setPlaceboDeinterlacePreset NOTIFY placeboDeinterlacePresetChanged)
 	Q_PROPERTY(int placeboDeinterlaceAlgorithm READ placeboDeinterlaceAlgorithm WRITE setPlaceboDeinterlaceAlgorithm NOTIFY placeboDeinterlaceAlgorithmChanged)
@@ -399,6 +400,8 @@ public:
     void setFrameGenFlowHighQuality(bool high);
     int frameGenDlssMotion() const;
     void setFrameGenDlssMotion(int mode);
+    int frameGenCleanup() const;
+    void setFrameGenCleanup(int mode);
     void setPlaceboFrameMixer(int mixer);
 
     bool placeboDeinterlaceEnabled() const;
@@ -666,6 +669,7 @@ public:
 signals:
     void frameGenFlowHighQualityChanged();
     void frameGenDlssMotionChanged();
+    void frameGenCleanupChanged();
     void frameGenVfgModeChanged();
     void frameGenVfgRuntimeChanged();
     void vfgRuntimeDownloadStateChanged();

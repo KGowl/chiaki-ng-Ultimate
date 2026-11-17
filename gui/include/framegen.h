@@ -68,6 +68,9 @@ public:
     void setDlssMotion(int mode);
     // NVIDIA VFG model: 0 Low, 1 Medium, 2 High.
     void setVfgMode(int mode);
+    // Clean-up of the generated frames (see fgfixup.h): 0 off, 1 static
+    // content (HUD, text) only, 2 static content and fine detail (default).
+    void setCleanup(int mode);
 
     // Waits for in-flight work and releases every Vulkan and backend resource.
     // Must be called before the pl_vulkan device is destroyed.
@@ -84,6 +87,9 @@ public:
     struct Impl;
 
 private:
+    bool processFrames(const struct pl_frame *src, int out_w, int out_h, int multiplier,
+                       float frame_interval_ms, std::vector<struct pl_frame> &outputs);
+
     std::unique_ptr<Impl> impl;
 };
 
