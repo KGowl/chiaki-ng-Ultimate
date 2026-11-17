@@ -7789,6 +7789,7 @@ void QmlMainWindow::render()
                 }
             }
             frame_gen->setFlowHighQuality(settings->GetFrameGenFlowHighQuality());
+            frame_gen->setDlssFlowMotion(settings->GetFrameGenDlssFlowMotion());
             if (multiplier >= 2 &&
                 frame_gen->process(&direct_render_frame, fg_out_w, fg_out_h, multiplier,
                                    static_cast<float>(source_interval_s * 1000.0), fg_outputs) &&

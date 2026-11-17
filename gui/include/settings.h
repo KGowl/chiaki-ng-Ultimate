@@ -555,6 +555,9 @@ class Settings : public QObject
 		// Flow frame generation analysis resolution: false = 1/4 (performance), true = 1/2 (quality)
 		bool GetFrameGenFlowHighQuality() const { return settings.value("settings/frame_gen_flow_high_quality", false).toBool(); }
 		void SetFrameGenFlowHighQuality(bool high) { settings.setValue("settings/frame_gen_flow_high_quality", high); }
+		// DLSS Frame Generation motion vectors from Flow's motion search (true) or zero motion.
+		bool GetFrameGenDlssFlowMotion() const { return settings.value("settings/frame_gen_dlss_flow_motion", true).toBool(); }
+		void SetFrameGenDlssFlowMotion(bool enabled) { settings.setValue("settings/frame_gen_dlss_flow_motion", enabled); }
 		// Output frames per stream frame (2 = one generated frame per real frame)
 		int GetFrameGenMultiplier() const { return qBound(2, settings.value("settings/frame_gen_multiplier", 2).toInt(), 4); }
 		void SetFrameGenMultiplier(int multiplier) { settings.setValue("settings/frame_gen_multiplier", qBound(2, multiplier, 4)); }

@@ -38,6 +38,13 @@ public:
     // of `cur` is prepared for the next call (start of a sequence).
     bool interpolate(pl_tex prev, pl_tex cur, pl_tex const *outputs, const float *times, int count);
 
+    // Motion vectors for DLSS Frame Generation: writes, for each pixel of
+    // `cur`, the displacement to the same content in `prev` in pixels into the
+    // storable two-channel float texture `out` (same size as `cur`). With
+    // `prev` null only the analysis of `cur` is prepared and `written` stays
+    // false.
+    bool motionVectors(pl_tex prev, pl_tex cur, pl_tex out, bool *written);
+
     // Drops all size dependent state.
     void invalidate();
 
@@ -51,6 +58,8 @@ public:
     float gpuTimeMs() const;
 
 private:
+    bool analyze(pl_tex prev, pl_tex cur, float anchor, bool &analyzed);
+
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

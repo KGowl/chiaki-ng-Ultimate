@@ -1125,7 +1125,7 @@ DialogView {
                     C.ComboBox {
                         Layout.preferredWidth: 400
                         visible: Chiaki.settings.frameGenFlowSupported
-                        enabled: Chiaki.settings.frameGenBackend === 3
+                        enabled: Chiaki.settings.frameGenBackend === 3 || (Chiaki.settings.frameGenBackend === 1 && Chiaki.settings.frameGenDlssFlowMotion)
                         model: [qsTr("Performance (1/4 resolution motion analysis)"), qsTr("Quality (1/2 resolution motion analysis)")]
                         currentIndex: Chiaki.settings.frameGenFlowHighQuality ? 1 : 0
                         onActivated: index => Chiaki.settings.frameGenFlowHighQuality = index === 1
@@ -1137,6 +1137,29 @@ DialogView {
                         Layout.alignment: Qt.AlignRight
                         visible: Chiaki.settings.frameGenFlowSupported
                         text: qsTr("(Performance)")
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        visible: Chiaki.settings.frameGenDlssSupported
+                        text: qsTr("DLSS Motion Vectors:")
+                    }
+
+                    C.ComboBox {
+                        Layout.preferredWidth: 400
+                        visible: Chiaki.settings.frameGenDlssSupported
+                        enabled: Chiaki.settings.frameGenBackend === 1
+                        model: [qsTr("Flow motion search (sharp edges, less jelly)"), qsTr("Zero motion")]
+                        currentIndex: Chiaki.settings.frameGenDlssFlowMotion ? 0 : 1
+                        onActivated: index => Chiaki.settings.frameGenDlssFlowMotion = index === 0
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("A video stream has no motion vectors. With Flow, DLSS Frame Generation gets per-pixel motion from chiaki-ng's motion search (Flow Quality applies, about 0.5 ms at Performance); with zero motion it relies on its own optical flow only, which drags the background along moving edges.")
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        visible: Chiaki.settings.frameGenDlssSupported
+                        text: qsTr("(Flow)")
                     }
 
                     Label {

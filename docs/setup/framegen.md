@@ -57,6 +57,19 @@ Settings → Video → **Frame Generation**: pick DLSS, FSR or Flow, then the
 [RTX Video Super Resolution](rtxvideo.md): frames are upscaled first, then
 generated.
 
+### DLSS motion vectors
+
+DLSS Frame Generation is made for games, which hand it per-pixel motion
+vectors and depth. A video stream has neither; with zero motion DLSS relies on
+its own optical flow alone and drags the background along the edges of moving
+characters ("jelly"). By default chiaki-ng now gives it per-pixel motion from
+Flow's motion search, measured at the current frame: every pixel takes the
+vector of the nearby block whose source in the previous frame matches it, so
+edges stay sharp and HUD elements get zero motion. **DLSS Motion Vectors** in
+Settings → Video (and Ctrl+O → Enhancement) switches between *Flow* and *Zero
+motion* for comparison; **Flow Quality** sets the analysis resolution
+(Performance ≈0.5 ms). The log shows `DLSS motion vectors: Flow`.
+
 ### 30 fps games in a 60 fps stream
 
 The console keeps sending 60 frames per second even when the game renders

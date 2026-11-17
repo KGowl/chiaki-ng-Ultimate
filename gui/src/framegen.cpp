@@ -139,6 +139,16 @@ struct FrameGen::Impl
     // Real frame of the previous call (Flow interpolates from it).
     FgImage *last_real = nullptr;
     bool flow_high_quality = false;
+    // DLSS Frame Generation gets per-pixel motion vectors from Flow's motion
+    // search instead of zero motion (which makes it drag the background along
+    // moving edges). `mvecs_from_flow` tells the backend how to scale them;
+    // `mvec_dirty` means `mvec` holds vectors that another backend must not see.
+    bool dlss_flow_motion = true;
+    std::unique_ptr<FlowInterpolator> motion_flow;
+    bool motion_flow_failed = false;
+    bool motion_flow_logged = false;
+    bool mvecs_from_flow = false;
+    bool mvec_dirty = false;
     // The first calls after a backend starts are logged step by step.
     int trace_frames = 0;
 
@@ -518,6 +528,7 @@ void FrameGen::Impl::shutdownCommon()
     if (vkWaitSemaphores)
         waitDone(done_value);
     destroyBackend();
+    motion_flow.reset();
     if (vkDestroyImageView)
         destroyImages();
     if (pool)
@@ -653,8 +664,10 @@ public:
             opt.multiFrameCount = static_cast<unsigned int>(count);
             opt.multiFrameIndex = static_cast<unsigned int>(i + 1);
             fillCamera(opt, color.w, color.h);
-            opt.mvecScale[0] = 1.0f;
-            opt.mvecScale[1] = 1.0f;
+            // Flow's vectors are the displacement to the previous frame in
+            // pixels; DLSS Frame Generation takes them normalized and reversed.
+            opt.mvecScale[0] = fg.mvecs_from_flow ? -1.0f / static_cast<float>(color.w) : 1.0f;
+            opt.mvecScale[1] = fg.mvecs_from_flow ? -1.0f / static_cast<float>(color.h) : 1.0f;
             opt.colorBuffersHDR = false;
             opt.depthInverted = false;
             opt.cameraMotionIncluded = true;
@@ -1118,6 +1131,13 @@ void FrameGen::setFlowHighQuality(bool high)
     impl->flow_high_quality = high;
 }
 
+void FrameGen::setDlssFlowMotion(bool enabled)
+{
+    if (enabled != impl->dlss_flow_motion)
+        impl->motion_flow_logged = false;
+    impl->dlss_flow_motion = enabled;
+}
+
 void FrameGen::destroy()
 {
     impl->shutdownCommon();
@@ -1176,6 +1196,46 @@ bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int mul
         return false;
     }
     trace_step("input rendered");
+
+    d.mvecs_from_flow = false;
+    if (d.backend == FrameGen::Backend::Dlss && d.dlss_flow_motion && !d.motion_flow_failed) {
+        if (!d.motion_flow) {
+            d.motion_flow = std::make_unique<FlowInterpolator>(d.log, d.gpu);
+            if (!d.motion_flow->init()) {
+                qCWarning(chiakiGui) << "[framegen] Flow motion vectors unavailable, DLSS gets zero motion";
+                d.motion_flow.reset();
+                d.motion_flow_failed = true;
+            }
+        }
+        if (d.motion_flow) {
+            d.motion_flow->setAnalysisScale(d.flow_high_quality ? 2 : 4);
+            const bool fresh = d.reset_pending || !d.have_history || !d.last_real;
+            bool written = false;
+            if (!d.motion_flow->motionVectors(fresh ? nullptr : d.last_real->tex, set.real.tex, d.mvec.tex, &written)) {
+                qCWarning(chiakiGui) << "[framegen] Flow motion vectors failed, DLSS gets zero motion";
+                d.motion_flow.reset();
+                d.motion_flow_failed = true;
+                written = false;
+            }
+            d.mvecs_from_flow = written;
+            if (written && !d.motion_flow_logged) {
+                d.motion_flow_logged = true;
+                qCInfo(chiakiGui) << "[framegen] DLSS motion vectors: Flow"
+                                  << (d.flow_high_quality ? "(1/2 resolution analysis)" : "(1/4 resolution analysis)");
+            }
+        }
+        trace_step(d.mvecs_from_flow ? "flow motion vectors" : "zero motion vectors");
+    }
+    if (d.mvecs_from_flow) {
+        d.mvec_dirty = true;
+    } else if (d.mvec_dirty) {
+        // Back to zero motion (first frame, scene start, other backend).
+        const float zero_value[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        const uint16_t zero_mvec[2] = { 0, 0 };
+        if (!d.fillConstant(d.mvec, zero_value, zero_mvec, sizeof(zero_mvec)))
+            return false;
+        d.mvec_dirty = false;
+    }
 
     if (d.backend == FrameGen::Backend::Flow) {
         auto *flow = static_cast<FlowBackend *>(d.backend_impl.get());
@@ -1338,6 +1398,7 @@ int FrameGen::maxMultiplier() const { return 1; }
 float FrameGen::gpuTimeMs() const { return 0.0f; }
 void FrameGen::reset() {}
 void FrameGen::setFlowHighQuality(bool) {}
+void FrameGen::setDlssFlowMotion(bool) {}
 void FrameGen::destroy() {}
 bool FrameGen::process(const struct pl_frame *, int, int, int, float, std::vector<struct pl_frame> &) { return false; }
 

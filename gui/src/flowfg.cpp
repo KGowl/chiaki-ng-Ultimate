@@ -61,19 +61,22 @@ for (int j = 0; j < 2; j++)
 imageStore(fgDst, p, vec4(s * 0.25, 0.0, 0.0, 1.0));
 )GLSL";
 
-// Matching cost of the symmetric motion `v` (in level texels) at texel
-// centre `c`: mean absolute luma difference over a 3x3 patch.
+// Matching cost of the motion `v` (in level texels) at texel centre `c`:
+// mean absolute luma difference over a 3x3 patch. `fgAnchor` is the time the
+// texel belongs to: 0.5 for the in-between frame (prev(c - v/2) against
+// cur(c + v/2)), 1 for the current frame (prev(c - v) against cur(c)).
 const char *kSearchHeader = R"GLSL(
 float flow_cost(vec2 c, vec2 v)
 {
     vec2 inv = 1.0 / fgSize;
-    vec2 h = 0.5 * v;
+    vec2 ha = fgAnchor * v;
+    vec2 hb = (1.0 - fgAnchor) * v;
     float s = 0.0;
     for (int j = -1; j <= 1; j++) {
         for (int i = -1; i <= 1; i++) {
             vec2 d = vec2(i, j) * fgPatchStep;
-            float a = textureLod(fgPrevL, (c + d - h) * inv, 0.0).r;
-            float b = textureLod(fgCurL, (c + d + h) * inv, 0.0).r;
+            float a = textureLod(fgPrevL, (c + d - ha) * inv, 0.0).r;
+            float b = textureLod(fgCurL, (c + d + hb) * inv, 0.0).r;
             s += abs(a - b);
         }
     }
@@ -337,6 +340,45 @@ if (st.x > 0.12 || st.y > 0.45) {
 imageStore(fgOutImg, p, vec4(res, 1.0));
 )GLSL";
 
+// Per-pixel motion vectors for DLSS Frame Generation, from block motion
+// measured at the current frame (anchor 1): each pixel picks, among the
+// vectors of the blocks around it (the same candidates as the synthesis) and
+// zero, the one whose source in the previous frame matches it best. That keeps vectors sharp at object edges instead of
+// dragging the background along, and HUD/overlays at zero. Written as the
+// displacement from the pixel to the same content in the previous frame, in
+// display pixels; DLSS gets it scaled by -1/size.
+const char *kVectorsBody = R"GLSL(
+ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+if (p.x >= int(fgSize.x) || p.y >= int(fgSize.y))
+    return;
+vec2 inv = 1.0 / fgSize;
+vec2 c = vec2(p) + 0.5;
+vec4 st = texelFetch(fgStats, ivec2(0), 0);
+vec2 bv = vec2(0.0);
+if (st.x <= 0.12 && st.y <= 0.45) {
+    vec2 fc = c * (fgFlowSize / fgSize);
+    vec2 vb = textureLod(fgFlow, fc / fgFlowSize, 0.0).xy;
+    vec3 a = vec3(0.0);
+    vec3 b = vec3(0.0);
+    float err = 1e9;
+    bv = vb;
+    flow_pick(c, vb, vb, inv, a, b, err, bv);
+    ivec2 fp = ivec2(floor(fc - 0.5));
+    ivec2 fmax = ivec2(fgFlowSize) - 1;
+    for (int j = 0; j <= 1; j++)
+        for (int i = 0; i <= 1; i++)
+            flow_pick(c, texelFetch(fgFlow, clamp(fp + ivec2(i, j), ivec2(0), fmax), 0).xy, vb, inv, a, b, err, bv);
+    for (int r = 0; r < 2; r++) {
+        int reach = int(r == 0 ? fgReach : fgReachFar);
+        for (int j = -reach; j <= 1 + reach; j += 1 + 2 * reach)
+            for (int i = -reach; i <= 1 + reach; i += 1 + 2 * reach)
+                flow_pick(c, texelFetch(fgFlow, clamp(fp + ivec2(i, j), ivec2(0), fmax), 0).xy, vb, inv, a, b, err, bv);
+    }
+    flow_pick(c, vec2(0.0), vb, inv, a, b, err, bv);
+}
+imageStore(fgOutImg, p, vec4(-bv, 0.0, 0.0));
+)GLSL";
+
 struct pl_shader_desc sampledDesc(const char *name, pl_tex tex, bool linear = true)
 {
     struct pl_shader_desc d = {};
@@ -408,6 +450,9 @@ struct FlowInterpolator::Impl
     std::array<pl_tex, 2> final_flow = {};
     int final_index = 0;
     bool have_temporal = false;
+    // Time the motion is measured at: 0.5 (in-between frame) for synthesis,
+    // 1 (current frame) for motion vectors.
+    float anchor = 0.5f;
     pl_tex stats = nullptr;
     // Bound where a pass needs no input (every descriptor of a pass must be
     // a distinct texture).
@@ -668,8 +713,14 @@ float FlowInterpolator::gpuTimeMs() const
     return impl->gpu_ms;
 }
 
-bool FlowInterpolator::interpolate(pl_tex prev, pl_tex cur, pl_tex const *outputs, const float *times, int count)
+bool FlowInterpolator::analyze(pl_tex prev, pl_tex cur, float anchor, bool &analyzed)
 {
+    analyzed = false;
+    if (impl->anchor != anchor) {
+        // The previous motion was measured at another time; do not seed from it.
+        impl->anchor = anchor;
+        impl->have_temporal = false;
+    }
     Impl &d = *impl;
     if (!d.dp || !cur)
         return false;
@@ -726,7 +777,7 @@ bool FlowInterpolator::interpolate(pl_tex prev, pl_tex cur, pl_tex const *output
                    { vec2Var("fgSize", size), vec2Var("fgCoarseSize", coarse_size), floatVar("fgToFull", &to_full),
                      floatVar("fgMaxFlow", &max_flow), floatVar("fgHasCoarse", &has_coarse),
                      floatVar("fgHasTemporal", &has_temporal), intVar("fgRadius", &radius),
-                     floatVar("fgPatchStep", &patch_step) },
+                     floatVar("fgPatchStep", &patch_step), floatVar("fgAnchor", &d.anchor) },
                    d.lw[l], d.lh[l], 16))
             return false;
     }
@@ -742,7 +793,7 @@ bool FlowInterpolator::interpolate(pl_tex prev, pl_tex cur, pl_tex const *output
                    { sampledDesc("fgPrevL", prev_pyr->luma[0]), sampledDesc("fgCurL", cur_pyr.luma[0]),
                      sampledDesc("fgCoarse", d.flow[0], false), storageDesc("fgDst", d.final_flow[static_cast<size_t>(next_final)]) },
                    { vec2Var("fgSize", size), floatVar("fgToFull", &to_full), floatVar("fgMaxFlow", &max_flow),
-                     floatVar("fgPatchStep", &patch_step) },
+                     floatVar("fgPatchStep", &patch_step), floatVar("fgAnchor", &d.anchor) },
                    d.lw[0], d.lh[0], 16))
             return false;
     }
@@ -766,7 +817,19 @@ bool FlowInterpolator::interpolate(pl_tex prev, pl_tex cur, pl_tex const *output
     }
     d.final_index = next_final;
     d.have_temporal = true;
+    analyzed = true;
+    return true;
+}
 
+bool FlowInterpolator::interpolate(pl_tex prev, pl_tex cur, pl_tex const *outputs, const float *times, int count)
+{
+    bool analyzed = false;
+    if (!analyze(prev, cur, 0.5f, analyzed))
+        return false;
+    if (!analyzed)
+        return true;
+    Impl &d = *impl;
+    const float full[2] = { static_cast<float>(d.width), static_cast<float>(d.height) };
     // Synthesis of each requested frame.
     pl_tex final_tex = d.final_flow[static_cast<size_t>(d.final_index)];
     const float flow_size[2] = { static_cast<float>(d.lw[0]), static_cast<float>(d.lh[0]) };
@@ -785,5 +848,34 @@ bool FlowInterpolator::interpolate(pl_tex prev, pl_tex cur, pl_tex const *output
                    d.width, d.height, 16))
             return false;
     }
+    return true;
+}
+
+bool FlowInterpolator::motionVectors(pl_tex prev, pl_tex cur, pl_tex out, bool *written)
+{
+    *written = false;
+    bool analyzed = false;
+    if (!out || !analyze(prev, cur, 1.0f, analyzed))
+        return false;
+    if (!analyzed)
+        return true;
+    Impl &d = *impl;
+    if (out->params.w != d.width || out->params.h != d.height)
+        return false;
+    const float full[2] = { static_cast<float>(d.width), static_cast<float>(d.height) };
+    const float flow_size[2] = { static_cast<float>(d.lw[0]), static_cast<float>(d.lh[0]) };
+    const float reach = d.base_scale < kDefaultBaseScale ? 2.0f : 1.0f;
+    const float reach_far = d.base_scale < kDefaultBaseScale ? 9.0f : 4.0f;
+    // Candidates are scored at the current frame (t = 1).
+    const float t = 1.0f;
+    if (!d.run("flow motion vectors", kSynthHeader, kVectorsBody,
+               { sampledDesc("fgPrevC", prev), sampledDesc("fgCurC", cur),
+                 sampledDesc("fgFlow", d.final_flow[static_cast<size_t>(d.final_index)]),
+                 sampledDesc("fgStats", d.stats, false), storageDesc("fgOutImg", out) },
+               { vec2Var("fgSize", full), vec2Var("fgFlowSize", flow_size), floatVar("fgT", &t),
+                 floatVar("fgReach", &reach), floatVar("fgReachFar", &reach_far) },
+               d.width, d.height, 16))
+        return false;
+    *written = true;
     return true;
 }

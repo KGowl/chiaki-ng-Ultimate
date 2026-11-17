@@ -61,6 +61,9 @@ public:
 
     // Flow backend only: analyse motion at 1/2 instead of 1/4 resolution.
     void setFlowHighQuality(bool high);
+    // DLSS Frame Generation: per-pixel motion vectors from Flow's motion
+    // search (true, default) or zero motion (false). Uses the Flow quality.
+    void setDlssFlowMotion(bool enabled);
 
     // Waits for in-flight work and releases every Vulkan and backend resource.
     // Must be called before the pl_vulkan device is destroyed.
