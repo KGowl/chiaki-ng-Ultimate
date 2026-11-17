@@ -1248,9 +1248,9 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
             return disable("after repeated failures");
         return false;
     };
-    auto crashed = [&](unsigned long code) {
+    auto crashed = [&](unsigned long code, const char *stage) {
         qCCritical(chiakiGui).nospace() << "[framegen] NVIDIA VFG crashed inside its runtime (exception 0x"
-                                        << Qt::hex << code << Qt::dec << ", in " << runner->stage() << ")";
+                                        << Qt::hex << code << Qt::dec << ", in " << stage << ")";
         // Its state is unknown: leak it rather than call into it again.
         backend_failed[static_cast<size_t>(backend)] = true;
         (void)backend_vfg->runner.release();
@@ -1270,6 +1270,17 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
         return vkBeginCommandBuffer(slot.cmd, &begin_info) == VK_SUCCESS ? &slot : nullptr;
     };
 
+    // Results of the generation queued for the previous frame.
+    {
+        unsigned long code = 0;
+        const char *stage = "";
+        const int status = runner->takeStatus(&code, &stage);
+        if (status == 2)
+            return crashed(code, stage);
+        if (status == 1)
+            return fail("generation failed");
+    }
+
     const int w = set.real.w;
     const int h = set.real.h;
     if (!runner->sizeMatches(w, h, vfg_mode)) {
@@ -1279,7 +1290,7 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
         unsigned long seh_code = 0;
         const bool sized = guardedCall([&]() { return runner->ensureSize(w, h, vfg_mode); }, &seh_code);
         if (seh_code)
-            return crashed(seh_code);
+            return crashed(seh_code, runner->stage());
         if (!sized)
             return disable("(the effect could not be set up, see above)");
         reset_pending = true;
@@ -1326,25 +1337,17 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
         return true;
     }
 
-    // (2) CUDA: generate between the previous and this frame.
+    // (2) Generation between the previous and this frame, on the runner's
+    // worker thread; it always signals `output_value`.
     const uint64_t output_value = input_value + 1;
-    bool signalled = false;
-    unsigned long seh_code = 0;
-    const bool generated_ok = guardedCall([&]() {
-        return runner->generate(prev_slot, cur_slot, count, false, input_value, output_value, &signalled);
-    }, &seh_code);
-    if (seh_code)
-        return crashed(seh_code);
-    trace_step(generated_ok ? "vfg generation queued" : "vfg generation failed");
+    runner->generateAsync(prev_slot, cur_slot, count, input_value, output_value);
+    runner->setLastValue(output_value);
+    trace_step("vfg generation queued");
 
-    // (3) Shared output buffers -> generated textures. Runs even after a
-    // failure when CUDA still signals, so the semaphore keeps advancing.
+    // (3) Shared output buffers -> generated textures, once the model is done.
     slot = begin_slot();
-    if (!slot) {
-        if (signalled)
-            runner->setLastValue(output_value);
+    if (!slot)
         return fail("command buffer unavailable");
-    }
     std::array<FgImage *, kMaxGenerated> held = {};
     size_t num_held = 0;
     bool holds_ok = true;
@@ -1355,32 +1358,23 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
             break;
         }
         held[num_held++] = &img;
-        if (generated_ok)
-            runner->recordDownload(slot->cmd, img.image, i);
+        runner->recordDownload(slot->cmd, img.image, i);
     }
     ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
     {
-        const SemValue extra_waits[] = { { runner->semaphore(), signalled ? output_value : input_value } };
-        const SemValue own_signal[] = { { runner->semaphore(), output_value } };
-        ok = ok && submitEx(slot->cmd, held.data(), num_held, extra_waits, 1,
-                            signalled ? nullptr : own_signal, signalled ? 0 : 1);
+        const SemValue extra_waits[] = { { runner->semaphore(), output_value } };
+        ok = ok && submitEx(slot->cmd, held.data(), num_held, extra_waits, 1, nullptr, 0);
     }
-    if (ok) {
+    if (ok)
         slot->done_value = done_value;
-        runner->setLastValue(output_value);
-    } else if (signalled) {
-        runner->setLastValue(output_value);
-    }
     for (size_t i = 0; i < num_held; i++) {
         if (ok)
             release(*held[i], sem_done, done_value);
         else
             release(*held[i], held[i]->sem, held[i]->value);
     }
-    if (!ok)
+    if (!ok || !holds_ok)
         return fail("copying the generated frames failed");
-    if (!generated_ok || !holds_ok)
-        return fail("generation failed");
     trace_step("vfg frames submitted");
 
     consecutive_failures = 0;

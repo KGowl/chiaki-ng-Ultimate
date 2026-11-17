@@ -52,13 +52,17 @@ public:
     void recordUpload(VkCommandBuffer cmd, VkImage image, int slot);
     void recordDownload(VkCommandBuffer cmd, VkImage image, int index);
 
-    // Queues on the CUDA stream: wait for `wait_value`, generate `count`
-    // evenly spaced frames between input `prev_slot` and `cur_slot` into the
-    // output buffers, signal `signal_value`. Returns false on failure;
-    // `signalled` tells whether CUDA will still signal `signal_value` (if not,
-    // the caller has to, or nothing waiting for it ever runs).
-    bool generate(int prev_slot, int cur_slot, int count, bool shot_change,
-                  uint64_t wait_value, uint64_t signal_value, bool *signalled);
+    // On the runner's worker thread (the SDK calls block for most of the
+    // model's run time, which must not stall the render thread): waits for
+    // `wait_value`, generates `count` evenly spaced frames between input
+    // `prev_slot` and `cur_slot` into the output buffers and signals
+    // `signal_value`. The value is always signalled, from the host if CUDA
+    // cannot, so Vulkan work waiting for it never hangs; failures are
+    // reported through takeStatus().
+    void generateAsync(int prev_slot, int cur_slot, int count, uint64_t wait_value, uint64_t signal_value);
+    // 0 = fine, 1 = a generation failed, 2 = the runtime crashed (`code`,
+    // `stage` say where; the runner must not be used any more). Resets 1.
+    int takeStatus(unsigned long *code, const char **stage);
 
     // Average GPU time of the generation per stream frame in milliseconds.
     float gpuTimeMs();

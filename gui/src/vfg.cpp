@@ -1,4 +1,5 @@
 #include "vfg.h"
+#include "vkguard.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -40,7 +41,13 @@ QString VfgRunner::findRuntime()
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <type_traits>
 
 namespace {
@@ -139,6 +146,8 @@ struct VfgRunner::Impl
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = nullptr;
     PFN_vkCmdCopyImageToBuffer vkCmdCopyImageToBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = nullptr;
+    PFN_vkSignalSemaphore vkSignalSemaphore = nullptr;
+    PFN_vkWaitSemaphores vkWaitSemaphores = nullptr;
     VkPhysicalDeviceMemoryProperties memory_props = {};
     std::array<uint8_t, VK_LUID_SIZE> luid = {};
     bool luid_valid = false;
@@ -218,6 +227,86 @@ struct VfgRunner::Impl
     int mode = -1;
     VkDeviceSize pitch = 0;
     unsigned bound_multiplier = 0;
+
+    // Worker thread running the SDK calls in submission order.
+    std::thread worker;
+    std::mutex jobs_mutex;
+    std::condition_variable jobs_cv;
+    std::condition_variable idle_cv;
+    std::deque<std::function<void()>> jobs;
+    bool busy = false;
+    bool stopping = false;
+    // Set by the worker after a crash; later jobs only signal from the host.
+    bool dead = false;
+    std::atomic<int> status { 0 };
+    unsigned long crash_code = 0;
+    const char *crash_stage = "";
+
+    void startWorker()
+    {
+        worker = std::thread([this]() {
+            std::unique_lock<std::mutex> lock(jobs_mutex);
+            for (;;) {
+                jobs_cv.wait(lock, [this]() { return stopping || !jobs.empty(); });
+                if (jobs.empty())
+                    break;
+                std::function<void()> job = std::move(jobs.front());
+                jobs.pop_front();
+                busy = true;
+                lock.unlock();
+                job();
+                lock.lock();
+                busy = false;
+                idle_cv.notify_all();
+            }
+        });
+    }
+    void enqueue(std::function<void()> job)
+    {
+        {
+            std::lock_guard<std::mutex> lock(jobs_mutex);
+            jobs.push_back(std::move(job));
+        }
+        jobs_cv.notify_one();
+    }
+    // Waits until every queued job has run.
+    void drain()
+    {
+        if (!worker.joinable())
+            return;
+        std::unique_lock<std::mutex> lock(jobs_mutex);
+        idle_cv.wait(lock, [this]() { return jobs.empty() && !busy; });
+    }
+    void stopWorker()
+    {
+        if (!worker.joinable())
+            return;
+        {
+            std::lock_guard<std::mutex> lock(jobs_mutex);
+            stopping = true;
+        }
+        jobs_cv.notify_one();
+        worker.join();
+    }
+    // Signals `value` from the host once `after` is reached (timeline values
+    // must only grow, and Vulkan signals `after` itself).
+    void hostSignal(uint64_t after, uint64_t value)
+    {
+        VkSemaphoreWaitInfo wait_info = {};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &sem;
+        wait_info.pValues = &after;
+        vkWaitSemaphores(vk->device, &wait_info, 2000000000ull);
+        VkSemaphoreSignalInfo signal_info = {};
+        signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+        signal_info.semaphore = sem;
+        signal_info.value = value;
+        if (vkSignalSemaphore(vk->device, &signal_info) != VK_SUCCESS)
+            qCWarning(chiakiGui) << "[framegen] VFG: could not signal the shared semaphore";
+    }
+
+    bool generate(int prev_slot, int cur_slot, int count, uint64_t wait_value, uint64_t signal_value, bool *signalled);
 
     bool cuOk(cu::Result r, const char *what)
     {
@@ -381,6 +470,8 @@ bool VfgRunner::Impl::loadVulkan()
     VFG_DEVICE_PROC(vkGetMemoryWin32HandleKHR)
     VFG_DEVICE_PROC(vkCmdCopyImageToBuffer)
     VFG_DEVICE_PROC(vkCmdCopyBufferToImage)
+    VFG_DEVICE_PROC(vkSignalSemaphore)
+    VFG_DEVICE_PROC(vkWaitSemaphores)
 #undef VFG_DEVICE_PROC
     auto get_memory_props = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
         vk->get_proc_addr(vk->instance, "vkGetPhysicalDeviceMemoryProperties"));
@@ -542,6 +633,7 @@ bool VfgRunner::Impl::createEffect()
 
 void VfgRunner::Impl::destroySized()
 {
+    drain();
     Current current(*this);
     if (current.active && stream)
         cuStreamSynchronize(stream);
@@ -567,6 +659,8 @@ VfgRunner::VfgRunner(pl_vulkan vk, PFN_vkGetDeviceProcAddr get_device_proc)
 VfgRunner::~VfgRunner()
 {
     Impl &d = *impl;
+    d.drain();
+    d.stopWorker();
     if (d.vfx_dll && d.cuda_dll)
         d.destroySized();
     {
@@ -632,6 +726,7 @@ bool VfgRunner::init()
     CloseHandle(handle.handle);
     if (!imported)
         return false;
+    d.startWorker();
     qCInfo(chiakiGui) << "[framegen] NVIDIA VFG initialized";
     return true;
 }
@@ -722,10 +817,11 @@ void VfgRunner::recordDownload(VkCommandBuffer cmd, VkImage image, int index)
     d.vkCmdCopyBufferToImage(cmd, d.outputs[static_cast<size_t>(index)].buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
-bool VfgRunner::generate(int prev_slot, int cur_slot, int count, bool shot_change,
-                         uint64_t wait_value, uint64_t signal_value, bool *signalled)
+bool VfgRunner::Impl::generate(int prev_slot, int cur_slot, int count, uint64_t wait_value, uint64_t signal_value,
+                               bool *signalled)
 {
-    Impl &d = *impl;
+    Impl &d = *this;
+    const bool shot_change = false; // the SDK's automatic detection is on
     *signalled = false;
     count = std::clamp(count, 1, kMaxOutputs);
     Impl::Current current(d);
@@ -783,8 +879,50 @@ bool VfgRunner::generate(int prev_slot, int cur_slot, int count, bool shot_chang
     if (!signalled_ok)
         return false;
     *signalled = true;
-    d.last_value = signal_value;
     return ok;
+}
+
+void VfgRunner::generateAsync(int prev_slot, int cur_slot, int count, uint64_t wait_value, uint64_t signal_value)
+{
+    Impl *d = impl.get();
+    d->enqueue([d, prev_slot, cur_slot, count, wait_value, signal_value]() {
+        if (d->dead) {
+            d->hostSignal(wait_value, signal_value);
+            return;
+        }
+        bool signalled = false;
+        unsigned long seh_code = 0;
+        const bool ok = guardedCall([&]() {
+            return d->generate(prev_slot, cur_slot, count, wait_value, signal_value, &signalled);
+        }, &seh_code);
+        if (!signalled)
+            d->hostSignal(wait_value, signal_value);
+        if (seh_code) {
+            d->crash_code = seh_code;
+            d->crash_stage = d->stage;
+            d->dead = true;
+            d->status.store(2);
+        } else if (!ok) {
+            int expected = 0;
+            d->status.compare_exchange_strong(expected, 1);
+        }
+    });
+}
+
+int VfgRunner::takeStatus(unsigned long *code, const char **stage)
+{
+    Impl &d = *impl;
+    const int status = d.status.load();
+    if (status == 2) {
+        *code = d.crash_code;
+        *stage = d.crash_stage;
+        return 2;
+    }
+    if (status == 1) {
+        int expected = 1;
+        d.status.compare_exchange_strong(expected, 0);
+    }
+    return status;
 }
 
 float VfgRunner::gpuTimeMs()
@@ -812,7 +950,8 @@ uint64_t VfgRunner::lastValue() const { return 0; }
 void VfgRunner::setLastValue(uint64_t) {}
 void VfgRunner::recordUpload(VkCommandBuffer, VkImage, int) {}
 void VfgRunner::recordDownload(VkCommandBuffer, VkImage, int) {}
-bool VfgRunner::generate(int, int, int, bool, uint64_t, uint64_t, bool *signalled) { *signalled = false; return false; }
+void VfgRunner::generateAsync(int, int, int, uint64_t, uint64_t) {}
+int VfgRunner::takeStatus(unsigned long *, const char **) { return 0; }
 float VfgRunner::gpuTimeMs() { return 0.0f; }
 const char *VfgRunner::stage() const { return ""; }
 
