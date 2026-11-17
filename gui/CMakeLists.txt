@@ -155,6 +155,45 @@ if(CHIAKI_ENABLE_FFX)
 	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_FFX)
 	message(STATUS "AMD FSR 3.1 Frame Generation enabled (FidelityFX SDK: ${CHIAKI_FFX_SDK_DIR})")
 endif()
+
+# FSR 3.1 frame generation built from the bundled FidelityFX SDK 1.1.4 sources
+# (optical flow + frame interpolation, Vulkan backend): AMD ships no runtime for
+# Linux. The shader permutation headers are pre-generated in
+# third-party/ffx-sdk/generated (scripts/ffx-gen-shaders.py).
+if(CHIAKI_ENABLE_FFX_SOURCE AND NOT CHIAKI_ENABLE_FFX)
+	find_package(Vulkan)
+	if(NOT Vulkan_FOUND)
+		message(WARNING "CHIAKI_ENABLE_FFX_SOURCE: Vulkan loader not found, FSR 3.1 Frame Generation disabled")
+	else()
+		set(FFX_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third-party/ffx-sdk")
+		add_library(chiaki-ffx STATIC
+			"${FFX_SRC_DIR}/src/shared/ffx_assert.cpp"
+			"${FFX_SRC_DIR}/src/shared/ffx_breadcrumbs_list.cpp"
+			"${FFX_SRC_DIR}/src/shared/ffx_message.cpp"
+			"${FFX_SRC_DIR}/src/shared/ffx_object_management.cpp"
+			"${FFX_SRC_DIR}/src/components/frameinterpolation/ffx_frameinterpolation.cpp"
+			"${FFX_SRC_DIR}/src/components/opticalflow/ffx_opticalflow.cpp"
+			"${FFX_SRC_DIR}/src/backends/shared/ffx_shader_blobs.cpp"
+			"${FFX_SRC_DIR}/src/backends/shared/blob_accessors/ffx_frameinterpolation_shaderblobs.cpp"
+			"${FFX_SRC_DIR}/src/backends/shared/blob_accessors/ffx_opticalflow_shaderblobs.cpp"
+			"${FFX_SRC_DIR}/src/backends/vk/ffx_vk.cpp"
+			"${FFX_SRC_DIR}/chiaki/ffx_stubs.cpp")
+		set_target_properties(chiaki-ffx PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_STANDARD 17)
+		target_compile_definitions(chiaki-ffx PRIVATE FFX_FI FFX_OF FFX_GCC)
+		target_compile_options(chiaki-ffx PRIVATE -w -include "${FFX_SRC_DIR}/chiaki/ffx_gcc_compat.h")
+		target_include_directories(chiaki-ffx PRIVATE
+			"${FFX_SRC_DIR}/src/components" "${FFX_SRC_DIR}/src/shared"
+			"${FFX_SRC_DIR}/src/backends/shared" "${FFX_SRC_DIR}/generated")
+		target_include_directories(chiaki-ffx PUBLIC
+			"${FFX_SRC_DIR}/include" "${FFX_SRC_DIR}/include/FidelityFX/host"
+			"${FFX_SRC_DIR}/include/FidelityFX/host/backends/vk")
+		target_link_libraries(chiaki-ffx PUBLIC Vulkan::Vulkan)
+		target_sources(chiaki PRIVATE src/ffxfi.cpp include/ffxfi.h)
+		target_link_libraries(chiaki chiaki-ffx)
+		target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_FFX_SOURCE)
+		message(STATUS "AMD FSR 3.1 Frame Generation enabled (bundled FidelityFX SDK 1.1.4 sources)")
+	endif()
+endif()
 if(CHIAKI_ENABLE_CLI)
 	add_definitions(-DCHIAKI_ENABLE_CLI)
 	target_link_libraries(chiaki chiaki-cli-lib)

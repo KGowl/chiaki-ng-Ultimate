@@ -1,6 +1,9 @@
 #include "framegen.h"
 #include "flowfg.h"
 #include "fgfixup.h"
+#if defined(CHIAKI_HAVE_FFX_SOURCE)
+#include "ffxfi.h"
+#endif
 #include "vfg.h"
 #include "ngxcore.h"
 #include "gputimer.h"
@@ -1017,6 +1020,56 @@ private:
 
 #endif // CHIAKI_HAVE_FFX
 
+#if defined(CHIAKI_HAVE_FFX_SOURCE) && !defined(CHIAKI_HAVE_FFX)
+// FSR 3.1 frame generation from the bundled FidelityFX SDK sources (Linux),
+// see ffxfi.h. Gets Flow's motion vectors (zero motion would leave FSR's
+// optical flow alone, which does worse than a plain blend on video).
+class FsrSourceBackend : public FgBackendImpl
+{
+public:
+    bool init(FrameGen::Impl &fg) override
+    {
+        runner = std::make_unique<FfxFiRunner>(fg.vk->device, fg.vk->phys_device, fg.vkGetDeviceProcAddr);
+        qCInfo(chiakiGui) << "[framegen] FSR 3.1 Frame Generation (built from the FidelityFX SDK 1.1.4 sources)";
+        return true;
+    }
+
+    int maxGenerated() const override { return 1; }
+
+    const char *stage() const override { return runner ? runner->stage() : "init"; }
+
+    bool record(FrameGen::Impl &fg, VkCommandBuffer cmd, FgImage &color,
+                FgImage *const *outputs, int count, bool reset, float frame_interval_ms) override
+    {
+        if (count < 1 || !runner)
+            return false;
+        if (!runner->ensure(color.w, color.h))
+            return false;
+        auto image = [](const FgImage &img) {
+            FfxFiRunner::Image out;
+            out.image = img.image;
+            out.format = img.format;
+            out.w = img.w;
+            out.h = img.h;
+            return out;
+        };
+        const float ms = std::isfinite(frame_interval_ms) && frame_interval_ms > 0.0f ? frame_interval_ms : 16.6667f;
+        return runner->record(cmd, image(color), image(*outputs[0]), image(fg.mvec), image(fg.depth), reset, ms);
+    }
+
+    void invalidate() override
+    {
+        if (runner)
+            runner->invalidate();
+    }
+
+    void shutdown() override { runner.reset(); }
+
+private:
+    std::unique_ptr<FfxFiRunner> runner;
+};
+#endif // CHIAKI_HAVE_FFX_SOURCE
+
 namespace {
 
 // Runs entirely on libplacebo (no raw Vulkan recording), see FrameGen::process.
@@ -1081,7 +1134,7 @@ bool FrameGen::backendCompiledIn(Backend backend)
 #if defined(CHIAKI_HAVE_NGX)
     case Backend::Dlss: return true;
 #endif
-#if defined(CHIAKI_HAVE_FFX)
+#if defined(CHIAKI_HAVE_FFX) || defined(CHIAKI_HAVE_FFX_SOURCE)
     case Backend::Fsr: return true;
 #endif
     case Backend::Flow: return true;
@@ -1140,6 +1193,8 @@ bool FrameGen::ensureInitialized(pl_vulkan vk, Backend backend)
 #endif
 #if defined(CHIAKI_HAVE_FFX)
     case Backend::Fsr: impl_backend = std::make_unique<FsrBackend>(); break;
+#elif defined(CHIAKI_HAVE_FFX_SOURCE)
+    case Backend::Fsr: impl_backend = std::make_unique<FsrSourceBackend>(); break;
 #endif
     case Backend::Flow: impl_backend = std::make_unique<FlowBackend>(); break;
 #if defined(_WIN32)

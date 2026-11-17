@@ -104,6 +104,15 @@ Settings → Video (and Ctrl+O → Enhancement) switches between *Flow* and *Zer
 motion* for comparison; **Flow Quality** sets the analysis resolution
 (Performance ≈0.5 ms). The log shows `DLSS motion vectors: Flow`.
 
+### FSR 3.1 on Linux
+
+Linux builds (AppImage, Flatpak, Steam Deck) build FSR 3.1 frame generation
+from the AMD FidelityFX SDK 1.1.4 sources (`third-party/ffx-sdk`): the optical
+flow and frame interpolation passes run directly in chiaki-ng's Vulkan
+renderer, on any GPU, 2x. Windows builds use AMD's signed DLL. Both get
+per-pixel motion from Flow's motion search: with zero motion FSR's own
+optical flow did worse than a plain blend on video in tests.
+
 ### Generated frame clean-up
 
 **Generated Frame Clean-up** (Settings → Video, or Ctrl+O → Enhancement)
