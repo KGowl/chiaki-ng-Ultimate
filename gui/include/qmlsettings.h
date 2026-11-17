@@ -111,7 +111,8 @@ class QmlSettings : public QObject
 	Q_PROPERTY(bool frameGenFsrSupported READ frameGenFsrSupported CONSTANT)
 	Q_PROPERTY(bool frameGenFlowSupported READ frameGenFlowSupported CONSTANT)
 	Q_PROPERTY(bool frameGenVfgSupported READ frameGenVfgSupported CONSTANT)
-	Q_PROPERTY(QString frameGenVfgRuntime READ frameGenVfgRuntime CONSTANT)
+	Q_PROPERTY(QString frameGenVfgRuntime READ frameGenVfgRuntime NOTIFY frameGenVfgRuntimeChanged)
+	Q_PROPERTY(int vfgRuntimeDownloadState READ vfgRuntimeDownloadState NOTIFY vfgRuntimeDownloadStateChanged)
 	Q_PROPERTY(int frameGenVfgMode READ frameGenVfgMode WRITE setFrameGenVfgMode NOTIFY frameGenVfgModeChanged)
 	Q_PROPERTY(bool ambientBorder READ ambientBorder WRITE setAmbientBorder NOTIFY ambientBorderChanged)
 	Q_PROPERTY(int rcasStrength READ rcasStrength WRITE setRcasStrength NOTIFY rcasStrengthChanged)
@@ -382,6 +383,11 @@ public:
     bool frameGenFlowSupported() const;
     bool frameGenVfgSupported() const;
     QString frameGenVfgRuntime() const;
+    // 0 idle, 1 running, 2 finished (restart to use it), 3 failed.
+    int vfgRuntimeDownloadState() const { return vfg_download_state; }
+    // Runs install-nvidia-vfx.ps1 in a console window: downloads NVIDIA's
+    // VFG / RTX VSR runtime into VfgRunner::userRuntimeDir().
+    Q_INVOKABLE void downloadVfgRuntime();
     int frameGenVfgMode() const;
     void setFrameGenVfgMode(int mode);
     bool ambientBorder() const;
@@ -661,6 +667,8 @@ signals:
     void frameGenFlowHighQualityChanged();
     void frameGenDlssMotionChanged();
     void frameGenVfgModeChanged();
+    void frameGenVfgRuntimeChanged();
+    void vfgRuntimeDownloadStateChanged();
     void ambientBorderChanged();
     void rcasStrengthChanged();
     void resolutionLocalPS4Changed();
@@ -823,6 +831,7 @@ signals:
 
 private:
     Settings *settings = {};
+    int vfg_download_state = 0;
     QStringList audio_in_devices;
     QStringList audio_out_devices;
 };

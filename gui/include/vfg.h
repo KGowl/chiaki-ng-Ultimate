@@ -13,10 +13,11 @@
 // buffers shared with libplacebo's Vulkan device and synchronised through a
 // shared timeline semaphore.
 //
-// The runtime is not bundled: chiaki-ng uses the user's Video Effects SDK
-// installation with the nvVFXVideoFrameGeneration feature (Windows, NVIDIA
-// RTX GPU), found through CHIAKI_VFX_PATH, a "vfx" folder next to chiaki.exe,
-// NV_VIDEO_EFFECTS_PATH or the SDK's default install folder.
+// The runtime is not bundled: install-nvidia-vfx.ps1 (installer option or the
+// settings' download button) fetches it from NVIDIA into userRuntimeDir().
+// It is found through CHIAKI_VFX_PATH, a "vfx" folder next to chiaki.exe,
+// userRuntimeDir(), NV_VIDEO_EFFECTS_PATH or the SDK's default install folder
+// (Windows, NVIDIA RTX GPU).
 class VfgRunner
 {
 public:
@@ -24,6 +25,8 @@ public:
 
     // Folder holding NVVideoEffects.dll, or empty if none was found.
     static QString findRuntime();
+    // Per-user folder the download script installs into.
+    static QString userRuntimeDir();
 
     VfgRunner(pl_vulkan vk, PFN_vkGetDeviceProcAddr get_device_proc);
     ~VfgRunner();

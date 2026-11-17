@@ -28,9 +28,12 @@ public:
     static bool keepsResolution(int quality);
     // Short human readable name of a mode, e.g. "High" or "AR Medium".
     static const char *qualityName(int quality);
-    // File version of the nvngx_vsr.dll next to the executable, e.g. "1.6.0.0"
-    // (empty when missing or unreadable). Read once and cached.
+    // File version of the nvngx_vsr.dll NGX uses, e.g. "1.6.0.0" (empty when
+    // missing or unreadable): the newest of the one next to the executable
+    // and the one in the NVIDIA runtime folder. Read once and cached.
     static QString dllVersion();
+    // Folder of that nvngx_vsr.dll (the executable's folder if none exists).
+    static QString dllDir();
     // Whether the installed nvngx_vsr.dll is new enough for the Artifact
     // Reduction and Streaming modes (1.8.2 or newer).
     static bool extendedModesAvailable();

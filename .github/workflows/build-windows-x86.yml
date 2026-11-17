@@ -260,6 +260,8 @@ jobs:
           # Frame generation runtimes (redistributable parts of the NVIDIA DLSS SDK and the AMD FidelityFX SDK)
           cp "${{ github.workspace }}\ngx-sdk\lib\Windows_x86_64\rel\nvngx_dlssg.dll" chiaki-ng-Win
           cp "${{ github.workspace }}\ffx-sdk\PrebuiltSignedDLL\amd_fidelityfx_vk.dll" chiaki-ng-Win
+          # Downloads the NVIDIA VFG / RTX VSR runtime on demand (not redistributed)
+          cp scripts\install-nvidia-vfx.ps1 chiaki-ng-Win
           mkdir chiaki-ng-Win\licenses
           cp "${{ github.workspace }}\ngx-sdk\LICENSE.txt" chiaki-ng-Win\licenses\NVIDIA-DLSS-SDK-LICENSE.txt
           cp "${{ github.workspace }}\ffx-sdk\LICENSE.txt" chiaki-ng-Win\licenses\AMD-FidelityFX-SDK-LICENSE.txt

@@ -1,4 +1,5 @@
 #include "ngxcore.h"
+#include "rtxvsr.h"
 
 #include <QLoggingCategory>
 
@@ -25,6 +26,7 @@ QMutex ngx_mutex;
 int ngx_refs = 0;
 VkDevice ngx_device = VK_NULL_HANDLE;
 std::wstring ngx_feature_path;
+std::wstring ngx_vsr_path;
 std::wstring ngx_data_path;
 
 } // namespace
@@ -64,18 +66,22 @@ bool NgxCore::acquire(pl_vulkan vk)
     if (!get_device_proc)
         return false;
 
-    // Feature DLLs (nvngx_vsr.dll, nvngx_dlssg.dll) are searched next to the executable.
+    // Feature DLLs are searched in order: the folder of the newest
+    // nvngx_vsr.dll (possibly the NVIDIA runtime folder), then next to the
+    // executable (nvngx_dlssg.dll, nvngx_vsr.dll).
     ngx_feature_path = QDir::toNativeSeparators(QCoreApplication::applicationDirPath()).toStdWString();
+    ngx_vsr_path = RtxVsr::dllDir().toStdWString();
     QString data_dir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     if (data_dir.isEmpty())
         data_dir = QDir::tempPath();
     QDir().mkpath(data_dir);
     ngx_data_path = QDir::toNativeSeparators(data_dir).toStdWString();
 
-    const wchar_t *paths[] = { ngx_feature_path.c_str() };
+    const wchar_t *paths[] = { ngx_vsr_path.c_str(), ngx_feature_path.c_str() };
+    const bool vsr_elsewhere = !ngx_vsr_path.empty() && ngx_vsr_path != ngx_feature_path;
     NVSDK_NGX_FeatureCommonInfo common_info = {};
-    common_info.PathListInfo.Path = paths;
-    common_info.PathListInfo.Length = 1;
+    common_info.PathListInfo.Path = vsr_elsewhere ? paths : paths + 1;
+    common_info.PathListInfo.Length = vsr_elsewhere ? 2 : 1;
 
     const NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_Init_with_ProjectID(
         kNgxProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", ngx_data_path.c_str(),

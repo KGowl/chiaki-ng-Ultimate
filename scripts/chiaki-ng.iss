@@ -75,10 +75,13 @@ Name: "ukrainian"; MessagesFile: "compiler:Languages\Ukrainian.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+; Not redistributed: the script downloads NVIDIA's own package (needs internet, ~420 MB).
+Name: "nvidiavfx"; Description: "Download the NVIDIA VFG frame generation and RTX VSR 1.8.3 runtime (NVIDIA RTX GPU, ~420 MB, NVIDIA license terms apply)"; GroupDescription: "NVIDIA runtime:"; Flags: unchecked; Check: IsX64OS
 
 [Files]
 Source: "{#MyAppPath}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppPath}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\scripts\install-nvidia-vfx.ps1"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
@@ -86,5 +89,9 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install-nvidia-vfx.ps1"" -Destination ""{app}\vfx"" -NoPause"; StatusMsg: "Downloading the NVIDIA VFG / RTX VSR runtime..."; Tasks: nvidiavfx; Flags: waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\vfx"

@@ -6,8 +6,14 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QLoggingCategory>
+#include <QStandardPaths>
 
 Q_DECLARE_LOGGING_CATEGORY(chiakiGui)
+
+QString VfgRunner::userRuntimeDir()
+{
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)).filePath(QStringLiteral("vfx"));
+}
 
 QString VfgRunner::findRuntime()
 {
@@ -17,6 +23,7 @@ QString VfgRunner::findRuntime()
     if (!custom.isEmpty())
         dirs << custom;
     dirs << QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("vfx"));
+    dirs << userRuntimeDir();
     const QString sdk = qEnvironmentVariable("NV_VIDEO_EFFECTS_PATH");
     if (!sdk.isEmpty())
         dirs << sdk;
@@ -688,8 +695,8 @@ bool VfgRunner::init()
     Impl &d = *impl;
     const QString root = findRuntime();
     if (root.isEmpty()) {
-        qCWarning(chiakiGui) << "[framegen] VFG: NVIDIA Video Effects SDK not found (set CHIAKI_VFX_PATH, put it in a"
-                                " \"vfx\" folder next to chiaki.exe, or install the SDK)";
+        qCWarning(chiakiGui) << "[framegen] VFG: NVIDIA runtime not found (use \"Download NVIDIA runtime\" in the"
+                                " settings, put it in a \"vfx\" folder next to chiaki.exe, or set CHIAKI_VFX_PATH)";
         return false;
     }
     if (!d.loadVulkan() || !d.loadCuda() || !d.pickDevice() || !d.loadVfx(root))

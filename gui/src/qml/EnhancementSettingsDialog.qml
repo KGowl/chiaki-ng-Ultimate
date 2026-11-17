@@ -109,7 +109,7 @@ DialogView {
                     Chiaki.settings.frameGenDlssSupported ? qsTr("NVIDIA DLSS Frame Generation") : qsTr("NVIDIA DLSS Frame Generation (not in this build)"),
                     Chiaki.settings.frameGenFsrSupported ? qsTr("AMD FSR 3.1 Frame Generation") : qsTr("AMD FSR 3.1 Frame Generation (not in this build)"),
                     qsTr("Flow Frame Generation (any GPU)"),
-                            Chiaki.settings.frameGenVfgSupported ? (Chiaki.settings.frameGenVfgRuntime.length ? qsTr("NVIDIA VFG (Video Effects SDK)") : qsTr("NVIDIA VFG (Video Effects SDK not found)")) : qsTr("NVIDIA VFG (Windows only)")]
+                            Chiaki.settings.frameGenVfgSupported ? (Chiaki.settings.frameGenVfgRuntime.length ? qsTr("NVIDIA VFG (Video Effects SDK)") : qsTr("NVIDIA VFG (runtime not installed)")) : qsTr("NVIDIA VFG (Windows only)")]
                 currentIndex: Chiaki.settings.frameGenBackend
                 onActivated: index => Chiaki.settings.frameGenBackend = index
                 ToolTip.visible: hovered
@@ -180,13 +180,44 @@ DialogView {
                 currentIndex: Chiaki.settings.frameGenVfgMode
                 onActivated: index => Chiaki.settings.frameGenVfgMode = index
                 ToolTip.visible: hovered
-                ToolTip.text: qsTr("NVIDIA Video Frame Generation: a video-trained model that needs no motion vectors (RTX 40/50). Uses the NVIDIA Video Effects SDK with its Video Frame Generation feature, which is not bundled: put it in a \"vfx\" folder next to chiaki.exe, set CHIAKI_VFX_PATH, or install the SDK. High costs tens of milliseconds per frame pair at 1440p, so it suits 30 fps sources. Found: %1").arg(Chiaki.settings.frameGenVfgRuntime.length ? Chiaki.settings.frameGenVfgRuntime : qsTr("not found"))
+                ToolTip.text: qsTr("NVIDIA Video Frame Generation: a video-trained model that needs no motion vectors (RTX 40/50). Its NVIDIA runtime is not bundled: install it with the NVIDIA Runtime button below (or the installer option). High costs tens of milliseconds per frame pair at 1440p, so it suits 30 fps sources. Found: %1").arg(Chiaki.settings.frameGenVfgRuntime.length ? Chiaki.settings.frameGenVfgRuntime : qsTr("not found"))
             }
 
             Label {
                 Layout.alignment: Qt.AlignRight
                 visible: Chiaki.settings.frameGenVfgSupported
                 text: qsTr("(High)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.frameGenVfgSupported
+                text: qsTr("NVIDIA Runtime:")
+            }
+
+            C.Button {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.frameGenVfgSupported
+                enabled: Chiaki.settings.vfgRuntimeDownloadState !== 1
+                text: Chiaki.settings.vfgRuntimeDownloadState === 1 ? qsTr("Downloading... (see the console window)")
+                    : Chiaki.settings.vfgRuntimeDownloadState === 2 ? qsTr("Installed - restart chiaki-ng")
+                    : Chiaki.settings.frameGenVfgRuntime.length ? qsTr("Re-download NVIDIA VFG + RTX VSR runtime")
+                    : qsTr("Download NVIDIA VFG + RTX VSR runtime (~420 MB)")
+                onClicked: {
+                    if (Chiaki.settings.vfgRuntimeDownloadState === 2)
+                        Chiaki.settings.restartApplication();
+                    else
+                        Chiaki.settings.downloadVfgRuntime();
+                }
+                Material.roundedScale: Material.SmallScale
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Downloads NVIDIA's official Video Effects runtime (nvidia-vfx package from pypi.nvidia.com, checked by SHA-256) and installs the NVIDIA VFG libraries and nvngx_vsr.dll 1.8.3 (all RTX VSR modes) for this user. NVIDIA's license terms apply. Found: %1").arg(Chiaki.settings.frameGenVfgRuntime.length ? Chiaki.settings.frameGenVfgRuntime : qsTr("not found"))
+            }
+
+            Label {
+                visible: Chiaki.settings.frameGenVfgSupported
+                text: Chiaki.settings.vfgRuntimeDownloadState === 3 ? qsTr("Failed, see the console") : Chiaki.settings.frameGenVfgRuntime.length ? qsTr("Found") : qsTr("Not found")
+                color: Chiaki.settings.vfgRuntimeDownloadState === 3 ? "#ef9a9a" : Chiaki.settings.frameGenVfgRuntime.length ? "#a5d6a7" : "#ffe082"
             }
 
             Label {

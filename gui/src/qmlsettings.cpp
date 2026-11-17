@@ -14,6 +14,11 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QProcess>
+#include <QDir>
+#include <QFileInfo>
+#if defined(_WIN32)
+#include <qt_windows.h>
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -1093,6 +1098,50 @@ bool QmlSettings::frameGenVfgSupported() const
 QString QmlSettings::frameGenVfgRuntime() const
 {
     return VfgRunner::findRuntime();
+}
+
+void QmlSettings::downloadVfgRuntime()
+{
+#if defined(_WIN32)
+    if (vfg_download_state == 1)
+        return;
+    const QString script = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("install-nvidia-vfx.ps1"));
+    auto setState = [this](int state) {
+        vfg_download_state = state;
+        emit vfgRuntimeDownloadStateChanged();
+    };
+    if (!QFileInfo::exists(script)) {
+        qCWarning(chiakiGui) << "[framegen] VFG: install-nvidia-vfx.ps1 missing next to chiaki.exe";
+        setState(3);
+        return;
+    }
+    auto *process = new QProcess(this);
+    process->setProgram(QStringLiteral("powershell.exe"));
+    process->setArguments({QStringLiteral("-NoProfile"), QStringLiteral("-ExecutionPolicy"), QStringLiteral("Bypass"),
+        QStringLiteral("-File"), QDir::toNativeSeparators(script),
+        QStringLiteral("-Destination"), QDir::toNativeSeparators(VfgRunner::userRuntimeDir())});
+    // Own console window, so the download progress is visible.
+    process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *args) {
+        args->flags |= CREATE_NEW_CONSOLE;
+        args->startupInfo->dwFlags &= ~STARTF_USESTDHANDLES;
+    });
+    connect(process, &QProcess::finished, this, [this, process, setState](int code, QProcess::ExitStatus status) {
+        const bool ok = status == QProcess::NormalExit && code == 0 && !VfgRunner::findRuntime().isEmpty();
+        qCInfo(chiakiGui) << "[framegen] VFG: runtime download" << (ok ? "finished:" : "failed") << VfgRunner::findRuntime();
+        setState(ok ? 2 : 3);
+        emit frameGenVfgRuntimeChanged();
+        process->deleteLater();
+    });
+    connect(process, &QProcess::errorOccurred, this, [process, setState](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart)
+            return;
+        qCWarning(chiakiGui) << "[framegen] VFG: could not start powershell.exe";
+        setState(3);
+        process->deleteLater();
+    });
+    setState(1);
+    process->start();
+#endif
 }
 
 int QmlSettings::frameGenVfgMode() const

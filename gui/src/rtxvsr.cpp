@@ -2,6 +2,7 @@
 #include "ngxcore.h"
 #include "gputimer.h"
 #include "vkguard.h"
+#include "vfg.h"
 
 #include <QLoggingCategory>
 #include <QCoreApplication>
@@ -44,10 +45,10 @@ const char *RtxVsr::qualityName(int quality)
     }
 }
 
-static QString readDllVersion()
+static QString readDllVersion(const QString &dir)
 {
 #ifdef _WIN32
-    const QString path = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("nvngx_vsr.dll"));
+    const QString path = QDir(dir).filePath(QStringLiteral("nvngx_vsr.dll"));
     const std::wstring wpath = QDir::toNativeSeparators(path).toStdWString();
     DWORD handle = 0;
     const DWORD size = GetFileVersionInfoSizeW(wpath.c_str(), &handle);
@@ -64,14 +65,50 @@ static QString readDllVersion()
         .arg(HIWORD(info->dwFileVersionMS)).arg(LOWORD(info->dwFileVersionMS))
         .arg(HIWORD(info->dwFileVersionLS)).arg(LOWORD(info->dwFileVersionLS));
 #else
+    Q_UNUSED(dir);
     return QString();
 #endif
 }
 
+namespace {
+struct VsrDll
+{
+    QString dir;
+    QString version;
+};
+}
+
+// The newest nvngx_vsr.dll of the one next to the executable and the one of
+// the NVIDIA runtime folder (install-nvidia-vfx.ps1 puts 1.8.3 there).
+static const VsrDll &vsrDll()
+{
+    static const VsrDll dll = [] {
+        VsrDll best;
+        best.dir = QCoreApplication::applicationDirPath();
+        best.version = readDllVersion(best.dir);
+        const QString runtime = VfgRunner::findRuntime();
+        if (!runtime.isEmpty()) {
+            const QString version = readDllVersion(runtime);
+            if (!version.isEmpty() && (best.version.isEmpty()
+                    || QVersionNumber::fromString(version) > QVersionNumber::fromString(best.version))) {
+                best.dir = runtime;
+                best.version = version;
+            }
+        }
+        best.dir = QDir::toNativeSeparators(QDir(best.dir).absolutePath());
+        return best;
+    }();
+    return dll;
+}
+
 QString RtxVsr::dllVersion()
 {
-    static const QString version = readDllVersion();
-    return version;
+    return vsrDll().version;
+}
+
+QString RtxVsr::dllDir()
+{
+    return vsrDll().dir;
 }
 
 bool RtxVsr::extendedModesAvailable()

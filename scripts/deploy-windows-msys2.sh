@@ -103,6 +103,9 @@ for dll_dir in "$msys_prefix/bin" "/clangarm64/bin" "$msys_prefix/mingw64/bin"; 
 done
 shopt -u nullglob
 
+# Downloads the NVIDIA VFG / RTX VSR runtime on demand (not redistributed).
+cp "$(dirname "$0")/install-nvidia-vfx.ps1" "$output_dir/"
+
 windeployqt6.exe --no-translations --qmldir="$qml_dir" "$output_dir/$(basename "$exe_path")"
 
 # Remove system-provided DLLs that Windows already supplies and

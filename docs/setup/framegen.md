@@ -67,11 +67,26 @@ milliseconds per frame pair at 1440p, which fits a 30 fps source (33 ms per
 frame) better than 60 fps. Pick Low or Medium in **NVIDIA VFG Quality** if the
 frame rate drops.
 
-The runtime is not bundled. Install the NVIDIA Video Effects SDK and its
-`nvVFXVideoFrameGeneration` feature (see NVIDIA's VFX SDK documentation), or
-copy the SDK folder (with `NVVideoEffects.dll`, `NVCVImage.dll` and the
-feature's folder) to a `vfx` folder next to `chiaki.exe`. chiaki-ng looks in
-`CHIAKI_VFX_PATH`, `<chiaki folder>\vfx`, `NV_VIDEO_EFFECTS_PATH` and
+The NVIDIA runtime is not bundled with chiaki-ng; it is downloaded from NVIDIA
+on request:
+
+- **Installer:** tick *Download the NVIDIA VFG frame generation and RTX VSR
+  runtime* (installs into `<chiaki folder>\vfx`).
+- **Any time (also the portable zip):** Settings → Video (or Ctrl+O →
+  Enhancement) → **NVIDIA Runtime** → *Download*, then restart chiaki-ng
+  (installs into `%LOCALAPPDATA%\Chiaki\Chiaki\vfx`).
+- **By hand:** run `install-nvidia-vfx.ps1` from the chiaki-ng folder
+  (`-Destination <folder>` to choose where).
+
+The script downloads NVIDIA's official `nvidia-vfx` 0.2.0.0 package from
+`pypi.nvidia.com` (about 420 MB, checked against its SHA-256) and keeps only
+`NVVideoEffects.dll`, `NVCVImage.dll`, `nvVFXVideoFrameGeneration.dll`,
+`cudart64_12.dll`, `nvngx_vsr.dll` 1.8.3 and NVIDIA's license files (NVIDIA's
+terms apply). When that `nvngx_vsr.dll` is newer than one next to `chiaki.exe`,
+RTX VSR uses it too, which enables the Artifact Reduction and Streaming modes.
+
+chiaki-ng looks for the runtime in `CHIAKI_VFX_PATH`, `<chiaki folder>\vfx`,
+`%LOCALAPPDATA%\Chiaki\Chiaki\vfx`, `NV_VIDEO_EFFECTS_PATH` and
 `C:\Program Files\NVIDIA Corporation\NVIDIA Video Effects`, in that order. The
 log shows `[framegen] VFG: Video Effects SDK x.y.z from ...` and
 `NVIDIA VFG ready: WxH, quality ...`, or what is missing.
