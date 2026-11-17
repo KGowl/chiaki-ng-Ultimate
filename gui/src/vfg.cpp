@@ -56,6 +56,7 @@ QString VfgRunner::findRuntime()
 #include <mutex>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -135,6 +136,23 @@ constexpr int kDxgiFormatR8G8B8A8Unorm = 28;      // DXGI_FORMAT_R8G8B8A8_UNORM
 constexpr size_t kInputs = 2;
 constexpr VkDeviceSize kPitchAlign = 256;
 
+// Shot-change test on a 64x36 grid of point samples of each input, copied to
+// host memory together with the input itself. It replaces the SDK's
+// AutomaticShotChangeDetection, which makes every NvVFX_Run wait for the GPU
+// and repeats the test for every generated frame of a pair. Measures and
+// thresholds as in Veyra (VfgShotChange.hlsl / SceneCadenceAnalyzer):
+// normalised luma SAD and 256-bin histogram distance; a flash (large SAD,
+// near identical histogram) is not a cut.
+constexpr uint32_t kProbeColumns = 64;
+constexpr uint32_t kProbeRows = 36;
+constexpr uint32_t kProbeSamples = kProbeColumns * kProbeRows;
+constexpr double kCutSad = 0.3;
+constexpr double kCutHistogram = 0.5;
+constexpr double kReplacementSad = 0.08;
+constexpr double kReplacementHistogram = 0.9;
+constexpr double kFlashSad = 0.5;
+constexpr double kFlashHistogram = 0.1;
+
 } // namespace
 
 struct VfgRunner::Impl
@@ -155,6 +173,8 @@ struct VfgRunner::Impl
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = nullptr;
     PFN_vkSignalSemaphore vkSignalSemaphore = nullptr;
     PFN_vkWaitSemaphores vkWaitSemaphores = nullptr;
+    PFN_vkMapMemory vkMapMemory = nullptr;
+    PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
     VkPhysicalDeviceMemoryProperties memory_props = {};
     std::array<uint8_t, VK_LUID_SIZE> luid = {};
     bool luid_valid = false;
@@ -227,6 +247,23 @@ struct VfgRunner::Impl
         NvCVImage *image = nullptr;
     };
     std::array<Buffer, kInputs> inputs;
+
+    // Host visible samples of each input for the shot-change test.
+    struct Probe
+    {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        const uint8_t *data = nullptr;
+    };
+    std::array<Probe, kInputs> probes;
+    std::vector<VkBufferImageCopy> probe_regions;
+    bool makeProbe(Probe &probe);
+    void freeProbe(Probe &probe);
+    // Whether the pair crosses a cut; waits for `ready_value` (the inputs
+    // copied) first. Runs on the worker thread.
+    bool shotChange(int prev_slot, int cur_slot, uint64_t ready_value);
+    uint64_t cuts = 0;
+    uint64_t pairs = 0;
     std::array<Buffer, VfgRunner::kMaxOutputs> outputs;
     NvVFXHandle effect = nullptr;
     int width = 0;
@@ -479,6 +516,8 @@ bool VfgRunner::Impl::loadVulkan()
     VFG_DEVICE_PROC(vkCmdCopyBufferToImage)
     VFG_DEVICE_PROC(vkSignalSemaphore)
     VFG_DEVICE_PROC(vkWaitSemaphores)
+    VFG_DEVICE_PROC(vkMapMemory)
+    VFG_DEVICE_PROC(vkCmdPipelineBarrier)
 #undef VFG_DEVICE_PROC
     auto get_memory_props = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
         vk->get_proc_addr(vk->instance, "vkGetPhysicalDeviceMemoryProperties"));
@@ -620,6 +659,94 @@ void VfgRunner::Impl::freeBuffer(Buffer &buf)
     buf = Buffer();
 }
 
+bool VfgRunner::Impl::makeProbe(Probe &probe)
+{
+    VkBufferCreateInfo buf_info = {};
+    buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buf_info.size = kProbeSamples * 4;
+    buf_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk->device, &buf_info, nullptr, &probe.buffer) != VK_SUCCESS)
+        return false;
+    VkMemoryRequirements reqs = {};
+    vkGetBufferMemoryRequirements(vk->device, probe.buffer, &reqs);
+    const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < memory_props.memoryTypeCount && type == UINT32_MAX; i++) {
+        if ((reqs.memoryTypeBits & (1u << i)) && (memory_props.memoryTypes[i].propertyFlags & wanted) == wanted)
+            type = i;
+    }
+    if (type == UINT32_MAX)
+        return false;
+    VkMemoryAllocateInfo alloc = {};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = reqs.size;
+    alloc.memoryTypeIndex = type;
+    void *mapped = nullptr;
+    if (vkAllocateMemory(vk->device, &alloc, nullptr, &probe.memory) != VK_SUCCESS ||
+        vkBindBufferMemory(vk->device, probe.buffer, probe.memory, 0) != VK_SUCCESS ||
+        vkMapMemory(vk->device, probe.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS || !mapped)
+        return false;
+    probe.data = static_cast<const uint8_t *>(mapped);
+    return true;
+}
+
+void VfgRunner::Impl::freeProbe(Probe &probe)
+{
+    // Freeing the memory also unmaps it.
+    if (probe.buffer)
+        vkDestroyBuffer(vk->device, probe.buffer, nullptr);
+    if (probe.memory)
+        vkFreeMemory(vk->device, probe.memory, nullptr);
+    probe = Probe();
+}
+
+bool VfgRunner::Impl::shotChange(int prev_slot, int cur_slot, uint64_t ready_value)
+{
+    const Probe &a = probes[static_cast<size_t>(prev_slot)];
+    const Probe &b = probes[static_cast<size_t>(cur_slot)];
+    if (!a.data || !b.data)
+        return false;
+    stage = "vkWaitSemaphores (shot change)";
+    VkSemaphoreWaitInfo wait_info = {};
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores = &sem;
+    wait_info.pValues = &ready_value;
+    if (vkWaitSemaphores(vk->device, &wait_info, 200000000ull) != VK_SUCCESS)
+        return false;
+    // Integer luma of the samples (RGBA8), as in Veyra's sampler.
+    std::array<uint32_t, 256> hist_a = {};
+    std::array<uint32_t, 256> hist_b = {};
+    uint64_t sad = 0;
+    for (uint32_t i = 0; i < kProbeSamples; i++) {
+        const uint8_t *pa = a.data + i * 4;
+        const uint8_t *pb = b.data + i * 4;
+        const uint32_t la = (54u * pa[0] + 183u * pa[1] + 19u * pa[2] + 128u) >> 8;
+        const uint32_t lb = (54u * pb[0] + 183u * pb[1] + 19u * pb[2] + 128u) >> 8;
+        hist_a[(std::min)(la, 255u)]++;
+        hist_b[(std::min)(lb, 255u)]++;
+        sad += la > lb ? la - lb : lb - la;
+    }
+    uint64_t hist_l1 = 0;
+    for (size_t i = 0; i < hist_a.size(); i++)
+        hist_l1 += hist_a[i] > hist_b[i] ? hist_a[i] - hist_b[i] : hist_b[i] - hist_a[i];
+    const double sad_n = static_cast<double>(sad) / (255.0 * kProbeSamples);
+    const double hist_n = static_cast<double>(hist_l1) / (2.0 * kProbeSamples);
+    const bool flash = sad_n > kFlashSad && hist_n < kFlashHistogram;
+    const bool cut = !flash && ((sad_n > kCutSad && hist_n > kCutHistogram) ||
+                                (sad_n > kReplacementSad && hist_n > kReplacementHistogram));
+    pairs++;
+    if (cut) {
+        cuts++;
+        // Rare by nature; a burst means the test misfires on this content.
+        if (cuts <= 20 || cuts % 100 == 0)
+            qCInfo(chiakiGui).nospace() << "[framegen] VFG: shot change " << cuts << " of " << pairs
+                                        << " pairs (sad " << sad_n << ", histogram " << hist_n << ")";
+    }
+    return cut;
+}
+
 bool VfgRunner::Impl::createEffect()
 {
     // Order as in NVIDIA's VideoFrameGenerationEffectApp sample.
@@ -631,7 +758,7 @@ bool VfgRunner::Impl::createEffect()
                     cvOk(NvVFX_SetU32(effect, "InputWidth", static_cast<unsigned>(width)), "InputWidth") &&
                     cvOk(NvVFX_SetU32(effect, "InputHeight", static_cast<unsigned>(height)), "InputHeight") &&
                     cvOk(NvVFX_SetU32(effect, "Mode", static_cast<unsigned>(mode)), "Mode") &&
-                    cvOk(NvVFX_SetU32(effect, "AutomaticShotChangeDetectionEnabled", 1u), "AutomaticShotChangeDetectionEnabled") &&
+                    cvOk(NvVFX_SetU32(effect, "AutomaticShotChangeDetectionEnabled", 0u), "AutomaticShotChangeDetectionEnabled") &&
                     cvOk(NvVFX_Load(effect), "NvVFX_Load") &&
                     cvOk(NvVFX_SetImage(effect, "DstImage0", outputs[0].image), "DstImage0");
     bound_multiplier = 0;
@@ -670,6 +797,8 @@ VfgRunner::~VfgRunner()
     d.stopWorker();
     if (d.vfx_dll && d.cuda_dll)
         d.destroySized();
+    for (auto &probe : d.probes)
+        d.freeProbe(probe);
     {
         Impl::Current current(d);
         for (auto &event : d.events) {
@@ -733,6 +862,12 @@ bool VfgRunner::init()
     CloseHandle(handle.handle);
     if (!imported)
         return false;
+    for (auto &probe : d.probes) {
+        if (!d.makeProbe(probe)) {
+            qCWarning(chiakiGui) << "[framegen] VFG: could not create the shot-change sample buffers";
+            return false;
+        }
+    }
     d.startWorker();
     qCInfo(chiakiGui) << "[framegen] NVIDIA VFG initialized";
     return true;
@@ -752,6 +887,16 @@ bool VfgRunner::ensureSize(int w, int h, int mode)
     d.height = h;
     d.mode = mode;
     d.pitch = (static_cast<VkDeviceSize>(w) * 4 + kPitchAlign - 1) / kPitchAlign * kPitchAlign;
+    d.probe_regions.assign(kProbeSamples, VkBufferImageCopy());
+    for (uint32_t i = 0; i < kProbeSamples; i++) {
+        VkBufferImageCopy &region = d.probe_regions[i];
+        region.bufferOffset = static_cast<VkDeviceSize>(i) * 4;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset.x = static_cast<int32_t>((i % kProbeColumns) * static_cast<uint32_t>(w) / kProbeColumns);
+        region.imageOffset.y = static_cast<int32_t>((i / kProbeColumns) * static_cast<uint32_t>(h) / kProbeRows);
+        region.imageExtent = { 1, 1, 1 };
+    }
     d.stage = "buffers";
     for (auto &buf : d.inputs) {
         if (!d.makeBuffer(buf)) {
@@ -811,6 +956,18 @@ void VfgRunner::recordUpload(VkCommandBuffer cmd, VkImage image, int slot)
     region.imageSubresource.layerCount = 1;
     region.imageExtent = { static_cast<uint32_t>(d.width), static_cast<uint32_t>(d.height), 1 };
     d.vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_GENERAL, d.inputs[static_cast<size_t>(slot)].buffer, 1, &region);
+    const Impl::Probe &probe = d.probes[static_cast<size_t>(slot)];
+    if (probe.buffer && !d.probe_regions.empty()) {
+        d.vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_GENERAL, probe.buffer,
+                                 static_cast<uint32_t>(d.probe_regions.size()), d.probe_regions.data());
+        // The worker reads the samples on the host after the semaphore.
+        VkMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        d.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               1, &barrier, 0, nullptr, 0, nullptr);
+    }
 }
 
 void VfgRunner::recordDownload(VkCommandBuffer cmd, VkImage image, int index)
@@ -828,7 +985,8 @@ bool VfgRunner::Impl::generate(int prev_slot, int cur_slot, int count, uint64_t 
                                bool *signalled)
 {
     Impl &d = *this;
-    const bool shot_change = false; // the SDK's automatic detection is on
+    // On a cut the SDK outputs the current picture instead of a blend.
+    const bool shot_change = shotChange(prev_slot, cur_slot, wait_value);
     *signalled = false;
     count = std::clamp(count, 1, kMaxOutputs);
     Impl::Current current(d);
