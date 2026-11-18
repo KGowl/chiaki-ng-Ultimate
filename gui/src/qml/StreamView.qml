@@ -89,7 +89,14 @@ Item {
     Component.onCompleted: {
         updateSeparateMenuGeometry();
         updateOverlayInteractionActive();
+        Chiaki.window.setStatsOverlayLayout(Chiaki.settings.streamStatsStyle, Chiaki.settings.streamStatsPosition);
         Chiaki.window.setStatsOverlayActive(streamStatsVisible);
+    }
+
+    Connections {
+        target: Chiaki.settings
+        function onStreamStatsStyleChanged() { Chiaki.window.setStatsOverlayLayout(Chiaki.settings.streamStatsStyle, Chiaki.settings.streamStatsPosition) }
+        function onStreamStatsPositionChanged() { Chiaki.window.setStatsOverlayLayout(Chiaki.settings.streamStatsStyle, Chiaki.settings.streamStatsPosition) }
     }
     onStreamStatsVisibleChanged: {
         if (Chiaki.window)

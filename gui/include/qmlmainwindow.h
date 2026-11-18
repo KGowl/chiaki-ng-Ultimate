@@ -161,6 +161,9 @@ public:
     Q_INVOKABLE void requestOverlayUpdate();
     Q_INVOKABLE void setOverlayInteractionActive(bool active);
     Q_INVOKABLE void setStatsOverlayActive(bool active);
+    // Stream stats overlay style (0 Mini, 1 Compact, 2 Default, 3 Full) and
+    // position (0-8: top/middle/bottom x left/centre/right).
+    Q_INVOKABLE void setStatsOverlayLayout(int style, int position);
     Q_INVOKABLE void noteLoadingTransitionComplete();
     Q_INVOKABLE void presentStartupWarmupFrame(unsigned width, unsigned height, bool hdr);
     void armVerbosePlaceboQuietWindow();

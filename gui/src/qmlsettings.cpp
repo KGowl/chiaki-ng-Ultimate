@@ -121,6 +121,32 @@ void QmlSettings::setShowStreamStats(bool enabled)
     emit showStreamStatsChanged();
 }
 
+int QmlSettings::streamStatsStyle() const
+{
+    return settings->GetStreamStatsStyle();
+}
+
+void QmlSettings::setStreamStatsStyle(int style)
+{
+    if (style == settings->GetStreamStatsStyle())
+        return;
+    settings->SetStreamStatsStyle(style);
+    emit streamStatsStyleChanged();
+}
+
+int QmlSettings::streamStatsPosition() const
+{
+    return settings->GetStreamStatsPosition();
+}
+
+void QmlSettings::setStreamStatsPosition(int position)
+{
+    if (position == settings->GetStreamStatsPosition())
+        return;
+    settings->SetStreamStatsPosition(position);
+    emit streamStatsPositionChanged();
+}
+
 bool QmlSettings::streamerMode() const
 {
     return settings->GetStreamerMode();

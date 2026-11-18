@@ -272,6 +272,11 @@ class Settings : public QObject
 
 		bool GetShowStreamStats() const            { return settings.value("settings/show_stream_stats", false).toBool(); }
 		void SetShowStreamStats(bool enabled)      { settings.setValue("settings/show_stream_stats", enabled); }
+		// Stats overlay: style 0 Mini, 1 Compact, 2 Default, 3 Full; position 0-8 (top/middle/bottom x left/centre/right).
+		int GetStreamStatsStyle() const            { return qBound(0, settings.value("settings/stream_stats_style", 2).toInt(), 3); }
+		void SetStreamStatsStyle(int style)        { settings.setValue("settings/stream_stats_style", qBound(0, style, 3)); }
+		int GetStreamStatsPosition() const         { return qBound(0, settings.value("settings/stream_stats_position", 5).toInt(), 8); }
+		void SetStreamStatsPosition(int position)  { settings.setValue("settings/stream_stats_position", qBound(0, position, 8)); }
 
 		bool GetStreamerMode() const		{ return settings.value("settings/streamer_mode", false).toBool(); }
 		void SetStreamerMode(bool enabled)	{ settings.setValue("settings/streamer_mode", enabled); }

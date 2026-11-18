@@ -2107,7 +2107,6 @@ DialogView {
                         }
 
                         C.CheckBox {
-                            lastInFocusChain: true
                             checked: Chiaki.settings.showStreamStats
                             onToggled: Chiaki.settings.showStreamStats = !Chiaki.settings.showStreamStats
                         }
@@ -2115,6 +2114,46 @@ DialogView {
                         Label {
                             Layout.alignment: Qt.AlignRight
                             text: qsTr("(Unchecked)")
+                        }
+
+                        Label {
+                            Layout.alignment: Qt.AlignRight
+                            text: qsTr("Stream Stats Style")
+                        }
+
+                        C.ComboBox {
+                            Layout.preferredWidth: 400
+                            enabled: Chiaki.settings.showStreamStats
+                            model: [qsTr("Mini (one line: fps, Mbps)"), qsTr("Compact (one line: stats + enhancements)"),
+                                qsTr("Default (small column)"), qsTr("Full (all stats, one enhancement per line)")]
+                            currentIndex: Chiaki.settings.streamStatsStyle
+                            onActivated: index => Chiaki.settings.streamStatsStyle = index
+                        }
+
+                        Label {
+                            Layout.alignment: Qt.AlignRight
+                            text: qsTr("(Default)")
+                        }
+
+                        Label {
+                            Layout.alignment: Qt.AlignRight
+                            text: qsTr("Stream Stats Position")
+                        }
+
+                        C.ComboBox {
+                            lastInFocusChain: true
+                            Layout.preferredWidth: 400
+                            enabled: Chiaki.settings.showStreamStats
+                            model: [qsTr("Top left"), qsTr("Top center"), qsTr("Top right"),
+                                qsTr("Middle left"), qsTr("Middle center"), qsTr("Middle right"),
+                                qsTr("Bottom left"), qsTr("Bottom center"), qsTr("Bottom right")]
+                            currentIndex: Chiaki.settings.streamStatsPosition
+                            onActivated: index => Chiaki.settings.streamStatsPosition = index
+                        }
+
+                        Label {
+                            Layout.alignment: Qt.AlignRight
+                            text: qsTr("(Middle right)")
                         }
                     }
                 }

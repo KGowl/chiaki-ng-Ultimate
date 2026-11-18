@@ -276,7 +276,6 @@ DialogView {
                 from: 0
                 to: 100
                 stepSize: 5
-                lastInFocusChain: !Chiaki.settings.ambientBorderSupported
                 value: Chiaki.settings.rcasStrength
                 onMoved: Chiaki.settings.rcasStrength = value
                 ToolTip.visible: hovered
@@ -294,6 +293,48 @@ DialogView {
             Label {
                 Layout.alignment: Qt.AlignRight
                 text: qsTr("(Off)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                text: qsTr("Stats Overlay:")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                model: [qsTr("Off"), qsTr("Mini"), qsTr("Compact"), qsTr("Default"), qsTr("Full")]
+                currentIndex: Chiaki.settings.showStreamStats ? Chiaki.settings.streamStatsStyle + 1 : 0
+                onActivated: index => {
+                    Chiaki.settings.showStreamStats = index > 0;
+                    if (index > 0)
+                        Chiaki.settings.streamStatsStyle = index - 1;
+                }
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                text: qsTr("(Off)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                text: qsTr("Stats Position:")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                enabled: Chiaki.settings.showStreamStats
+                lastInFocusChain: !Chiaki.settings.ambientBorderSupported
+                model: [qsTr("Top left"), qsTr("Top center"), qsTr("Top right"),
+                    qsTr("Middle left"), qsTr("Middle center"), qsTr("Middle right"),
+                    qsTr("Bottom left"), qsTr("Bottom center"), qsTr("Bottom right")]
+                currentIndex: Chiaki.settings.streamStatsPosition
+                onActivated: index => Chiaki.settings.streamStatsPosition = index
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                text: qsTr("(Middle right)")
             }
 
             Label {
