@@ -1502,7 +1502,8 @@ bool Dx12Fg::nrEnsureSize(int w, int h)
     d.nr_query_done = 0;
     d.nr_gpu_ms = 0.0;
     d.nr_sized = true;
-    d.log(0, "neural rendering (DLSS Super Resolution DLAA, D3D12) ready: %dx%d", w, h);
+    d.log(0, "neural rendering (%s) ready: %dx%d",
+          d.gate_ready ? "NGX feature 18, nvngx_dlssnr.dll" : "DLSS Super Resolution DLAA through NeuralHub", w, h);
     return true;
 }
 
