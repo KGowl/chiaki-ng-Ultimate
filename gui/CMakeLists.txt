@@ -145,6 +145,12 @@ if(CHIAKI_ENABLE_NGX)
 	# DLSS Frame Generation through NGX D3D12 (AMD GPUs with NeuralHub's NGX stub), see dx12fg.h.
 	target_sources(chiaki PRIVATE include/dx12fg.h src/dx12fg.cpp)
 	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG)
+	# nvngx.dll_dlssnr.dll next to chiaki.exe: NVIDIA's DLSS Neural Rendering snippet only serves
+	# callers inside a module named like nvngx.dll, so dx12fg calls it through this pass-through
+	# (src/nrgate.cpp, no NVIDIA code). The snippet itself (nvngx_dlssnr.dll) is not bundled.
+	add_library(chiaki-nrgate SHARED src/nrgate.cpp)
+	set_target_properties(chiaki-nrgate PROPERTIES OUTPUT_NAME "nvngx.dll_dlssnr" PREFIX "" SUFFIX ".dll")
+	add_dependencies(chiaki chiaki-nrgate)
 	# Console test of the frame generation backends and of neural rendering on synthetic frames
 	# (tools/fgdx12test.cpp). Not built by default: --target chiaki-fgdx12test.
 	add_executable(chiaki-fgdx12test EXCLUDE_FROM_ALL tools/fgdx12test.cpp
@@ -156,6 +162,7 @@ if(CHIAKI_ENABLE_NGX)
 	target_compile_definitions(chiaki-fgdx12test PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG)
 	target_link_libraries(chiaki-fgdx12test PkgConfig::LIBPLACEBO Qt::Core Qt::Gui "${CHIAKI_NGX_LIB}"
 		advapi32 user32 setupapi version shell32 ole32 avrt winmm)
+	add_dependencies(chiaki-fgdx12test chiaki-nrgate)
 	message(STATUS "NVIDIA NGX enabled: RTX Video Super Resolution, DLSS Frame Generation, DLSS neural rendering through D3D12 (${CHIAKI_NGX_LIB})")
 endif()
 

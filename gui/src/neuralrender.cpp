@@ -477,8 +477,8 @@ bool NeuralRender::ensureInitialized(pl_vulkan vk)
     if (impl->init_failed || !vk)
         return false;
     if (!impl->init(vk)) {
-        qCWarning(chiakiGui) << "[neural-render] DLSS neural rendering is unavailable (on AMD it needs NeuralHub's "
-                                "dxgi.dll and neuralhub.ini next to chiaki.exe)";
+        qCWarning(chiakiGui) << "[neural-render] DLSS neural rendering is unavailable (NVIDIA: nvngx_dlssnr.dll next to "
+                                "chiaki.exe; AMD: NeuralHub's dxgi.dll and neuralhub.ini next to chiaki.exe)";
         impl->shutdown();
         impl->init_failed = true;
         return false;

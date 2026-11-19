@@ -103,7 +103,7 @@ DialogView {
             C.ComboBox {
                 Layout.preferredWidth: 600
                 visible: Chiaki.settings.neuralRenderSupported
-                model: [qsTr("Off"), qsTr("DLSS 5 Neural Rendering via D3D12 (AMD: needs NeuralHub's stub)")]
+                model: [qsTr("Off"), qsTr("DLSS 5 Neural Rendering via D3D12 (NVIDIA: nvngx_dlssnr.dll, AMD: NeuralHub's stub)")]
                 currentIndex: Chiaki.settings.neuralRender ? 1 : 0
                 onActivated: index => Chiaki.settings.neuralRender = index === 1
             }

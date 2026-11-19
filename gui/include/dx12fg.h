@@ -89,10 +89,11 @@ public:
     bool fgAvailable() const;
     bool nrAvailable() const;
 
-    // ---- neural rendering (DLSS 5 through NeuralHub) ----
-    // A DLSS Super Resolution feature in DLAA mode (input = output size). NeuralHub serves
-    // it and runs its DLSS 5 neural rendering pass first; NVIDIA's own runtime gives plain
-    // DLAA. It has its own size, textures and shared buffers next to the frame generation
+    // ---- neural rendering (DLSS 5) ----
+    // NVIDIA: NGX feature 18 from nvngx_dlssnr.dll next to chiaki.exe, called through
+    // nvngx.dll_dlssnr.dll (nrgate.cpp). Other GPUs: a DLSS Super Resolution feature in DLAA
+    // mode (input = output size), which NeuralHub serves after its DLSS 5 neural rendering
+    // pass. It has its own size, textures and shared buffers next to the frame generation
     // ones and uses the same shared timeline semaphore (lastValue / setLastValue).
     // nrEnsureSize warms the model up (a few seconds). No GPU work may be pending on its
     // buffers.

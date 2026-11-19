@@ -10,11 +10,12 @@
 // DLSS 5 Neural Rendering on the video, through the NGX D3D12 bridge (dx12fg.h).
 //
 // Each new stream frame is rendered into an RGBA8 texture at its own size, copied into a
-// buffer shared with D3D12, run through a DLSS Super Resolution feature in DLAA mode
-// (input size = output size) and copied back into an RGB texture that replaces the frame.
-// On a GPU without NVIDIA's runtime, NeuralHub (its dxgi.dll stub and neuralhub.ini next to
-// chiaki.exe) serves that call and runs its DLSS 5 neural rendering pass first; this is the
-// route the DLSS 5 video players take. NVIDIA's own runtime gives plain DLAA instead.
+// buffer shared with D3D12, run through DLSS 5 and copied back into an RGB texture that
+// replaces the frame. On NVIDIA that is NGX feature 18 from nvngx_dlssnr.dll next to
+// chiaki.exe (not bundled). On a GPU without NVIDIA's runtime it is a DLSS Super Resolution
+// feature in DLAA mode (input size = output size) that NeuralHub (its dxgi.dll stub and
+// neuralhub.ini next to chiaki.exe) serves after its DLSS 5 neural rendering pass, the route
+// the DLSS 5 video players take.
 //
 // Only functional in builds with CHIAKI_HAVE_DX12FG (Windows, NGX SDK); otherwise every
 // call is a no-op that reports it as unavailable. SDR only (8-bit), like RTX VSR.

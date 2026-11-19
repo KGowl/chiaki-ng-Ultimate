@@ -4,6 +4,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winver.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -31,6 +32,57 @@ constexpr size_t kSlots = 4;
 constexpr UINT kHiddenWindowSize = 1280;
 // A project id of our own, as NGX wants one per application.
 constexpr const char *kProjectId = "9d1c7a52-6a4e-4c36-8d4f-1f0a5f3b7c11";
+constexpr UINT kVendorNvidia = 0x10DE;
+// DLSS Neural Rendering's NGX feature id (a reserved slot in the public headers).
+constexpr int kFeatureNeuralRendering = 18;
+// NGX's generic application id, for the snippet's own Init_Ext.
+constexpr unsigned long long kNrApplicationId = 0x24480451ull;
+
+// NVIDIA's DLSS Neural Rendering snippet (nvngx_dlssnr.dll) only serves callers inside a
+// module named like nvngx.dll; nvngx.dll_dlssnr.dll (src/nrgate.cpp) is that pass-through.
+struct NrGate
+{
+    int (*load)(const wchar_t *) = nullptr;
+    int (*init)(unsigned long long, const wchar_t *, void *, int, const void *) = nullptr;
+    int (*create)(void *, int, void *, void **) = nullptr;
+    int (*evaluate)(void *, void *, void *) = nullptr;
+    int (*release)(void *) = nullptr;
+    int (*shutdown)(void *) = nullptr;
+    const char *(*fault)() = nullptr;
+
+    bool open(const std::wstring &path)
+    {
+        HMODULE m = LoadLibraryW(path.c_str());
+        if (!m)
+            return false;
+        load = reinterpret_cast<decltype(load)>(GetProcAddress(m, "nrgate_load"));
+        init = reinterpret_cast<decltype(init)>(GetProcAddress(m, "nrgate_init"));
+        create = reinterpret_cast<decltype(create)>(GetProcAddress(m, "nrgate_create"));
+        evaluate = reinterpret_cast<decltype(evaluate)>(GetProcAddress(m, "nrgate_evaluate"));
+        release = reinterpret_cast<decltype(release)>(GetProcAddress(m, "nrgate_release"));
+        shutdown = reinterpret_cast<decltype(shutdown)>(GetProcAddress(m, "nrgate_shutdown"));
+        fault = reinterpret_cast<decltype(fault)>(GetProcAddress(m, "nrgate_fault"));
+        return load && init && create && evaluate && release && shutdown && fault;
+    }
+};
+
+std::string fileVersion(const std::wstring &path)
+{
+    DWORD unused = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &unused);
+    if (!size)
+        return "unknown version";
+    std::vector<char> data(size);
+    VS_FIXEDFILEINFO *info = nullptr;
+    UINT len = 0;
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data())
+        || !VerQueryValueW(data.data(), L"\\", reinterpret_cast<void **>(&info), &len) || !info)
+        return "unknown version";
+    char text[64];
+    std::snprintf(text, sizeof(text), "%u.%u.%u.%u", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+                  HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+    return text;
+}
 
 const char *ngxResultString(NVSDK_NGX_Result r)
 {
@@ -186,7 +238,13 @@ struct Dx12Fg::Impl
     std::array<Shared, kMaxOutputs> out_bufs;
     bool sized = false;
 
-    // ---- neural rendering: DLSS Super Resolution in DLAA mode, own size ----
+    // ---- neural rendering, own size: NGX feature 18 through the gate on NVIDIA, DLSS Super
+    // Resolution in DLAA mode elsewhere (NeuralHub runs DLSS 5 in front of it) ----
+    UINT adapter_vendor = 0;
+    std::wstring exe_dir;
+    std::wstring ngx_data;
+    NrGate gate;
+    bool gate_ready = false;
     NVSDK_NGX_Parameter *nr_params = nullptr;
     NVSDK_NGX_Handle *nr_handle = nullptr;
     int nr_width = 0;
@@ -209,6 +267,7 @@ struct Dx12Fg::Impl
     bool createDevice();
     bool createSwapchain();
     bool initNgx();
+    void initGate();
     bool createSharedFence();
     bool makeTex(Tex &t, int w, int h, DXGI_FORMAT format, UINT bytes_per_texel);
     bool fill(const std::vector<Tex *> &zero, Tex *half);
@@ -323,6 +382,7 @@ bool Dx12Fg::Impl::createDevice()
     adapter->GetDesc1(&desc);
     char name[128] = {};
     WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+    adapter_vendor = desc.VendorId;
     HRESULT hr = create_device(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
     if (FAILED(hr)) {
         log(1, "D3D12CreateDevice failed on %s (0x%08x)", name, static_cast<unsigned>(hr));
@@ -433,6 +493,8 @@ bool Dx12Fg::Impl::initNgx()
     GetTempPathW(MAX_PATH, tmp);
     const std::wstring data = std::wstring(tmp) + L"chiaki-ng-ngx-d3d12";
     CreateDirectoryW(data.c_str(), nullptr);
+    exe_dir = dir;
+    ngx_data = data;
     const wchar_t *paths[] = { dir.c_str() };
     NVSDK_NGX_FeatureCommonInfo info = {};
     info.PathListInfo.Path = paths;
@@ -482,9 +544,45 @@ bool Dx12Fg::Impl::initNgx()
         log(0, "DLSS Frame Generation (D3D12) available, up to %d generated frames", max_generated);
     else
         log(1, "DLSS Frame Generation is not available through NGX D3D12 on this GPU");
-    log(sr_available ? 0 : 1, "DLSS Super Resolution (D3D12, used for neural rendering) %s",
-        sr_available ? "available" : "is not available");
+    if (adapter_vendor == kVendorNvidia)
+        initGate();
+    else
+        log(sr_available ? 0 : 1, "DLSS Super Resolution (D3D12, used for neural rendering) %s",
+            sr_available ? "available" : "is not available");
     return true;
+}
+
+// NVIDIA: DLSS 5 Neural Rendering (NGX feature 18) straight from nvngx_dlssnr.dll next to
+// chiaki.exe, called through nvngx.dll_dlssnr.dll. The driver core is never asked for
+// feature 18 (from driver 616.64 on it routes that request into the snippet and faults).
+// Not fatal: without it there is no neural rendering, frame generation is unaffected.
+void Dx12Fg::Impl::initGate()
+{
+    const std::wstring snippet = exe_dir + L"\\nvngx_dlssnr.dll";
+    if (GetFileAttributesW(snippet.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        log(1, "DLSS 5 neural rendering needs NVIDIA's nvngx_dlssnr.dll next to chiaki.exe (not bundled)");
+        return;
+    }
+    stage = "neural rendering gate";
+    if (!gate.open(exe_dir + L"\\nvngx.dll_dlssnr.dll")) {
+        log(1, "nvngx.dll_dlssnr.dll (part of chiaki-ng) is missing or incomplete next to chiaki.exe");
+        return;
+    }
+    if (!gate.load(snippet.c_str())) {
+        log(1, "nvngx_dlssnr.dll could not be loaded: %s", gate.fault());
+        return;
+    }
+    stage = "nvngx_dlssnr Init_Ext";
+    const auto r = static_cast<NVSDK_NGX_Result>(
+        gate.init(kNrApplicationId, ngx_data.c_str(), device.Get(), NVSDK_NGX_Version_API, nr_params));
+    if (NVSDK_NGX_FAILED(r)) {
+        log(1, "nvngx_dlssnr.dll refused to initialise: %s (0x%08x) %s", ngxResultString(r), static_cast<unsigned>(r),
+            gate.fault());
+        return;
+    }
+    gate_ready = true;
+    const std::string version = fileVersion(snippet);
+    log(0, "DLSS 5 neural rendering (NGX feature 18) ready, nvngx_dlssnr.dll %s", version.c_str());
 }
 
 bool Dx12Fg::Impl::createSharedFence()
@@ -927,15 +1025,51 @@ void Dx12Fg::Impl::destroySized()
 }
 
 // ---- neural rendering ----
-// DLSS 5 Neural Rendering is not called directly (NGX feature 18 is not answered by
-// NeuralHub, and NVIDIA's driver only gives it to approved applications): this creates a
-// DLSS Super Resolution feature in DLAA mode (input size = output size), which NeuralHub
-// serves with its upscaling provider and runs its neural rendering pass in front of, the
-// same route as the DLSS 5 video players. Video has no depth and no motion vectors: the
-// depth is a constant 0.5 and the motion vectors are zero.
+// Two routes to DLSS 5 Neural Rendering. NVIDIA: NGX feature 18 from nvngx_dlssnr.dll,
+// called through the gate (initGate). Elsewhere NeuralHub does not answer feature 18, so this
+// creates a DLSS Super Resolution feature in DLAA mode (input size = output size), which
+// NeuralHub serves with its upscaling provider and runs its neural rendering pass in front
+// of, the same route as the DLSS 5 video players. Video has no depth and no motion vectors:
+// the depth is a constant 0.5 and the motion vectors are zero.
 
 bool Dx12Fg::Impl::nrCreateFeature()
 {
+    if (gate_ready) {
+        // The model reads these at create time. Default model settings.
+        const unsigned int w = static_cast<unsigned int>(nr_width), h = static_cast<unsigned int>(nr_height);
+        nr_params->Reset();
+        NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_Width, w);
+        NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_Height, h);
+        NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_OutWidth, w);
+        NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_OutHeight, h);
+        NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_MaxQuality);
+        NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_CreationNodeMask, 1);
+        NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_VisibilityNodeMask, 1);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Enabled", 1);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Width", w);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Height", h);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Hint.Render.Preset", 0);
+        NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.Intensity", 1.0f);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Style", 0);
+        NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.LocalStructureStrength", 1.0f);
+        NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.LocalToneStrength", 1.0f);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.UseAutoMask", 0);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.UICorrection", 1);
+        Slot *slot = nullptr;
+        if (!beginList(&slot))
+            return false;
+        stage = "nvngx_dlssnr CreateFeature";
+        const auto r = static_cast<NVSDK_NGX_Result>(
+            gate.create(list.Get(), kFeatureNeuralRendering, nr_params, reinterpret_cast<void **>(&nr_handle)));
+        const bool executed = endList(*slot) && waitIdle();
+        if (NVSDK_NGX_FAILED(r) || !nr_handle) {
+            log(1, "creating DLSS 5 neural rendering (feature 18) failed: %s (0x%08x) %s", ngxResultString(r),
+                static_cast<unsigned>(r), gate.fault());
+            nr_handle = nullptr;
+            return false;
+        }
+        return executed;
+    }
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth = static_cast<unsigned int>(nr_width);
     cp.Feature.InHeight = static_cast<unsigned int>(nr_height);
@@ -965,6 +1099,33 @@ bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
     barrier(nr_depth, srv);
     barrier(nr_motion, srv);
     barrier(nr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (gate_ready) {
+        const unsigned int w = static_cast<unsigned int>(nr_width), h = static_cast<unsigned int>(nr_height);
+        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Color", nr_in.res.Get());
+        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Depth", nr_depth.res.Get());
+        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.MVec", nr_motion.res.Get());
+        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Output", nr_out.res.Get());
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Enabled", 1);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Reset", reset ? 1 : 0);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.DepthInverted", 0);
+        for (const char *name : { "Color", "Output", "Depth", "MVec" }) {
+            const std::string base = std::string("DLSSNR.") + name + "Subrect";
+            NVSDK_NGX_Parameter_SetUI(nr_params, (base + "BaseX").c_str(), 0);
+            NVSDK_NGX_Parameter_SetUI(nr_params, (base + "BaseY").c_str(), 0);
+            NVSDK_NGX_Parameter_SetUI(nr_params, (base + "Width").c_str(), w);
+            NVSDK_NGX_Parameter_SetUI(nr_params, (base + "Height").c_str(), h);
+        }
+        NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.MVecScaleX", 1.0f);
+        NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.MVecScaleY", 1.0f);
+        stage = "nvngx_dlssnr EvaluateFeature";
+        const auto r = static_cast<NVSDK_NGX_Result>(gate.evaluate(list.Get(), nr_handle, nr_params));
+        if (NVSDK_NGX_FAILED(r)) {
+            log(log_level, "evaluating DLSS 5 neural rendering (feature 18) failed: %s (0x%08x) %s", ngxResultString(r),
+                static_cast<unsigned>(r), gate.fault());
+            return false;
+        }
+        return true;
+    }
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
     ep.Feature.pInColor = nr_in.res.Get();
     ep.Feature.pInOutput = nr_out.res.Get();
@@ -1032,8 +1193,12 @@ void Dx12Fg::Impl::destroyNr()
 {
     if (queue)
         waitIdle();
-    if (nr_handle)
-        NVSDK_NGX_D3D12_ReleaseFeature(nr_handle);
+    if (nr_handle) {
+        if (gate_ready)
+            gate.release(nr_handle);
+        else
+            NVSDK_NGX_D3D12_ReleaseFeature(nr_handle);
+    }
     nr_handle = nullptr;
     freeShared(nr_in_buf);
     freeShared(nr_out_buf);
@@ -1063,6 +1228,8 @@ Dx12Fg::~Dx12Fg()
         d.vkDestroySemaphore(d.vk.device, d.semaphore, nullptr);
     if (d.params)
         NVSDK_NGX_D3D12_DestroyParameters(d.params);
+    if (d.gate_ready && d.device)
+        d.gate.shutdown(d.device.Get());
     if (d.nr_params)
         NVSDK_NGX_D3D12_DestroyParameters(d.nr_params);
     if (d.ngx_up && d.device)
@@ -1265,7 +1432,8 @@ bool Dx12Fg::fgAvailable() const
 
 bool Dx12Fg::nrAvailable() const
 {
-    return impl->sr_available;
+    // On NVIDIA the DLSS Super Resolution route would only be DLAA, not neural rendering.
+    return impl->gate_ready || (impl->adapter_vendor != kVendorNvidia && impl->sr_available);
 }
 
 bool Dx12Fg::nrSizeMatches(int w, int h) const
@@ -1284,8 +1452,10 @@ bool Dx12Fg::nrEnsureSize(int w, int h)
     if (nrSizeMatches(w, h))
         return true;
     d.destroyNr();
-    if (!d.sr_available) {
-        d.log(1, "DLSS Super Resolution is not available through NGX D3D12 on this GPU, no neural rendering");
+    if (!nrAvailable()) {
+        d.log(1, d.adapter_vendor == kVendorNvidia
+                     ? "DLSS 5 neural rendering is not set up (nvngx_dlssnr.dll next to chiaki.exe, see above)"
+                     : "DLSS Super Resolution is not available through NGX D3D12 on this GPU, no neural rendering");
         return false;
     }
     d.nr_width = w;
