@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <winver.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <vulkan/vulkan_win32.h>
@@ -97,6 +98,70 @@ const char *ngxResultString(NVSDK_NGX_Result r)
     default: return "Fail";
     }
 }
+
+// DLSS Super Resolution's quality mode for an upscale from in_w to out_w (DLAA at 1:1).
+NVSDK_NGX_PerfQuality_Value qualityFor(int in_w, int out_w)
+{
+    const double s = static_cast<double>(out_w) / static_cast<double>(in_w);
+    return s < 1.01   ? NVSDK_NGX_PerfQuality_Value_DLAA
+           : s < 1.6  ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+           : s < 1.85 ? NVSDK_NGX_PerfQuality_Value_Balanced
+           : s < 2.5  ? NVSDK_NGX_PerfQuality_Value_MaxPerf
+                      : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+}
+
+const char *qualityName(NVSDK_NGX_PerfQuality_Value q)
+{
+    switch (q) {
+    case NVSDK_NGX_PerfQuality_Value_DLAA: return "DLAA";
+    case NVSDK_NGX_PerfQuality_Value_MaxQuality: return "Quality";
+    case NVSDK_NGX_PerfQuality_Value_Balanced: return "Balanced";
+    case NVSDK_NGX_PerfQuality_Value_MaxPerf: return "Performance";
+    case NVSDK_NGX_PerfQuality_Value_UltraPerformance: return "Ultra Performance";
+    default: return "?";
+    }
+}
+
+// HDR through feature 18, which only takes SDR (it clips at 1.0): the model sees the proxy
+// p = C / (1 + P), P the brightest channel of the linear pixel C (so p stays below 1), sRGB
+// coded; its change to p is scaled back by (1 + P) onto C, so an unchanged proxy leaves the
+// pixel as it was and the highlights stay HDR.
+const char kProxyShaders[] = R"(
+Texture2D<float4> src0 : register(t0);
+Texture2D<float4> src1 : register(t1);
+Texture2D<float4> src2 : register(t2);
+RWTexture2D<float4> dst : register(u0);
+cbuffer Constants : register(b0) { uint2 size; float max_out; float unused; };
+float3 toSrgb(float3 c)
+{
+    c = saturate(c);
+    return lerp(c * 12.92, 1.055 * pow(c, 1.0 / 2.4) - 0.055, step(0.0031308, c));
+}
+float3 fromSrgb(float3 c)
+{
+    return lerp(c / 12.92, pow((c + 0.055) / 1.055, 2.4), step(0.04045, c));
+}
+[numthreads(8, 8, 1)]
+void encode(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+    float3 c = max(src0[id.xy].rgb, 0.0);
+    float m = max(c.r, max(c.g, c.b));
+    dst[id.xy] = float4(toSrgb(c / (1.0 + m)), 1.0);
+}
+[numthreads(8, 8, 1)]
+void compose(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+    float3 c = src0[id.xy].rgb;
+    float m = max(max(c.r, max(c.g, c.b)), 0.0);
+    float3 delta = fromSrgb(src2[id.xy].rgb) - fromSrgb(src1[id.xy].rgb);
+    float3 o = max(c + delta * (1.0 + m), min(c, 0.0));
+    dst[id.xy] = float4(min(o, max_out), 1.0);
+}
+)";
 
 LRESULT CALLBACK hiddenWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -247,11 +312,23 @@ struct Dx12Fg::Impl
     bool gate_ready = false;
     NVSDK_NGX_Parameter *nr_params = nullptr;
     NVSDK_NGX_Handle *nr_handle = nullptr;
-    int nr_width = 0;
-    int nr_height = 0;
+    // NVIDIA upscaling: DLSS Super Resolution from feature 18's output.
+    NVSDK_NGX_Parameter *nr_sr_params = nullptr;
+    NVSDK_NGX_Handle *nr_sr_handle = nullptr;
+    NrConfig nr_cfg;
     Tex nr_in, nr_out, nr_depth, nr_motion;
+    // NVIDIA: feature 18's output at the input size when upscaling follows (nr_mid), and
+    // the RGBA8 SDR proxy of an HDR frame before / after the model.
+    Tex nr_mid, nr_proxy_in, nr_proxy_out;
     Shared nr_in_buf, nr_out_buf;
     bool nr_sized = false;
+    // HDR proxy compute passes (NVIDIA): encode = linear frame -> proxy, compose = linear
+    // frame + (model's proxy - proxy) -> output. Shaders compiled once with D3DCompile.
+    ComPtr<ID3D12RootSignature> cs_root;
+    ComPtr<ID3D12PipelineState> cs_encode, cs_compose;
+    ComPtr<ID3D12DescriptorHeap> cs_heap;
+    UINT cs_increment = 0;
+    bool cs_failed = false;
     // GPU time of the evaluation: two timestamps resolved into a readback buffer, read
     // once the command list that wrote them has finished.
     ComPtr<ID3D12QueryHeap> nr_queries;
@@ -272,9 +349,25 @@ struct Dx12Fg::Impl
     bool makeTex(Tex &t, int w, int h, DXGI_FORMAT format, UINT bytes_per_texel);
     bool fill(const std::vector<Tex *> &zero, Tex *half);
     bool nrCreateFeature();
+    bool nrCreateUpscaler();
     bool nrEvaluate(bool reset, int log_level = 1);
     bool nrWarmUp();
     void destroyNr();
+    // Every neural rendering texture that exists, for warm-up fills and state rollback.
+    std::vector<Tex *> nrTextures()
+    {
+        std::vector<Tex *> all;
+        for (Tex *t : { &nr_in, &nr_out, &nr_depth, &nr_motion, &nr_mid, &nr_proxy_in, &nr_proxy_out }) {
+            if (t->res)
+                all.push_back(t);
+        }
+        return all;
+    }
+    bool nrUsesProxy() const { return gate_ready && nr_cfg.hdr; }
+    bool nrUpscales() const { return nr_cfg.out_width != nr_cfg.width || nr_cfg.out_height != nr_cfg.height; }
+    bool createProxyPipeline();
+    void writeProxyDescriptors();
+    void dispatchProxy(bool compose);
     bool makeShared(Shared &s, UINT64 size);
     void freeShared(Shared &s);
     bool waitIdle();
@@ -544,11 +637,14 @@ bool Dx12Fg::Impl::initNgx()
         log(0, "DLSS Frame Generation (D3D12) available, up to %d generated frames", max_generated);
     else
         log(1, "DLSS Frame Generation is not available through NGX D3D12 on this GPU");
-    if (adapter_vendor == kVendorNvidia)
+    if (adapter_vendor == kVendorNvidia) {
         initGate();
-    else
+        log(0, "DLSS Super Resolution (upscaling after neural rendering) %s",
+            sr_available ? "available" : "not available (needs nvngx_dlss.dll next to chiaki.exe)");
+    } else {
         log(sr_available ? 0 : 1, "DLSS Super Resolution (D3D12, used for neural rendering) %s",
             sr_available ? "available" : "is not available");
+    }
     return true;
 }
 
@@ -1034,9 +1130,11 @@ void Dx12Fg::Impl::destroySized()
 
 bool Dx12Fg::Impl::nrCreateFeature()
 {
+    const unsigned int w = static_cast<unsigned int>(nr_cfg.width), h = static_cast<unsigned int>(nr_cfg.height);
     if (gate_ready) {
-        // The model reads these at create time. Default model settings.
-        const unsigned int w = static_cast<unsigned int>(nr_width), h = static_cast<unsigned int>(nr_height);
+        // The model reads these at create time; feature 18 always runs at the input size.
+        // Presets: 1 = CC (CC_Control_History_Blend weights), 0 / 2 / 3 = HT (hnet-almond-eagle).
+        const unsigned int preset = nr_cfg.model == 1 ? 0u : 1u;
         nr_params->Reset();
         NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_Width, w);
         NVSDK_NGX_Parameter_SetUI(nr_params, NVSDK_NGX_Parameter_Height, h);
@@ -1048,7 +1146,7 @@ bool Dx12Fg::Impl::nrCreateFeature()
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Enabled", 1);
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Width", w);
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Height", h);
-        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Hint.Render.Preset", 0);
+        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Hint.Render.Preset", preset);
         NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.Intensity", 1.0f);
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Style", 0);
         NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.LocalStructureStrength", 1.0f);
@@ -1068,15 +1166,16 @@ bool Dx12Fg::Impl::nrCreateFeature()
             nr_handle = nullptr;
             return false;
         }
-        return executed;
+        return executed && (!nrUpscales() || nrCreateUpscaler());
     }
     NVSDK_NGX_DLSS_Create_Params cp = {};
-    cp.Feature.InWidth = static_cast<unsigned int>(nr_width);
-    cp.Feature.InHeight = static_cast<unsigned int>(nr_height);
-    cp.Feature.InTargetWidth = cp.Feature.InWidth;
-    cp.Feature.InTargetHeight = cp.Feature.InHeight;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
-    cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    cp.Feature.InWidth = w;
+    cp.Feature.InHeight = h;
+    cp.Feature.InTargetWidth = static_cast<unsigned int>(nr_cfg.out_width);
+    cp.Feature.InTargetHeight = static_cast<unsigned int>(nr_cfg.out_height);
+    cp.Feature.InPerfQualityValue = qualityFor(nr_cfg.width, nr_cfg.out_width);
+    cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure
+                              | (nr_cfg.hdr ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0);
     Slot *slot = nullptr;
     if (!beginList(&slot))
         return false;
@@ -1092,19 +1191,190 @@ bool Dx12Fg::Impl::nrCreateFeature()
     return executed;
 }
 
-bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
+// NVIDIA upscaling: NVIDIA's DLSS Super Resolution (nvngx_dlss.dll) from feature 18's output.
+bool Dx12Fg::Impl::nrCreateUpscaler()
+{
+    if (!nr_sr_params && (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_AllocateParameters(&nr_sr_params)) || !nr_sr_params)) {
+        log(1, "NGX parameter allocation for the upscaler failed");
+        return false;
+    }
+    NVSDK_NGX_DLSS_Create_Params cp = {};
+    cp.Feature.InWidth = static_cast<unsigned int>(nr_cfg.width);
+    cp.Feature.InHeight = static_cast<unsigned int>(nr_cfg.height);
+    cp.Feature.InTargetWidth = static_cast<unsigned int>(nr_cfg.out_width);
+    cp.Feature.InTargetHeight = static_cast<unsigned int>(nr_cfg.out_height);
+    cp.Feature.InPerfQualityValue = qualityFor(nr_cfg.width, nr_cfg.out_width);
+    cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure
+                              | (nr_cfg.hdr ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0);
+    Slot *slot = nullptr;
+    if (!beginList(&slot))
+        return false;
+    stage = "NGX_D3D12_CREATE_DLSS_EXT (upscaling after neural rendering)";
+    const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(list.Get(), 1, 1, &nr_sr_handle, nr_sr_params, &cp);
+    const bool executed = endList(*slot) && waitIdle();
+    if (NVSDK_NGX_FAILED(r) || !nr_sr_handle) {
+        log(1, "creating DLSS Super Resolution for upscaling failed: %s (0x%08x)", ngxResultString(r),
+            static_cast<unsigned>(r));
+        nr_sr_handle = nullptr;
+        return false;
+    }
+    return executed;
+}
+
+bool Dx12Fg::Impl::createProxyPipeline()
+{
+    if (cs_encode && cs_compose && cs_heap)
+        return true;
+    if (cs_failed)
+        return false;
+    cs_failed = true; // until everything below succeeds
+    stage = "HDR proxy shaders";
+    HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+    const auto compile = compiler ? reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+    using SerializeFn = HRESULT(WINAPI *)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **,
+                                          ID3DBlob **);
+    const auto serialize = reinterpret_cast<SerializeFn>(GetProcAddress(d3d12_dll, "D3D12SerializeRootSignature"));
+    if (!compile || !serialize) {
+        log(1, "HDR neural rendering on NVIDIA needs d3dcompiler_47.dll and D3D12SerializeRootSignature");
+        return false;
+    }
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 3;
+    ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].OffsetInDescriptorsFromTableStart = 3;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 2;
+    rp[0].DescriptorTable.pDescriptorRanges = ranges;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.ShaderRegister = 0;
+    rp[1].Constants.Num32BitValues = 4;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 2;
+    rsd.pParameters = rp;
+    ComPtr<ID3DBlob> blob, errors;
+    if (FAILED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors))
+        || FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&cs_root)))) {
+        log(1, "could not create the HDR proxy root signature");
+        return false;
+    }
+    for (int i = 0; i < 2; i++) {
+        const char *entry = i == 0 ? "encode" : "compose";
+        ComPtr<ID3DBlob> code;
+        errors.Reset();
+        if (FAILED(compile(kProxyShaders, sizeof(kProxyShaders) - 1, "dx12fg_proxy", nullptr, nullptr, entry, "cs_5_0",
+                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors))) {
+            log(1, "compiling the HDR proxy shader %s failed: %s", entry,
+                errors ? static_cast<const char *>(errors->GetBufferPointer()) : "no message");
+            return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = cs_root.Get();
+        pd.CS.pShaderBytecode = code->GetBufferPointer();
+        pd.CS.BytecodeLength = code->GetBufferSize();
+        ComPtr<ID3D12PipelineState> &target = i == 0 ? cs_encode : cs_compose;
+        if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&target)))) {
+            log(1, "could not create the HDR proxy pipeline %s", entry);
+            return false;
+        }
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 8;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cs_heap)))) {
+        log(1, "could not create the HDR proxy descriptor heap");
+        return false;
+    }
+    cs_increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    cs_failed = false;
+    return true;
+}
+
+// Descriptors 0-3: encode (t0 = linear frame, u0 = proxy; t1 / t2 unused), 4-7: compose
+// (t0 = linear frame, t1 = proxy, t2 = the model's proxy, u0 = composed frame).
+void Dx12Fg::Impl::writeProxyDescriptors()
+{
+    const D3D12_CPU_DESCRIPTOR_HANDLE base = cs_heap->GetCPUDescriptorHandleForHeapStart();
+    auto at = [&](UINT i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = base;
+        h.ptr += static_cast<SIZE_T>(i) * cs_increment;
+        return h;
+    };
+    auto srv = [&](Tex &t, UINT i) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+        d.Format = t.format;
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(t.res.Get(), &d, at(i));
+    };
+    auto uav = [&](Tex &t, UINT i) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC d = {};
+        d.Format = t.format;
+        d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(t.res.Get(), nullptr, &d, at(i));
+    };
+    srv(nr_in, 0);
+    srv(nr_in, 1);
+    srv(nr_in, 2);
+    uav(nr_proxy_in, 3);
+    srv(nr_in, 4);
+    srv(nr_proxy_in, 5);
+    srv(nr_proxy_out, 6);
+    uav(nrUpscales() ? nr_mid : nr_out, 7);
+}
+
+void Dx12Fg::Impl::dispatchProxy(bool compose)
 {
     const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     barrier(nr_in, srv);
+    if (compose) {
+        barrier(nr_proxy_in, srv);
+        barrier(nr_proxy_out, srv);
+        barrier(nrUpscales() ? nr_mid : nr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else {
+        barrier(nr_proxy_in, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    ID3D12DescriptorHeap *heaps[] = { cs_heap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(cs_root.Get());
+    list->SetPipelineState(compose ? cs_compose.Get() : cs_encode.Get());
+    D3D12_GPU_DESCRIPTOR_HANDLE table = cs_heap->GetGPUDescriptorHandleForHeapStart();
+    table.ptr += static_cast<UINT64>(compose ? 4 : 0) * cs_increment;
+    list->SetComputeRootDescriptorTable(0, table);
+    const UINT w = static_cast<UINT>(nr_cfg.width), h = static_cast<UINT>(nr_cfg.height);
+    const float max_out = 10000.0f / 203.0f; // PQ's ceiling, in units of SDR white
+    UINT constants[4] = { w, h, 0, 0 };
+    std::memcpy(&constants[2], &max_out, sizeof(max_out));
+    list->SetComputeRoot32BitConstants(1, 4, constants, 0);
+    list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+}
+
+bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
+{
+    const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const unsigned int w = static_cast<unsigned int>(nr_cfg.width), h = static_cast<unsigned int>(nr_cfg.height);
     barrier(nr_depth, srv);
     barrier(nr_motion, srv);
-    barrier(nr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (gate_ready) {
-        const unsigned int w = static_cast<unsigned int>(nr_width), h = static_cast<unsigned int>(nr_height);
-        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Color", nr_in.res.Get());
+        // feature 18 at the input size; HDR through the proxy; then the upscaler if any.
+        const bool proxy = nrUsesProxy();
+        if (proxy)
+            dispatchProxy(false);
+        Tex &model_in = proxy ? nr_proxy_in : nr_in;
+        Tex &model_out = proxy ? nr_proxy_out : nrUpscales() ? nr_mid : nr_out;
+        barrier(model_in, srv);
+        barrier(model_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Color", model_in.res.Get());
         NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Depth", nr_depth.res.Get());
         NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.MVec", nr_motion.res.Get());
-        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Output", nr_out.res.Get());
+        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Output", model_out.res.Get());
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Enabled", 1);
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Reset", reset ? 1 : 0);
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.DepthInverted", 0);
@@ -1118,14 +1388,41 @@ bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
         NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.MVecScaleX", 1.0f);
         NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.MVecScaleY", 1.0f);
         stage = "nvngx_dlssnr EvaluateFeature";
-        const auto r = static_cast<NVSDK_NGX_Result>(gate.evaluate(list.Get(), nr_handle, nr_params));
+        auto r = static_cast<NVSDK_NGX_Result>(gate.evaluate(list.Get(), nr_handle, nr_params));
         if (NVSDK_NGX_FAILED(r)) {
             log(log_level, "evaluating DLSS 5 neural rendering (feature 18) failed: %s (0x%08x) %s", ngxResultString(r),
                 static_cast<unsigned>(r), gate.fault());
             return false;
         }
+        if (proxy)
+            dispatchProxy(true);
+        if (!nrUpscales())
+            return true;
+        barrier(nr_mid, srv);
+        barrier(nr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        NVSDK_NGX_D3D12_DLSS_Eval_Params up = {};
+        up.Feature.pInColor = nr_mid.res.Get();
+        up.Feature.pInOutput = nr_out.res.Get();
+        up.pInDepth = nr_depth.res.Get();
+        up.pInMotionVectors = nr_motion.res.Get();
+        up.InRenderSubrectDimensions = { w, h };
+        up.InReset = reset ? 1 : 0;
+        up.InMVScaleX = 1.0f;
+        up.InMVScaleY = 1.0f;
+        up.InPreExposure = 1.0f;
+        up.InExposureScale = 1.0f;
+        up.InFrameTimeDeltaInMsec = 16.7f;
+        stage = "NGX_D3D12_EVALUATE_DLSS_EXT (upscaling after neural rendering)";
+        r = NGX_D3D12_EVALUATE_DLSS_EXT(list.Get(), nr_sr_handle, nr_sr_params, &up);
+        if (NVSDK_NGX_FAILED(r)) {
+            log(log_level, "evaluating DLSS Super Resolution (upscaling) failed: %s (0x%08x)", ngxResultString(r),
+                static_cast<unsigned>(r));
+            return false;
+        }
         return true;
     }
+    barrier(nr_in, srv);
+    barrier(nr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
     ep.Feature.pInColor = nr_in.res.Get();
     ep.Feature.pInOutput = nr_out.res.Get();
@@ -1133,7 +1430,7 @@ bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
     ep.pInMotionVectors = nr_motion.res.Get();
     ep.InJitterOffsetX = 0.0f;
     ep.InJitterOffsetY = 0.0f;
-    ep.InRenderSubrectDimensions = { static_cast<unsigned int>(nr_width), static_cast<unsigned int>(nr_height) };
+    ep.InRenderSubrectDimensions = { w, h };
     ep.InReset = reset ? 1 : 0;
     ep.InMVScaleX = 1.0f;
     ep.InMVScaleY = 1.0f;
@@ -1154,7 +1451,13 @@ bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
 // a black frame, instead of during the stream.
 bool Dx12Fg::Impl::nrWarmUp()
 {
-    if (!fill({ &nr_in, &nr_motion, &nr_out }, &nr_depth))
+    std::vector<Tex *> textures = nrTextures();
+    std::vector<Tex *> zero;
+    for (Tex *t : textures) {
+        if (t != &nr_depth)
+            zero.push_back(t);
+    }
+    if (!fill(zero, &nr_depth))
         return false;
     for (int i = 0; i < 2; i++) {
         constexpr int kAttempts = 4;
@@ -1167,16 +1470,16 @@ bool Dx12Fg::Impl::nrWarmUp()
                 if (!createSwapchain())
                     return false;
             }
-            const D3D12_RESOURCE_STATES saved[] = { nr_in.state, nr_depth.state, nr_motion.state, nr_out.state };
+            std::vector<D3D12_RESOURCE_STATES> saved;
+            for (Tex *t : textures)
+                saved.push_back(t->state);
             Slot *slot = nullptr;
             if (!beginList(&slot))
                 return false;
             if (!nrEvaluate(true, attempt + 1 < kAttempts ? 0 : 1)) {
                 list->Close();
-                nr_in.state = saved[0];
-                nr_depth.state = saved[1];
-                nr_motion.state = saved[2];
-                nr_out.state = saved[3];
+                for (size_t k = 0; k < textures.size(); k++)
+                    textures[k]->state = saved[k];
                 continue;
             }
             if (!endList(*slot) || !waitIdle())
@@ -1200,13 +1503,19 @@ void Dx12Fg::Impl::destroyNr()
             NVSDK_NGX_D3D12_ReleaseFeature(nr_handle);
     }
     nr_handle = nullptr;
+    if (nr_sr_handle)
+        NVSDK_NGX_D3D12_ReleaseFeature(nr_sr_handle);
+    nr_sr_handle = nullptr;
     freeShared(nr_in_buf);
     freeShared(nr_out_buf);
     nr_in = Tex();
     nr_out = Tex();
     nr_depth = Tex();
     nr_motion = Tex();
-    nr_width = nr_height = 0;
+    nr_mid = Tex();
+    nr_proxy_in = Tex();
+    nr_proxy_out = Tex();
+    nr_cfg = NrConfig();
     nr_sized = false;
     nr_query_done = 0;
 }
@@ -1232,6 +1541,8 @@ Dx12Fg::~Dx12Fg()
         d.gate.shutdown(d.device.Get());
     if (d.nr_params)
         NVSDK_NGX_D3D12_DestroyParameters(d.nr_params);
+    if (d.nr_sr_params)
+        NVSDK_NGX_D3D12_DestroyParameters(d.nr_sr_params);
     if (d.ngx_up && d.device)
         NVSDK_NGX_D3D12_Shutdown1(d.device.Get());
     d.swapchain.Reset();
@@ -1436,9 +1747,14 @@ bool Dx12Fg::nrAvailable() const
     return impl->gate_ready || (impl->adapter_vendor != kVendorNvidia && impl->sr_available);
 }
 
-bool Dx12Fg::nrSizeMatches(int w, int h) const
+bool Dx12Fg::nrCanUpscale() const
 {
-    return impl->nr_sized && impl->nr_width == w && impl->nr_height == h;
+    return impl->gate_ready ? impl->sr_available : nrAvailable();
+}
+
+bool Dx12Fg::nrMatches(const NrConfig &config) const
+{
+    return impl->nr_sized && impl->nr_cfg == config;
 }
 
 void Dx12Fg::nrInvalidate()
@@ -1446,10 +1762,10 @@ void Dx12Fg::nrInvalidate()
     impl->destroyNr();
 }
 
-bool Dx12Fg::nrEnsureSize(int w, int h)
+bool Dx12Fg::nrEnsure(const NrConfig &config)
 {
     Impl &d = *impl;
-    if (nrSizeMatches(w, h))
+    if (nrMatches(config))
         return true;
     d.destroyNr();
     if (!nrAvailable()) {
@@ -1458,13 +1774,35 @@ bool Dx12Fg::nrEnsureSize(int w, int h)
                      : "DLSS Super Resolution is not available through NGX D3D12 on this GPU, no neural rendering");
         return false;
     }
-    d.nr_width = w;
-    d.nr_height = h;
+    if (config.width <= 0 || config.height <= 0 || config.out_width < config.width
+        || config.out_height < config.height) {
+        d.log(1, "neural rendering: invalid size %dx%d -> %dx%d", config.width, config.height, config.out_width,
+              config.out_height);
+        return false;
+    }
+    d.nr_cfg = config;
+    const bool upscale = d.nrUpscales();
+    if (upscale && !nrCanUpscale()) {
+        d.log(1, "neural rendering: no upscaler after DLSS 5 (nvngx_dlss.dll next to chiaki.exe), keeping %dx%d",
+              config.width, config.height);
+        d.nr_cfg = NrConfig();
+        return false;
+    }
+    const int w = config.width, h = config.height, ow = config.out_width, oh = config.out_height;
+    const DXGI_FORMAT color = config.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    const UINT bpt = config.hdr ? 8 : 4;
     d.stage = "neural rendering textures";
-    bool ok = d.makeTex(d.nr_in, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) &&
-              d.makeTex(d.nr_out, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) &&
-              d.makeTex(d.nr_depth, w, h, DXGI_FORMAT_R32_FLOAT, 4) &&
-              d.makeTex(d.nr_motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4);
+    bool ok = d.makeTex(d.nr_in, w, h, color, bpt) && d.makeTex(d.nr_out, ow, oh, color, bpt)
+              && d.makeTex(d.nr_depth, w, h, DXGI_FORMAT_R32_FLOAT, 4)
+              && d.makeTex(d.nr_motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4);
+    if (ok && d.gate_ready && upscale)
+        ok = d.makeTex(d.nr_mid, w, h, color, bpt);
+    if (ok && d.nrUsesProxy()) {
+        ok = d.makeTex(d.nr_proxy_in, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4)
+             && d.makeTex(d.nr_proxy_out, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) && d.createProxyPipeline();
+        if (ok)
+            d.writeProxyDescriptors();
+    }
     d.stage = "neural rendering shared buffers";
     ok = ok && d.makeShared(d.nr_in_buf, d.nr_in.total) && d.makeShared(d.nr_out_buf, d.nr_out.total);
     if (!ok || !d.nrCreateFeature()) {
@@ -1502,8 +1840,19 @@ bool Dx12Fg::nrEnsureSize(int w, int h)
     d.nr_query_done = 0;
     d.nr_gpu_ms = 0.0;
     d.nr_sized = true;
-    d.log(0, "neural rendering (%s) ready: %dx%d",
-          d.gate_ready ? "NGX feature 18, nvngx_dlssnr.dll" : "DLSS Super Resolution DLAA through NeuralHub", w, h);
+    std::string route;
+    if (d.gate_ready) {
+        route = std::string("NGX feature 18 ") + (config.model == 1 ? "HT" : "CC");
+        if (d.nrUsesProxy())
+            route += " + HDR proxy";
+        if (upscale)
+            route += std::string(" + DLSS Super Resolution ") + qualityName(qualityFor(w, ow));
+    } else {
+        route = std::string("DLSS Super Resolution ") + qualityName(qualityFor(w, ow))
+                + " through NeuralHub (DLSS 5 in front of the upscaler)";
+    }
+    d.log(0, "neural rendering ready: %dx%d -> %dx%d, %s, %s", w, h, ow, oh, config.hdr ? "HDR" : "SDR",
+          route.c_str());
     return true;
 }
 
@@ -1519,7 +1868,7 @@ void Dx12Fg::recordNrInput(VkCommandBuffer cmd, VkImage image)
     region.bufferRowLength = d.nr_in.footprint.Footprint.RowPitch / d.nr_in.bytes_per_texel;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1;
-    region.imageExtent = { static_cast<uint32_t>(d.nr_width), static_cast<uint32_t>(d.nr_height), 1 };
+    region.imageExtent = { static_cast<uint32_t>(d.nr_cfg.width), static_cast<uint32_t>(d.nr_cfg.height), 1 };
     d.vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_GENERAL, d.nr_in_buf.buffer, 1, &region);
 }
 
@@ -1530,7 +1879,7 @@ void Dx12Fg::recordNrOutput(VkCommandBuffer cmd, VkImage image)
     region.bufferRowLength = d.nr_out.footprint.Footprint.RowPitch / d.nr_out.bytes_per_texel;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1;
-    region.imageExtent = { static_cast<uint32_t>(d.nr_width), static_cast<uint32_t>(d.nr_height), 1 };
+    region.imageExtent = { static_cast<uint32_t>(d.nr_cfg.out_width), static_cast<uint32_t>(d.nr_cfg.out_height), 1 };
     d.vkCmdCopyBufferToImage(cmd, d.nr_out_buf.buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
@@ -1540,7 +1889,10 @@ bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset
     d.stage = "queue wait";
     bool ok = d.nr_sized && d.nr_handle && SUCCEEDED(d.queue->Wait(d.shared_fence.Get(), wait_value));
     if (ok) {
-        const D3D12_RESOURCE_STATES saved[] = { d.nr_in.state, d.nr_depth.state, d.nr_motion.state, d.nr_out.state };
+        const std::vector<Impl::Tex *> textures = d.nrTextures();
+        std::vector<D3D12_RESOURCE_STATES> saved;
+        for (Impl::Tex *t : textures)
+            saved.push_back(t->state);
         // Timestamps of an earlier evaluation are read once its list has finished; new
         // ones are only written when the readback buffer is free.
         bool timed = false;
@@ -1588,10 +1940,8 @@ bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset
             d.list->Close();
         }
         if (!ok) {
-            d.nr_in.state = saved[0];
-            d.nr_depth.state = saved[1];
-            d.nr_motion.state = saved[2];
-            d.nr_out.state = saved[3];
+            for (size_t k = 0; k < textures.size(); k++)
+                textures[k]->state = saved[k];
         }
     }
     return d.signalShared(signal_value) && ok;

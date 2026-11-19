@@ -91,23 +91,45 @@ public:
 
     // ---- neural rendering (DLSS 5) ----
     // NVIDIA: NGX feature 18 from nvngx_dlssnr.dll next to chiaki.exe, called through
-    // nvngx.dll_dlssnr.dll (nrgate.cpp). Other GPUs: a DLSS Super Resolution feature in DLAA
-    // mode (input = output size), which NeuralHub serves after its DLSS 5 neural rendering
-    // pass. It has its own size, textures and shared buffers next to the frame generation
-    // ones and uses the same shared timeline semaphore (lastValue / setLastValue).
-    // nrEnsureSize warms the model up (a few seconds). No GPU work may be pending on its
-    // buffers.
-    bool nrEnsureSize(int w, int h);
-    bool nrSizeMatches(int w, int h) const;
+    // nvngx.dll_dlssnr.dll (nrgate.cpp); upscaling is NVIDIA's DLSS Super Resolution
+    // (nvngx_dlss.dll) after it, and HDR goes through an SDR proxy (the model is SDR only)
+    // whose change is put back on the linear frame. Other GPUs: one DLSS Super Resolution
+    // feature, which NeuralHub serves with its DLSS 5 neural rendering pass in front of the
+    // upscaler (DLAA when input = output size; IsHDR for HDR). It has its own size,
+    // textures and shared buffers next to the frame generation ones and uses the same
+    // shared timeline semaphore (lastValue / setLastValue).
+    struct NrConfig
+    {
+        int width = 0, height = 0;         // input (stream frame) size
+        int out_width = 0, out_height = 0; // output size: the input size, or larger to upscale
+        // RGBA16F linear light, 1.0 = SDR white (203 nits), BT.709 primaries; else RGBA8 sRGB.
+        bool hdr = false;
+        // NVIDIA feature 18 model: 0 = CC (as NeuralHub's default), 1 = HT. NeuralHub picks
+        // its model in neuralhub.ini.
+        int model = 0;
+        bool operator==(const NrConfig &o) const
+        {
+            return width == o.width && height == o.height && out_width == o.out_width && out_height == o.out_height
+                && hdr == o.hdr && model == o.model;
+        }
+    };
+    // Whether this GPU can upscale after neural rendering (NeuralHub: always; NVIDIA: with
+    // nvngx_dlss.dll next to chiaki.exe).
+    bool nrCanUpscale() const;
+    // nrEnsure warms the model up (a few seconds). No GPU work may be pending on its buffers.
+    bool nrEnsure(const NrConfig &config);
+    bool nrMatches(const NrConfig &config) const;
     void nrInvalidate();
-    // Copies between a w x h RGBA8 Vulkan image (VK_IMAGE_LAYOUT_GENERAL) and the shared
-    // neural rendering input / output buffers.
+    // Copies between Vulkan images (VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM or
+    // VK_FORMAT_R16G16B16A16_SFLOAT for HDR) and the shared input buffer (width x height) /
+    // output buffer (out_width x out_height).
     void recordNrInput(VkCommandBuffer cmd, VkImage image);
     void recordNrOutput(VkCommandBuffer cmd, VkImage image);
     // Waits (on the GPU) for `wait_value`, runs the feature on the input buffer, writes the
     // output buffer and signals `signal_value` (always, as generate() does).
     bool neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset);
-    // Average GPU time of the neural rendering evaluation in milliseconds (0 if unknown).
+    // Average GPU time of the neural rendering evaluation in milliseconds (0 if unknown),
+    // upscaling and the HDR proxy passes included.
     float nrGpuTimeMs() const;
 
     // One instance per Vulkan device, shared by frame generation and neural rendering

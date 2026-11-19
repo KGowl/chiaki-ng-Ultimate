@@ -42,6 +42,7 @@ struct NeuralRender::Impl
         VkImage image = VK_NULL_HANDLE;
         int w = 0;
         int h = 0;
+        bool hdr = false;
     };
 
     struct CacheEntry
@@ -63,9 +64,11 @@ struct NeuralRender::Impl
     pl_gpu gpu = nullptr;
     pl_renderer renderer = nullptr;
     pl_fmt fmt = nullptr;
+    pl_fmt fmt_hdr = nullptr; // rgba16f, nullptr when it cannot be rendered to
     bool initialized = false;
     bool init_failed = false;
     bool hdr_warned = false;
+    bool upscale_warned = false;
     bool reset_pending = true;
     int failures = 0;
     std::shared_ptr<Dx12Fg> runner;
@@ -105,10 +108,10 @@ struct NeuralRender::Impl
     CommandSlot *beginSlot();
     bool submit(VkCommandBuffer cmd, VkSemaphore image_sem, uint64_t image_value, uint64_t shared_wait,
                 uint64_t shared_signal);
-    bool ensureImage(Image &img, int w, int h);
+    bool ensureImage(Image &img, int w, int h, bool hdr);
     void destroyImage(Image &img);
     CacheEntry &acquireCacheEntry(uint64_t key);
-    bool run(Image &out, int w, int h, bool reset, bool *crashed);
+    bool run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed);
     void abandonRunner();
 };
 
@@ -149,6 +152,9 @@ bool NeuralRender::Impl::init(pl_vulkan vk_)
         qCWarning(chiakiGui) << "[neural-render] rgba8 format is not renderable on this device";
         return false;
     }
+    fmt_hdr = pl_find_named_fmt(gpu, "rgba16f");
+    if (fmt_hdr && (fmt_hdr->caps & needed_caps) != needed_caps)
+        fmt_hdr = nullptr;
     queue_family = vk->queue_graphics.index;
     vkGetDeviceQueue(vk->device, queue_family, 0, &queue);
     if (!queue)
@@ -276,29 +282,33 @@ bool NeuralRender::Impl::submit(VkCommandBuffer cmd, VkSemaphore image_sem, uint
     return true;
 }
 
-bool NeuralRender::Impl::ensureImage(Image &img, int w, int h)
+bool NeuralRender::Impl::ensureImage(Image &img, int w, int h, bool hdr)
 {
-    if (img.tex && img.w == w && img.h == h)
+    if (img.tex && img.w == w && img.h == h && img.hdr == hdr)
         return true;
     destroyImage(img);
     struct pl_tex_params tex_params = {};
     tex_params.w = w;
     tex_params.h = h;
-    tex_params.format = fmt;
+    tex_params.format = hdr ? fmt_hdr : fmt;
     tex_params.sampleable = true;
     tex_params.renderable = true;
+    if (!tex_params.format)
+        return false;
     img.tex = pl_tex_create(gpu, &tex_params);
     if (!img.tex)
         return false;
     VkFormat vk_format = VK_FORMAT_UNDEFINED;
     img.image = pl_vulkan_unwrap(gpu, img.tex, &vk_format, nullptr);
-    if (!img.image || vk_format != VK_FORMAT_R8G8B8A8_UNORM) {
+    const VkFormat expected = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    if (!img.image || vk_format != expected) {
         qCWarning(chiakiGui) << "[neural-render] Unexpected texture format" << static_cast<int>(vk_format);
         destroyImage(img);
         return false;
     }
     img.w = w;
     img.h = h;
+    img.hdr = hdr;
     return true;
 }
 
@@ -334,17 +344,18 @@ void NeuralRender::Impl::abandonRunner()
 // (1) Vulkan copies `input` into the shared buffer and signals the D3D12 timeline, (2) the
 // D3D12 queue waits for it, runs the feature and signals the next value, (3) Vulkan waits for
 // that and copies the shared output buffer into `out`.
-bool NeuralRender::Impl::run(Image &out, int w, int h, bool reset, bool *crashed)
+bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed)
 {
     *crashed = false;
-    if (!runner->nrSizeMatches(w, h)) {
+    if (!runner->nrMatches(config)) {
         // The shared buffers are rebuilt: nothing may still use them.
         if (!waitDone(done_value))
             return false;
-        qCInfo(chiakiGui).nospace() << "[neural-render] Preparing DLSS neural rendering for " << w << "x" << h
-                                    << " (the model warms up, a few seconds)";
+        qCInfo(chiakiGui).nospace() << "[neural-render] Preparing DLSS neural rendering for " << config.width << "x"
+                                    << config.height << " -> " << config.out_width << "x" << config.out_height
+                                    << (config.hdr ? " HDR" : " SDR") << " (the model warms up, a few seconds)";
         unsigned long seh_code = 0;
-        const bool sized = guardedCall([&]() { return runner->nrEnsureSize(w, h); }, &seh_code);
+        const bool sized = guardedCall([&]() { return runner->nrEnsure(config); }, &seh_code);
         if (seh_code) {
             qCCritical(chiakiGui).nospace() << "[neural-render] The NGX D3D12 runtime crashed (exception 0x" << Qt::hex
                                             << seh_code << Qt::dec << ", in " << runner->stage() << ")";
@@ -493,6 +504,11 @@ bool NeuralRender::failed() const
     return impl->init_failed;
 }
 
+bool NeuralRender::canUpscale() const
+{
+    return impl->runner && impl->runner->nrCanUpscale();
+}
+
 float NeuralRender::gpuTimeMs() const
 {
     return impl->runner ? impl->runner->nrGpuTimeMs() : 0.0f;
@@ -503,24 +519,57 @@ void NeuralRender::destroy()
     impl->shutdown();
 }
 
-bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, struct pl_frame *out_frame,
-                           uint64_t *out_signature)
+bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, const Options &options,
+                           struct pl_frame *out_frame, uint64_t *out_signature)
 {
     Impl &d = *impl;
     if (!d.initialized || !src || src->num_planes <= 0)
         return false;
-    if (pl_color_space_is_hdr(&src->color)) {
+    const bool hdr = pl_color_space_is_hdr(&src->color);
+    if (hdr && !d.fmt_hdr) {
         if (!d.hdr_warned) {
-            qCInfo(chiakiGui) << "[neural-render] HDR stream detected, DLSS neural rendering is skipped for HDR content";
+            qCInfo(chiakiGui) << "[neural-render] HDR stream detected, but rgba16f cannot be rendered to on this "
+                                 "device: DLSS neural rendering is skipped for HDR content";
             d.hdr_warned = true;
         }
         return false;
     }
-    const int w = static_cast<int>(std::lround(std::fabs(pl_rect_w(src->crop))));
-    const int h = static_cast<int>(std::lround(std::fabs(pl_rect_h(src->crop))));
-    if (w <= 0 || h <= 0)
+    Dx12Fg::NrConfig config;
+    config.width = static_cast<int>(std::lround(std::fabs(pl_rect_w(src->crop))));
+    config.height = static_cast<int>(std::lround(std::fabs(pl_rect_h(src->crop))));
+    if (config.width <= 0 || config.height <= 0)
         return false;
-    const uint64_t key = signature ^ (static_cast<uint64_t>(w) * 0x9E3779B97F4A7C15ull) ^ (static_cast<uint64_t>(h) << 32)
+    config.out_width = config.width;
+    config.out_height = config.height;
+    if (options.out_width > config.width && options.out_height > config.height) {
+        if (d.runner->nrCanUpscale()) {
+            config.out_width = options.out_width;
+            config.out_height = options.out_height;
+        } else if (!d.upscale_warned) {
+            qCWarning(chiakiGui) << "[neural-render] Upscaling after DLSS neural rendering is unavailable (NVIDIA: "
+                                    "nvngx_dlss.dll next to chiaki.exe), keeping the stream size";
+            d.upscale_warned = true;
+        }
+    }
+    config.hdr = hdr;
+    config.model = options.model == 1 ? 1 : 0;
+
+    // Linear light, 1.0 = SDR white (libplacebo's linear convention), BT.709 primaries and
+    // gamut (libplacebo maps wider gamuts into it), the stream's HDR peak: no tone mapping.
+    struct pl_color_space color = pl_color_space_bt709;
+    if (hdr) {
+        struct pl_color_space src_color = src->color;
+        pl_color_space_infer(&src_color);
+        color = {};
+        color.primaries = PL_COLOR_PRIM_BT_709;
+        color.transfer = PL_COLOR_TRC_LINEAR;
+        color.hdr = src_color.hdr;
+        color.hdr.prim = *pl_raw_primaries_get(PL_COLOR_PRIM_BT_709);
+    }
+
+    const uint64_t key = signature ^ (static_cast<uint64_t>(config.width) * 0x9E3779B97F4A7C15ull)
+        ^ (static_cast<uint64_t>(config.height) << 32) ^ (static_cast<uint64_t>(config.out_width) * 0xC2B2AE3D27D4EB4Full)
+        ^ (static_cast<uint64_t>(config.out_height) << 20) ^ (hdr ? 0x1000000000ull : 0) ^ (config.model ? 0x2000000000ull : 0)
         ^ 0x4E52000000000000ull;
 
     auto fill_frame = [&](Impl::CacheEntry &entry) {
@@ -533,7 +582,7 @@ bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, struc
         out_frame->planes[0].component_mapping[1] = PL_CHANNEL_G;
         out_frame->planes[0].component_mapping[2] = PL_CHANNEL_B;
         out_frame->repr = pl_color_repr_rgb;
-        out_frame->color = pl_color_space_bt709;
+        out_frame->color = color;
         out_frame->crop = { 0.0f, 0.0f, static_cast<float>(entry.image.w), static_cast<float>(entry.image.h) };
         *out_signature = entry.key;
     };
@@ -545,9 +594,10 @@ bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, struc
     }
 
     // Resizing destroys the texture, so pending copies must not use it anymore.
-    if (d.input.tex && (d.input.w != w || d.input.h != h) && !d.waitDone(d.done_value))
+    if (d.input.tex && (d.input.w != config.width || d.input.h != config.height || d.input.hdr != hdr)
+        && !d.waitDone(d.done_value))
         return false;
-    if (!d.ensureImage(d.input, w, h))
+    if (!d.ensureImage(d.input, config.width, config.height, hdr))
         return false;
     struct pl_frame in_target = {};
     in_target.num_planes = 1;
@@ -556,9 +606,11 @@ bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, struc
     for (int i = 0; i < 4; i++)
         in_target.planes[0].component_mapping[i] = i;
     in_target.repr = pl_color_repr_rgb;
-    in_target.color = pl_color_space_bt709;
+    in_target.color = color;
     struct pl_render_params render_params = pl_render_default_params;
     render_params.frame_mixer = nullptr;
+    if (hdr)
+        render_params.peak_detect_params = nullptr; // keep the stream's levels for the model
     if (!pl_render_image(d.renderer, src, &in_target, &render_params)) {
         qCWarning(chiakiGui) << "[neural-render] Failed to prepare the input frame";
         return false;
@@ -566,12 +618,12 @@ bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, struc
 
     Impl::CacheEntry &entry = d.acquireCacheEntry(key);
     // A recycled entry is several frames old, so this wait normally returns at once.
-    if (!d.waitDone(entry.done_value) || !d.ensureImage(entry.image, w, h)) {
+    if (!d.waitDone(entry.done_value) || !d.ensureImage(entry.image, config.out_width, config.out_height, hdr)) {
         entry.key = 0;
         return false;
     }
     bool crashed = false;
-    const bool ok = d.run(entry.image, w, h, d.reset_pending, &crashed);
+    const bool ok = d.run(entry.image, config, d.reset_pending, &crashed);
     if (!ok) {
         entry.key = 0;
         d.reset_pending = true;
@@ -601,8 +653,12 @@ NeuralRender::NeuralRender(pl_log) {}
 NeuralRender::~NeuralRender() = default;
 bool NeuralRender::ensureInitialized(pl_vulkan) { return false; }
 bool NeuralRender::failed() const { return true; }
+bool NeuralRender::canUpscale() const { return false; }
 float NeuralRender::gpuTimeMs() const { return 0.0f; }
 void NeuralRender::destroy() {}
-bool NeuralRender::process(const struct pl_frame *, uint64_t, struct pl_frame *, uint64_t *) { return false; }
+bool NeuralRender::process(const struct pl_frame *, uint64_t, const Options &, struct pl_frame *, uint64_t *)
+{
+    return false;
+}
 
 #endif // CHIAKI_HAVE_DX12FG

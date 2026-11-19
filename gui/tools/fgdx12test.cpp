@@ -6,9 +6,12 @@
 // Usage: chiaki-fgdx12test [--backend 5] [--frames N] [--mvx N] [--w W --h H]
 //   --backend  FrameGen::Backend value: 1 DLSS (Vulkan), 3 Flow, 5 DLSS through D3D12 (default)
 //        chiaki-fgdx12test --nr [--image file] [--out file.png] [--with-fg] [--frames N] [--mvx N]
+//                          [--scale 1|1.5|2] [--hdr] [--model 0|1]
 //   --nr       neural rendering (NeuralRender, DLSS 5 through D3D12) on a moving pattern or on
 //              an image panned by --mvx px per frame; --out saves the last output, --with-fg
-//              also runs DLSS Frame Generation through D3D12 on the output (shared runtime).
+//              also runs DLSS Frame Generation through D3D12 on the output (shared runtime),
+//              --scale upscales after it, --hdr feeds a linear-light HDR frame, --model picks
+//              NVIDIA's feature 18 model (0 CC, 1 HT).
 // For backend 5 and --nr on a GPU without NVIDIA's runtime, NeuralHub's dxgi.dll and
 // neuralhub.ini must sit next to the executable.
 
@@ -188,6 +191,95 @@ struct Rig
         return pl_tex_download(gpu, &dn);
     }
 
+    // ---- neural rendering test: HDR source and readback at any size ----
+    pl_tex source_hdr = nullptr; // rgba16f, linear light
+    pl_tex float_target = nullptr;
+    float hdr_peak = 8.0f;
+
+    bool ensureHdrSource()
+    {
+        if (source_hdr && source_hdr->params.w == w && source_hdr->params.h == h)
+            return true;
+        if (source_hdr)
+            pl_tex_destroy(gpu, &source_hdr);
+        struct pl_tex_params p = {};
+        p.w = w;
+        p.h = h;
+        p.format = pl_find_named_fmt(gpu, "rgba16f");
+        p.sampleable = true;
+        p.host_writable = true;
+        source_hdr = p.format ? pl_tex_create(gpu, &p) : nullptr;
+        return source_hdr != nullptr;
+    }
+
+    void uploadHalf(const uint16_t *data)
+    {
+        struct pl_tex_transfer_params up = {};
+        up.tex = source_hdr;
+        up.ptr = const_cast<uint16_t *>(data);
+        up.row_pitch = static_cast<size_t>(w) * 8;
+        pl_tex_upload(gpu, &up);
+    }
+
+    // Linear light, 1.0 = SDR white, BT.709, highlights up to hdr_peak: how chiaki-ng's
+    // neural rendering takes an HDR stream.
+    struct pl_color_space hdrSpace() const
+    {
+        struct pl_color_space c = {};
+        c.primaries = PL_COLOR_PRIM_BT_709;
+        c.transfer = PL_COLOR_TRC_LINEAR;
+        c.hdr.max_luma = hdr_peak * PL_COLOR_SDR_WHITE;
+        c.hdr.prim = *pl_raw_primaries_get(PL_COLOR_PRIM_BT_709);
+        return c;
+    }
+
+    struct pl_frame hdrSourceFrame() const
+    {
+        struct pl_frame frame = sourceFrame();
+        frame.planes[0].texture = source_hdr;
+        frame.color = hdrSpace();
+        return frame;
+    }
+
+    // Renders `frame` into an ow x oh rgba32f target in `color` and reads it back.
+    bool readFloat(const struct pl_frame &frame, int ow, int oh, const struct pl_color_space &color,
+                   std::vector<float> &out)
+    {
+        if (!float_target || float_target->params.w != ow || float_target->params.h != oh) {
+            if (float_target)
+                pl_tex_destroy(gpu, &float_target);
+            struct pl_tex_params p = {};
+            p.w = ow;
+            p.h = oh;
+            p.format = pl_find_named_fmt(gpu, "rgba32f");
+            p.renderable = true;
+            p.host_readable = true;
+            float_target = p.format ? pl_tex_create(gpu, &p) : nullptr;
+            if (!float_target)
+                return false;
+        }
+        struct pl_frame target = {};
+        target.num_planes = 1;
+        target.planes[0].texture = float_target;
+        target.planes[0].components = 4;
+        for (int i = 0; i < 4; i++)
+            target.planes[0].component_mapping[i] = i;
+        target.repr = pl_color_repr_rgb;
+        target.color = color;
+        struct pl_render_params params = pl_render_default_params;
+        params.frame_mixer = nullptr;
+        params.dither_params = nullptr;
+        params.peak_detect_params = nullptr;
+        if (!pl_render_image(renderer, &frame, &target, &params))
+            return false;
+        out.resize(static_cast<size_t>(ow) * oh * 4);
+        struct pl_tex_transfer_params dn = {};
+        dn.tex = float_target;
+        dn.ptr = out.data();
+        dn.row_pitch = static_cast<size_t>(ow) * 16;
+        return pl_tex_download(gpu, &dn);
+    }
+
     void destroy()
     {
         if (gpu) {
@@ -195,6 +287,10 @@ struct Rig
                 pl_tex_destroy(gpu, &source);
             if (readback)
                 pl_tex_destroy(gpu, &readback);
+            if (source_hdr)
+                pl_tex_destroy(gpu, &source_hdr);
+            if (float_target)
+                pl_tex_destroy(gpu, &float_target);
         }
         if (renderer)
             pl_renderer_destroy(&renderer);
@@ -238,11 +334,71 @@ struct Phase
     int w, h, multiplier, frames, cleanup;
 };
 
+float srgbToLinear(float v)
+{
+    return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+}
+
+uint16_t floatToHalf(float f)
+{
+    uint32_t x = 0;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int exp = static_cast<int>((x >> 23) & 0xffu) - 127 + 15;
+    const uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0)
+        return static_cast<uint16_t>(sign);
+    if (exp >= 31)
+        return static_cast<uint16_t>(sign | 0x7c00u);
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
+}
+
+// A synthetic HDR frame from an SDR one (same as nrprobe): linear light with the highlights
+// pushed up to `peak` times SDR white.
+std::vector<uint16_t> toHdrHalf(const std::vector<uint8_t> &rgba, float peak)
+{
+    std::vector<uint16_t> out(rgba.size());
+    for (size_t i = 0; i < rgba.size(); i += 4) {
+        float l[3];
+        for (int c = 0; c < 3; c++)
+            l[c] = srgbToLinear(rgba[i + c] / 255.0f);
+        const float m = std::max({ l[0], l[1], l[2] });
+        const float t = std::clamp((m - 0.5f) / 0.5f, 0.0f, 1.0f);
+        const float boost = 1.0f + (peak - 1.0f) * t * t * (3.0f - 2.0f * t);
+        for (int c = 0; c < 3; c++)
+            out[i + c] = floatToHalf(l[c] * boost);
+        out[i + 3] = floatToHalf(1.0f);
+    }
+    return out;
+}
+
+struct HdrStats
+{
+    double mean = 0.0, max = 0.0, above = 0.0; // luminance, share of pixels above SDR white
+};
+
+HdrStats hdrStats(const std::vector<float> &f)
+{
+    HdrStats s;
+    const size_t n = f.size() / 4;
+    for (size_t i = 0; i < f.size(); i += 4) {
+        const double y = 0.2126 * f[i] + 0.7152 * f[i + 1] + 0.0722 * f[i + 2];
+        s.mean += y;
+        s.max = std::max(s.max, y);
+        if (y > 1.0)
+            s.above += 1.0;
+    }
+    s.mean /= std::max<size_t>(n, 1);
+    s.above = 100.0 * s.above / std::max<size_t>(n, 1);
+    return s;
+}
+
 // Neural rendering on a moving pattern or a panned image: every output must be a real
 // picture close to its input (not black, not the previous frame), and the runtime must keep
-// working when frame generation through D3D12 shares it.
+// working when frame generation through D3D12 shares it. --scale upscales after it, --hdr
+// feeds a linear-light HDR frame (highlights to 8x SDR white) and checks they stay HDR.
 int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &out_path, int frames, int mvx, int w,
-                    int h, bool with_fg)
+                    int h, bool with_fg, float scale, bool hdr, int model)
 {
     std::vector<uint8_t> base;
     if (!image_path.empty()) {
@@ -258,9 +414,17 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
         for (int y = 0; y < h; y++)
             std::memcpy(base.data() + static_cast<size_t>(y) * w * 4, img.constScanLine(y), static_cast<size_t>(w) * 4);
     }
-    std::printf("neural rendering test: %dx%d %s, %d frames, %d px/frame pan%s\n", w, h,
-                base.empty() ? "pattern" : image_path.c_str(), frames, mvx, with_fg ? ", with DLSS FG D3D12" : "");
-    if (!rig.resize(w, h)) {
+    NeuralRender::Options options;
+    options.model = model;
+    if (scale > 1.01f) {
+        options.out_width = static_cast<int>(std::lround(w * scale / 2.0f)) * 2;
+        options.out_height = static_cast<int>(std::lround(h * scale / 2.0f)) * 2;
+    }
+    std::printf("neural rendering test: %dx%d -> %dx%d %s %s, model %s, %d frames, %d px/frame pan%s\n", w, h,
+                options.out_width ? options.out_width : w, options.out_height ? options.out_height : h,
+                hdr ? "HDR" : "SDR", base.empty() ? "pattern" : image_path.c_str(), model == 1 ? "HT" : "CC", frames,
+                mvx, with_fg ? ", with DLSS FG D3D12" : "");
+    if (!rig.resize(w, h) || (hdr && !rig.ensureHdrSource())) {
         std::printf("VERDICT: textures\n");
         return 3;
     }
@@ -280,9 +444,12 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
     }
 
     int failures = 0, good = 0;
-    double sum_ms = 0.0;
+    double sum_ms = 0.0, sum_gpu = 0.0;
     int timed = 0;
-    std::vector<uint8_t> input(static_cast<size_t>(w) * h * 4), output;
+    int out_w = w, out_h = h;
+    std::vector<uint8_t> input(static_cast<size_t>(w) * h * 4);
+    std::vector<float> reference, output, last_full;
+    struct pl_frame last_out = {};
     for (int k = 0; k < frames; k++) {
         const int shift = mvx * k;
         if (base.empty()) {
@@ -302,61 +469,99 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
                 std::memcpy(dst_row + static_cast<size_t>(w - s) * 4, src_row, static_cast<size_t>(s) * 4);
             }
         }
-        rig.uploadRgba(input.data());
-        struct pl_frame src = rig.sourceFrame();
+        struct pl_frame src;
+        if (hdr) {
+            const std::vector<uint16_t> half = toHdrHalf(input, rig.hdr_peak);
+            rig.uploadHalf(half.data());
+            src = rig.hdrSourceFrame();
+        } else {
+            rig.uploadRgba(input.data());
+            src = rig.sourceFrame();
+        }
         struct pl_frame out = {};
         uint64_t signature = 0;
         timer.restart();
-        const bool ok = nr.process(&src, static_cast<uint64_t>(k + 1), &out, &signature);
+        const bool ok = nr.process(&src, static_cast<uint64_t>(k + 1), options, &out, &signature);
         const double ms = timer.nsecsElapsed() / 1e6;
         if (!ok) {
             std::printf("frame %2d: process() failed (%.1f ms)\n", k, ms);
             failures++;
             continue;
         }
-        if (!rig.readRgba(out, output)) {
+        out_w = static_cast<int>(std::lround(std::fabs(pl_rect_w(out.crop))));
+        out_h = static_cast<int>(std::lround(std::fabs(pl_rect_h(out.crop))));
+        // Both seen the same way (SDR BT.709, HDR tone mapped by libplacebo, the output scaled
+        // back to the input size): the output must stay close to its input.
+        if (!rig.readFloat(src, w, h, pl_color_space_bt709, reference) ||
+            !rig.readFloat(out, w, h, pl_color_space_bt709, output)) {
             std::printf("frame %2d: reading the output failed\n", k);
             failures++;
             continue;
         }
         if (k >= 2) {
             sum_ms += ms;
+            sum_gpu += nr.gpuTimeMs();
             timed++;
         }
         double diff = 0.0, mean = 0.0;
         for (size_t i = 0; i < output.size(); i += 4) {
             for (int c = 0; c < 3; c++) {
-                diff += std::fabs(static_cast<double>(output[i + c]) - static_cast<double>(input[i + c]));
-                mean += output[i + c];
+                diff += std::fabs(static_cast<double>(output[i + c]) - static_cast<double>(reference[i + c])) * 255.0;
+                mean += output[i + c] * 255.0;
             }
         }
         const double n = static_cast<double>(output.size() / 4) * 3.0;
         diff /= n;
         mean /= n;
-        const bool frame_good = mean > 5.0 && diff < 40.0;
+        bool frame_good = mean > 5.0 && diff < 40.0;
+        if (options.out_width && (out_w != options.out_width || out_h != options.out_height))
+            frame_good = false;
+        std::string hdr_note;
+        if (hdr) {
+            std::vector<float> lin_in, lin_out;
+            if (rig.readFloat(src, w, h, rig.hdrSpace(), lin_in) &&
+                rig.readFloat(out, out_w, out_h, rig.hdrSpace(), lin_out)) {
+                const HdrStats a = hdrStats(lin_in), b = hdrStats(lin_out);
+                char buf[200];
+                std::snprintf(buf, sizeof(buf), " | HDR in: mean %.3f max %.2f >1.0 %.1f%%, out: mean %.3f max %.2f >1.0 %.1f%%",
+                              a.mean, a.max, a.above, b.mean, b.max, b.above);
+                hdr_note = buf;
+                // The highlights must survive (not clipped at SDR white).
+                if (b.max < 2.0 || b.above < a.above * 0.5)
+                    frame_good = false;
+            }
+        }
         std::string fg_note;
         if (with_fg) {
             std::vector<struct pl_frame> fg_out;
-            const bool fg_ok = fg.process(&out, w, h, 2, 16.7f, fg_out);
+            const bool fg_ok = fg.process(&out, out_w, out_h, 2, 16.7f, fg_out);
             fg_note = fg_ok ? " | FG " + std::to_string(fg_out.size()) + " frame(s)" : " | FG failed";
             if (!fg_ok && k > 0)
                 failures++;
         }
-        std::printf("frame %2d: process %.1f ms, NR GPU %.2f ms, mean diff to input %.2f, output mean %.1f%s %s\n", k, ms,
-                    nr.gpuTimeMs(), diff, mean, fg_note.c_str(), frame_good ? "OK" : "BAD");
+        std::printf("frame %2d: %dx%d, process %.1f ms, NR GPU %.2f ms, mean diff to input %.2f, output mean %.1f%s%s %s\n",
+                    k, out_w, out_h, ms, nr.gpuTimeMs(), diff, mean, hdr_note.c_str(), fg_note.c_str(),
+                    frame_good ? "OK" : "BAD");
         if (frame_good)
             good++;
         else
             failures++;
+        last_out = out;
     }
-    if (!out_path.empty() && !output.empty()) {
-        QImage saved(output.data(), w, h, w * 4, QImage::Format_RGBA8888);
-        std::printf("%s %s\n", saved.copy().save(QString::fromStdString(out_path)) ? "saved" : "could not save",
-                    out_path.c_str());
+    if (!out_path.empty() && last_out.num_planes > 0) {
+        // The last output at its own size, as an SDR picture (HDR tone mapped by libplacebo).
+        if (rig.readFloat(last_out, out_w, out_h, pl_color_space_bt709, last_full)) {
+            std::vector<uint8_t> bytes(last_full.size());
+            for (size_t i = 0; i < last_full.size(); i++)
+                bytes[i] = static_cast<uint8_t>(std::clamp(last_full[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+            QImage saved(bytes.data(), out_w, out_h, out_w * 4, QImage::Format_RGBA8888);
+            std::printf("%s %s (%dx%d)\n", saved.copy().save(QString::fromStdString(out_path)) ? "saved" : "could not save",
+                        out_path.c_str(), out_w, out_h);
+        }
     }
     if (timed)
-        std::printf("-- %d of %d frames good, average process() %.2f ms, NR GPU time %.2f ms\n", good, frames,
-                    sum_ms / timed, nr.gpuTimeMs());
+        std::printf("-- %d of %d frames good, %dx%d -> %dx%d %s, average process() %.2f ms, NR GPU time %.2f ms\n", good,
+                    frames, w, h, out_w, out_h, hdr ? "HDR" : "SDR", sum_ms / timed, sum_gpu / timed);
     fg.destroy();
     nr.destroy();
     std::printf("\nVERDICT: %s\n", failures == 0 ? "NEURAL RENDERING PASSED" : "NEURAL RENDERING FAILED, see above");
@@ -368,8 +573,9 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
-    int backend_value = 5, frames = 20, mvx = 8, w = 1920, h = 1080;
-    bool nr_mode = false, with_fg = false;
+    int backend_value = 5, frames = 20, mvx = 8, w = 1920, h = 1080, model = 0;
+    bool nr_mode = false, with_fg = false, hdr = false;
+    float scale = 1.0f;
     std::string image_path, out_path;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -382,6 +588,9 @@ int main(int argc, char **argv)
         else if (a == "--with-fg") with_fg = true;
         else if (a == "--image" && i + 1 < argc) image_path = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+        else if (a == "--scale" && i + 1 < argc) scale = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--hdr") hdr = true;
+        else if (a == "--model" && i + 1 < argc) model = std::atoi(argv[++i]);
     }
     if (nr_mode) {
         if (!NeuralRender::compiledIn()) {
@@ -394,7 +603,7 @@ int main(int argc, char **argv)
             rig.destroy();
             return 3;
         }
-        const int result = runNeuralRender(rig, image_path, out_path, frames, mvx, w, h, with_fg);
+        const int result = runNeuralRender(rig, image_path, out_path, frames, mvx, w, h, with_fg, scale, hdr, model);
         rig.destroy();
         return result;
     }

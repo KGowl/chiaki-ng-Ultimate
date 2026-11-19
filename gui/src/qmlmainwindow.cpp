@@ -5513,6 +5513,11 @@ renderer_backend_ready:
         switch (nr_status_state.loadRelaxed()) {
         case 1: {
             QString part = QStringLiteral("DLSS NR");
+            const int out_h = nr_status_out_h.loadRelaxed();
+            if (out_h > 0)
+                part += QStringLiteral(" → %1p").arg(out_h);
+            if (nr_status_hdr.loadRelaxed())
+                part += QStringLiteral(" HDR");
             const int cms = nr_status_gpu_cms.loadRelaxed();
             if (cms > 0)
                 part += QStringLiteral(" %1 ms").arg(cms / 100.0, 0, 'f', 1);
@@ -7859,39 +7864,73 @@ void QmlMainWindow::render()
     }
 
     // DLSS neural rendering (DLSS 5 through the NGX D3D12 bridge; NeuralHub on AMD):
-    // replace each source frame with a neural rendered RGB frame at its own size,
-    // before RTX VSR and frame generation, which then work on it. Any failure keeps
-    // the decoded frame.
+    // replace each source frame with a neural rendered RGB frame, at its own size or
+    // upscaled 1.5x / 2x toward the window, before RTX VSR and frame generation, which
+    // then work on it. Any failure keeps the decoded frame.
     constexpr int kNeuralMaxMixFrames = 8;
     std::array<struct pl_frame, kNeuralMaxMixFrames> nr_frames;
     std::array<const struct pl_frame *, kNeuralMaxMixFrames> nr_frame_ptrs;
     std::array<uint64_t, kNeuralMaxMixFrames> nr_signatures;
     uint64_t direct_signature = direct_frame_serial;
     bool nr_applied = false;
+    bool nr_upscaled = false;
+    int nr_out_h = 0;
+    bool nr_hdr = false;
     const bool nr_wanted = neural_render && has_settings && settings->GetNeuralRender() && stream_active;
     if (!fg_override && nr_wanted && neural_render->ensureInitialized(placebo_vulkan)) {
+        // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
+        // the largest step DLSS Performance covers well), or the source size.
+        auto nr_options_for = [&](const struct pl_frame *src) {
+            NeuralRender::Options options;
+            options.model = settings->GetNeuralRenderModel();
+            if (!settings->GetNeuralRenderUpscale() || !src)
+                return options;
+            const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
+            const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
+            if (src_w < 1.0f || src_h < 1.0f)
+                return options;
+            const float ratio = qMin(dst_w / src_w, dst_h / src_h);
+            const float scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
+            if (scale > 1.0f) {
+                // Even sizes keep the chroma-free RGB textures and the upscaler's ratios exact.
+                options.out_width = static_cast<int>(lroundf(src_w * scale / 2.0f)) * 2;
+                options.out_height = static_cast<int>(lroundf(src_h * scale / 2.0f)) * 2;
+            }
+            return options;
+        };
+        auto note_result = [&](const struct pl_frame *src, const struct pl_frame &out) {
+            nr_upscaled = fabsf(pl_rect_w(out.crop)) > fabsf(pl_rect_w(src->crop)) + 0.5f;
+            nr_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(out.crop))));
+            nr_hdr = pl_color_space_is_hdr(&out.color);
+        };
         if (bypass_frame_queue) {
             struct pl_frame rendered = {};
             uint64_t rendered_signature = 0;
             if (direct_render_frame.num_planes > 0 &&
-                neural_render->process(&direct_render_frame, direct_frame_serial, &rendered, &rendered_signature)) {
+                neural_render->process(&direct_render_frame, direct_frame_serial, nr_options_for(&direct_render_frame),
+                                       &rendered, &rendered_signature)) {
+                note_result(&direct_render_frame, rendered);
                 direct_render_frame = rendered;
                 direct_signature = rendered_signature;
                 nr_applied = true;
             }
         } else if (frame_mix.num_frames > 0 && frame_mix.num_frames <= kNeuralMaxMixFrames) {
             nr_applied = true;
+            const NeuralRender::Options options = nr_options_for(frame_mix.frames[0]);
             for (int i = 0; i < frame_mix.num_frames && nr_applied; i++) {
-                nr_applied = neural_render->process(frame_mix.frames[i], frame_mix.signatures[i], &nr_frames[i],
+                nr_applied = neural_render->process(frame_mix.frames[i], frame_mix.signatures[i], options, &nr_frames[i],
                                                     &nr_signatures[i]);
                 nr_frame_ptrs[i] = &nr_frames[i];
             }
             if (nr_applied) {
+                note_result(frame_mix.frames[0], nr_frames[0]);
                 frame_mix.frames = nr_frame_ptrs.data();
                 frame_mix.signatures = nr_signatures.data();
             }
         }
     }
+    if (!nr_applied)
+        nr_upscaled = false;
     if (!fg_override) {
         if (nr_applied != neural_render_active) {
             neural_render_active = nr_applied;
@@ -7899,6 +7938,8 @@ void QmlMainWindow::render()
         }
         nr_status_state.storeRelaxed(!nr_wanted ? 0 : nr_applied ? 1 : neural_render->failed() ? 3 : 2);
         nr_status_gpu_cms.storeRelaxed(nr_applied ? static_cast<int>(neural_render->gpuTimeMs() * 100.0f) : 0);
+        nr_status_out_h.storeRelaxed(nr_applied && nr_upscaled ? nr_out_h : 0);
+        nr_status_hdr.storeRelaxed(nr_applied && nr_hdr ? 1 : 0);
     }
 
     // RTX Video Super Resolution: replace each source frame with an NVIDIA
@@ -7911,7 +7952,9 @@ void QmlMainWindow::render()
     std::array<uint64_t, kRtxVsrMaxMixFrames> vsr_signatures;
     bool vsr_applied = false;
     const int rtx_vsr_quality = rtx_vsr && has_settings ? settings->GetRtxVsrQuality() : 0;
-    if (!fg_override && rtx_vsr_quality > 0 && nvidia_card && stream_active && rtx_vsr->ensureInitialized(placebo_vulkan)) {
+    // Not after neural rendering upscaled the frame (it already is near the window size).
+    if (!fg_override && !nr_upscaled && rtx_vsr_quality > 0 && nvidia_card && stream_active &&
+        rtx_vsr->ensureInitialized(placebo_vulkan)) {
         const int vsr_out_w = static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop))));
         const int vsr_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(target_frame.crop))));
         if (bypass_frame_queue) {
@@ -8045,7 +8088,7 @@ void QmlMainWindow::render()
         }
     }
 
-    if ((vsr_applied && !RtxVsr::keepsResolution(rtx_vsr_quality)) || fg_applied) {
+    if ((vsr_applied && !RtxVsr::keepsResolution(rtx_vsr_quality)) || fg_applied || nr_upscaled) {
         // The frame already is at display size; skip the shader upscalers
         // but keep RCAS, which sharpens the final image.
         const bool rcas_active = num_active_hooks > 0 && active_hooks[num_active_hooks - 1] == rcas_hook;

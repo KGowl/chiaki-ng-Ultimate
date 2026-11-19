@@ -108,6 +108,8 @@ class QmlSettings : public QObject
 	Q_PROPERTY(QString rtxVsrDllVersion READ rtxVsrDllVersion CONSTANT)
 	Q_PROPERTY(bool neuralRender READ neuralRender WRITE setNeuralRender NOTIFY neuralRenderChanged)
 	Q_PROPERTY(bool neuralRenderSupported READ neuralRenderSupported CONSTANT)
+	Q_PROPERTY(bool neuralRenderUpscale READ neuralRenderUpscale WRITE setNeuralRenderUpscale NOTIFY neuralRenderChanged)
+	Q_PROPERTY(int neuralRenderModel READ neuralRenderModel WRITE setNeuralRenderModel NOTIFY neuralRenderChanged)
 	Q_PROPERTY(int frameGenBackend READ frameGenBackend WRITE setFrameGenBackend NOTIFY frameGenBackendChanged)
 	Q_PROPERTY(int frameGenMultiplier READ frameGenMultiplier WRITE setFrameGenMultiplier NOTIFY frameGenMultiplierChanged)
 	Q_PROPERTY(bool frameGenSupported READ frameGenSupported CONSTANT)
@@ -385,6 +387,10 @@ public:
     bool neuralRender() const;
     void setNeuralRender(bool enabled);
     bool neuralRenderSupported() const;
+    bool neuralRenderUpscale() const;
+    void setNeuralRenderUpscale(bool enabled);
+    int neuralRenderModel() const;
+    void setNeuralRenderModel(int model);
     int frameGenBackend() const;
     void setFrameGenBackend(int backend);
     int frameGenMultiplier() const;

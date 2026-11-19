@@ -1096,6 +1096,33 @@ bool QmlSettings::neuralRenderSupported() const
     return NeuralRender::compiledIn();
 }
 
+bool QmlSettings::neuralRenderUpscale() const
+{
+    return settings->GetNeuralRenderUpscale();
+}
+
+void QmlSettings::setNeuralRenderUpscale(bool enabled)
+{
+    if (enabled == settings->GetNeuralRenderUpscale())
+        return;
+    settings->SetNeuralRenderUpscale(enabled);
+    emit neuralRenderChanged();
+}
+
+int QmlSettings::neuralRenderModel() const
+{
+    return settings->GetNeuralRenderModel();
+}
+
+void QmlSettings::setNeuralRenderModel(int model)
+{
+    model = model == 1 ? 1 : 0;
+    if (model == settings->GetNeuralRenderModel())
+        return;
+    settings->SetNeuralRenderModel(model);
+    emit neuralRenderChanged();
+}
+
 int QmlSettings::frameGenBackend() const
 {
     return settings->GetFrameGenBackend();

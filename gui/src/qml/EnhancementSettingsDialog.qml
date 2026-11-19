@@ -116,6 +116,48 @@ DialogView {
 
             Label {
                 Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("DLSS NR Upscaling:")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.neuralRenderSupported
+                enabled: Chiaki.settings.neuralRender
+                model: [qsTr("Off (stream resolution)"), qsTr("Up to 2x toward the window (1080p to 4K: DLSS Performance)")]
+                currentIndex: Chiaki.settings.neuralRenderUpscale ? 1 : 0
+                onActivated: index => Chiaki.settings.neuralRenderUpscale = index === 1
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("(Up to 2x)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("DLSS NR Model (NVIDIA):")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.neuralRenderSupported
+                enabled: Chiaki.settings.neuralRender
+                model: [qsTr("CC (as NeuralHub's default)"), qsTr("HT (lighter, about 2 ms at 1080p)")]
+                currentIndex: Chiaki.settings.neuralRenderModel
+                onActivated: index => Chiaki.settings.neuralRenderModel = index
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("(CC)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
                 visible: Chiaki.settings.frameGenSupported
                 text: qsTr("Frame Generation:")
             }

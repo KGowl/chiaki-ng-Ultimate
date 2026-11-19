@@ -350,6 +350,8 @@ private:
     // its D3D12 GPU time in hundredths of a millisecond.
     QAtomicInteger<int> nr_status_state = 0;
     QAtomicInteger<int> nr_status_gpu_cms = 0;
+    QAtomicInteger<int> nr_status_out_h = 0; // output height when neural rendering upscales, else 0
+    QAtomicInteger<int> nr_status_hdr = 0;
     // Stream frames per game picture (2 = 30 fps game in a 60 fps stream,
     // repeats dropped before frame generation); set by presentFrame.
     RepeatCadenceDetector repeat_detector;

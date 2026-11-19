@@ -554,6 +554,12 @@ class Settings : public QObject
 		// DLSS neural rendering (DLSS 5) on the video through the NGX D3D12 bridge, see neuralrender.h.
 		bool GetNeuralRender() const { return settings.value("settings/neural_render", false).toBool(); }
 		void SetNeuralRender(bool enabled) { settings.setValue("settings/neural_render", enabled); }
+		// Upscale after neural rendering toward the window size (1.5x or 2x steps).
+		bool GetNeuralRenderUpscale() const { return settings.value("settings/neural_render_upscale", true).toBool(); }
+		void SetNeuralRenderUpscale(bool enabled) { settings.setValue("settings/neural_render_upscale", enabled); }
+		// NVIDIA feature 18 model: 0 = CC, 1 = HT.
+		int GetNeuralRenderModel() const { return settings.value("settings/neural_render_model", 0).toInt(); }
+		void SetNeuralRenderModel(int model) { settings.setValue("settings/neural_render_model", model); }
 		// AMD RCAS sharpening of the final image: 0 = off, 1-100 = strength in percent
 		int GetRcasStrength() const { return qBound(0, settings.value("settings/rcas_strength", 0).toInt(), 100); }
 		void SetRcasStrength(int strength) { settings.setValue("settings/rcas_strength", qBound(0, strength, 100)); }
