@@ -2,6 +2,7 @@
 #include "qmlsettings.h"
 #include "sessionlog.h"
 #include "rtxvsr.h"
+#include "neuralrender.h"
 #include "framegen.h"
 
 #include <QSet>
@@ -1075,6 +1076,24 @@ bool QmlSettings::rtxVsrExtendedModes() const
 QString QmlSettings::rtxVsrDllVersion() const
 {
     return RtxVsr::dllVersion();
+}
+
+bool QmlSettings::neuralRender() const
+{
+    return settings->GetNeuralRender();
+}
+
+void QmlSettings::setNeuralRender(bool enabled)
+{
+    if (enabled == settings->GetNeuralRender())
+        return;
+    settings->SetNeuralRender(enabled);
+    emit neuralRenderChanged();
+}
+
+bool QmlSettings::neuralRenderSupported() const
+{
+    return NeuralRender::compiledIn();
 }
 
 int QmlSettings::frameGenBackend() const
@@ -2183,6 +2202,7 @@ void QmlSettings::refreshAllKeys()
     emit echoSuppressLevelChanged();
 #endif
     emit rtxVsrQualityChanged();
+    emit neuralRenderChanged();
     emit frameGenBackendChanged();
     emit frameGenMultiplierChanged();
     emit displayTargetContrastChanged();

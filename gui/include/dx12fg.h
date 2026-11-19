@@ -85,6 +85,40 @@ public:
     bool generate(int count, uint64_t wait_value, uint64_t signal_value, bool reset, bool use_motion,
                   float mvec_scale_x, float mvec_scale_y);
 
+    // What the NGX D3D12 runtime offers; init() succeeds with either.
+    bool fgAvailable() const;
+    bool nrAvailable() const;
+
+    // ---- neural rendering (DLSS 5 through NeuralHub) ----
+    // A DLSS Super Resolution feature in DLAA mode (input = output size). NeuralHub serves
+    // it and runs its DLSS 5 neural rendering pass first; NVIDIA's own runtime gives plain
+    // DLAA. It has its own size, textures and shared buffers next to the frame generation
+    // ones and uses the same shared timeline semaphore (lastValue / setLastValue).
+    // nrEnsureSize warms the model up (a few seconds). No GPU work may be pending on its
+    // buffers.
+    bool nrEnsureSize(int w, int h);
+    bool nrSizeMatches(int w, int h) const;
+    void nrInvalidate();
+    // Copies between a w x h RGBA8 Vulkan image (VK_IMAGE_LAYOUT_GENERAL) and the shared
+    // neural rendering input / output buffers.
+    void recordNrInput(VkCommandBuffer cmd, VkImage image);
+    void recordNrOutput(VkCommandBuffer cmd, VkImage image);
+    // Waits (on the GPU) for `wait_value`, runs the feature on the input buffer, writes the
+    // output buffer and signals `signal_value` (always, as generate() does).
+    bool neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset);
+    // Average GPU time of the neural rendering evaluation in milliseconds (0 if unknown).
+    float nrGpuTimeMs() const;
+
+    // One instance per Vulkan device, shared by frame generation and neural rendering
+    // (one D3D12 device and one NGX runtime for both). Created and initialised on first
+    // use; nullptr when init() fails. The log callback of the first caller is used.
+    static std::shared_ptr<Dx12Fg> shared(const VulkanDevice &vk, LogFn log, void *user);
+    // After a crash inside the runtime its state is unknown: the user that saw it calls
+    // markCrashed() and leaks its reference (the instance is never destroyed), and
+    // shared() returns nullptr for that Vulkan device from then on.
+    void markCrashed();
+    bool crashed() const;
+
     // The runtime call in progress, named in the log if the runtime crashes.
     const char *stage() const;
 

@@ -96,6 +96,26 @@ DialogView {
 
             Label {
                 Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("DLSS Neural Rendering:")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.neuralRenderSupported
+                model: [qsTr("Off"), qsTr("DLSS 5 Neural Rendering via D3D12 (AMD: needs NeuralHub's stub)")]
+                currentIndex: Chiaki.settings.neuralRender ? 1 : 0
+                onActivated: index => Chiaki.settings.neuralRender = index === 1
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("(Off)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
                 visible: Chiaki.settings.frameGenSupported
                 text: qsTr("Frame Generation:")
             }

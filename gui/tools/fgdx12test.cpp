@@ -5,10 +5,17 @@
 //
 // Usage: chiaki-fgdx12test [--backend 5] [--frames N] [--mvx N] [--w W --h H]
 //   --backend  FrameGen::Backend value: 1 DLSS (Vulkan), 3 Flow, 5 DLSS through D3D12 (default)
-// For backend 5 on a GPU without NVIDIA's runtime, NeuralHub's dxgi.dll and neuralhub.ini
-// must sit next to the executable.
+//        chiaki-fgdx12test --nr [--image file] [--out file.png] [--with-fg] [--frames N] [--mvx N]
+//   --nr       neural rendering (NeuralRender, DLSS 5 through D3D12) on a moving pattern or on
+//              an image panned by --mvx px per frame; --out saves the last output, --with-fg
+//              also runs DLSS Frame Generation through D3D12 on the output (shared runtime).
+// For backend 5 and --nr on a GPU without NVIDIA's runtime, NeuralHub's dxgi.dll and
+// neuralhub.ini must sit next to the executable.
 
 #include "framegen.h"
+#include "neuralrender.h"
+
+#include <QImage>
 
 #include <libplacebo/gpu.h>
 #include <libplacebo/log.h>
@@ -120,9 +127,14 @@ struct Rig
                 row[4 * x + 3] = 255;
             }
         }
+        uploadRgba(data.data());
+    }
+
+    void uploadRgba(const uint8_t *data)
+    {
         struct pl_tex_transfer_params up = {};
         up.tex = source;
-        up.ptr = data.data();
+        up.ptr = const_cast<uint8_t *>(data);
         up.row_pitch = static_cast<size_t>(w) * 4;
         pl_tex_upload(gpu, &up);
     }
@@ -144,6 +156,17 @@ struct Rig
     // Reads a frame produced by FrameGen back to host memory (red channel, one byte per pixel).
     bool read(const struct pl_frame &frame, std::vector<uint8_t> &red)
     {
+        std::vector<uint8_t> rgba;
+        if (!readRgba(frame, rgba))
+            return false;
+        red.resize(static_cast<size_t>(w) * h);
+        for (size_t i = 0; i < red.size(); i++)
+            red[i] = rgba[4 * i];
+        return true;
+    }
+
+    bool readRgba(const struct pl_frame &frame, std::vector<uint8_t> &rgba)
+    {
         struct pl_frame target = {};
         target.num_planes = 1;
         target.planes[0].texture = readback;
@@ -157,17 +180,12 @@ struct Rig
         params.dither_params = nullptr;
         if (!pl_render_image(renderer, &frame, &target, &params))
             return false;
-        std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
+        rgba.resize(static_cast<size_t>(w) * h * 4);
         struct pl_tex_transfer_params dn = {};
         dn.tex = readback;
         dn.ptr = rgba.data();
         dn.row_pitch = static_cast<size_t>(w) * 4;
-        if (!pl_tex_download(gpu, &dn))
-            return false;
-        red.resize(static_cast<size_t>(w) * h);
-        for (size_t i = 0; i < red.size(); i++)
-            red[i] = rgba[4 * i];
-        return true;
+        return pl_tex_download(gpu, &dn);
     }
 
     void destroy()
@@ -220,12 +238,139 @@ struct Phase
     int w, h, multiplier, frames, cleanup;
 };
 
+// Neural rendering on a moving pattern or a panned image: every output must be a real
+// picture close to its input (not black, not the previous frame), and the runtime must keep
+// working when frame generation through D3D12 shares it.
+int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &out_path, int frames, int mvx, int w,
+                    int h, bool with_fg)
+{
+    std::vector<uint8_t> base;
+    if (!image_path.empty()) {
+        QImage img(QString::fromStdString(image_path));
+        if (img.isNull()) {
+            std::printf("VERDICT: could not read %s\n", image_path.c_str());
+            return 4;
+        }
+        img = img.convertToFormat(QImage::Format_RGBA8888);
+        w = img.width();
+        h = img.height();
+        base.resize(static_cast<size_t>(w) * h * 4);
+        for (int y = 0; y < h; y++)
+            std::memcpy(base.data() + static_cast<size_t>(y) * w * 4, img.constScanLine(y), static_cast<size_t>(w) * 4);
+    }
+    std::printf("neural rendering test: %dx%d %s, %d frames, %d px/frame pan%s\n", w, h,
+                base.empty() ? "pattern" : image_path.c_str(), frames, mvx, with_fg ? ", with DLSS FG D3D12" : "");
+    if (!rig.resize(w, h)) {
+        std::printf("VERDICT: textures\n");
+        return 3;
+    }
+    NeuralRender nr(rig.log);
+    QElapsedTimer timer;
+    timer.start();
+    if (!nr.ensureInitialized(rig.vk)) {
+        std::printf("VERDICT: neural rendering unavailable (see the log above)\n");
+        return 5;
+    }
+    std::printf("bridge ready in %.0f ms\n", timer.nsecsElapsed() / 1e6);
+    FrameGen fg(rig.log);
+    if (with_fg && !fg.ensureInitialized(rig.vk, FrameGen::Backend::Dlss12)) {
+        std::printf("VERDICT: DLSS FG D3D12 could not start next to neural rendering\n");
+        nr.destroy();
+        return 6;
+    }
+
+    int failures = 0, good = 0;
+    double sum_ms = 0.0;
+    int timed = 0;
+    std::vector<uint8_t> input(static_cast<size_t>(w) * h * 4), output;
+    for (int k = 0; k < frames; k++) {
+        const int shift = mvx * k;
+        if (base.empty()) {
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    uint8_t *p = input.data() + (static_cast<size_t>(y) * w + x) * 4;
+                    p[0] = p[1] = p[2] = pattern(x, y, shift);
+                    p[3] = 255;
+                }
+            }
+        } else {
+            const int s = ((shift % w) + w) % w;
+            for (int y = 0; y < h; y++) {
+                const uint8_t *src_row = base.data() + static_cast<size_t>(y) * w * 4;
+                uint8_t *dst_row = input.data() + static_cast<size_t>(y) * w * 4;
+                std::memcpy(dst_row, src_row + static_cast<size_t>(s) * 4, static_cast<size_t>(w - s) * 4);
+                std::memcpy(dst_row + static_cast<size_t>(w - s) * 4, src_row, static_cast<size_t>(s) * 4);
+            }
+        }
+        rig.uploadRgba(input.data());
+        struct pl_frame src = rig.sourceFrame();
+        struct pl_frame out = {};
+        uint64_t signature = 0;
+        timer.restart();
+        const bool ok = nr.process(&src, static_cast<uint64_t>(k + 1), &out, &signature);
+        const double ms = timer.nsecsElapsed() / 1e6;
+        if (!ok) {
+            std::printf("frame %2d: process() failed (%.1f ms)\n", k, ms);
+            failures++;
+            continue;
+        }
+        if (!rig.readRgba(out, output)) {
+            std::printf("frame %2d: reading the output failed\n", k);
+            failures++;
+            continue;
+        }
+        if (k >= 2) {
+            sum_ms += ms;
+            timed++;
+        }
+        double diff = 0.0, mean = 0.0;
+        for (size_t i = 0; i < output.size(); i += 4) {
+            for (int c = 0; c < 3; c++) {
+                diff += std::fabs(static_cast<double>(output[i + c]) - static_cast<double>(input[i + c]));
+                mean += output[i + c];
+            }
+        }
+        const double n = static_cast<double>(output.size() / 4) * 3.0;
+        diff /= n;
+        mean /= n;
+        const bool frame_good = mean > 5.0 && diff < 40.0;
+        std::string fg_note;
+        if (with_fg) {
+            std::vector<struct pl_frame> fg_out;
+            const bool fg_ok = fg.process(&out, w, h, 2, 16.7f, fg_out);
+            fg_note = fg_ok ? " | FG " + std::to_string(fg_out.size()) + " frame(s)" : " | FG failed";
+            if (!fg_ok && k > 0)
+                failures++;
+        }
+        std::printf("frame %2d: process %.1f ms, NR GPU %.2f ms, mean diff to input %.2f, output mean %.1f%s %s\n", k, ms,
+                    nr.gpuTimeMs(), diff, mean, fg_note.c_str(), frame_good ? "OK" : "BAD");
+        if (frame_good)
+            good++;
+        else
+            failures++;
+    }
+    if (!out_path.empty() && !output.empty()) {
+        QImage saved(output.data(), w, h, w * 4, QImage::Format_RGBA8888);
+        std::printf("%s %s\n", saved.copy().save(QString::fromStdString(out_path)) ? "saved" : "could not save",
+                    out_path.c_str());
+    }
+    if (timed)
+        std::printf("-- %d of %d frames good, average process() %.2f ms, NR GPU time %.2f ms\n", good, frames,
+                    sum_ms / timed, nr.gpuTimeMs());
+    fg.destroy();
+    nr.destroy();
+    std::printf("\nVERDICT: %s\n", failures == 0 ? "NEURAL RENDERING PASSED" : "NEURAL RENDERING FAILED, see above");
+    return failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
     int backend_value = 5, frames = 20, mvx = 8, w = 1920, h = 1080;
+    bool nr_mode = false, with_fg = false;
+    std::string image_path, out_path;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--backend" && i + 1 < argc) backend_value = std::atoi(argv[++i]);
@@ -233,6 +378,25 @@ int main(int argc, char **argv)
         else if (a == "--mvx" && i + 1 < argc) mvx = std::atoi(argv[++i]);
         else if (a == "--w" && i + 1 < argc) w = std::atoi(argv[++i]);
         else if (a == "--h" && i + 1 < argc) h = std::atoi(argv[++i]);
+        else if (a == "--nr") nr_mode = true;
+        else if (a == "--with-fg") with_fg = true;
+        else if (a == "--image" && i + 1 < argc) image_path = argv[++i];
+        else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+    }
+    if (nr_mode) {
+        if (!NeuralRender::compiledIn()) {
+            std::printf("VERDICT: neural rendering not compiled in\n");
+            return 2;
+        }
+        Rig rig;
+        if (!rig.init()) {
+            std::printf("VERDICT: could not create the libplacebo Vulkan device\n");
+            rig.destroy();
+            return 3;
+        }
+        const int result = runNeuralRender(rig, image_path, out_path, frames, mvx, w, h, with_fg);
+        rig.destroy();
+        return result;
     }
     const auto backend = static_cast<FrameGen::Backend>(backend_value);
     std::printf("chiaki-fgdx12test: backend %s, %d frames, %d px/frame motion\n", FrameGen::backendName(backend), frames, mvx);

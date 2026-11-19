@@ -58,6 +58,8 @@ set(SOURCE_FILES
 	src/ngxcore.cpp
 	include/rtxvsr.h
 	src/rtxvsr.cpp
+	include/neuralrender.h
+	src/neuralrender.cpp
 	include/framegen.h
 	src/framegen.cpp
 	include/flowfg.h
@@ -143,17 +145,18 @@ if(CHIAKI_ENABLE_NGX)
 	# DLSS Frame Generation through NGX D3D12 (AMD GPUs with NeuralHub's NGX stub), see dx12fg.h.
 	target_sources(chiaki PRIVATE include/dx12fg.h src/dx12fg.cpp)
 	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG)
-	# Console test of the frame generation backends on synthetic frames (tools/fgdx12test.cpp).
-	# Not built by default: --target chiaki-fgdx12test.
+	# Console test of the frame generation backends and of neural rendering on synthetic frames
+	# (tools/fgdx12test.cpp). Not built by default: --target chiaki-fgdx12test.
 	add_executable(chiaki-fgdx12test EXCLUDE_FROM_ALL tools/fgdx12test.cpp
-		src/framegen.cpp src/flowfg.cpp src/fgfixup.cpp src/vfg.cpp src/vkguard.c src/ngxcore.cpp src/rtxvsr.cpp src/dx12fg.cpp)
+		src/framegen.cpp src/flowfg.cpp src/fgfixup.cpp src/vfg.cpp src/vkguard.c src/ngxcore.cpp src/rtxvsr.cpp src/dx12fg.cpp
+		src/neuralrender.cpp)
 	# The same include directories as the application (Vulkan and libplacebo headers come from there).
 	target_include_directories(chiaki-fgdx12test PRIVATE include "${CHIAKI_NGX_SDK_DIR}/include"
 		$<TARGET_PROPERTY:chiaki,INCLUDE_DIRECTORIES>)
 	target_compile_definitions(chiaki-fgdx12test PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG)
 	target_link_libraries(chiaki-fgdx12test PkgConfig::LIBPLACEBO Qt::Core Qt::Gui "${CHIAKI_NGX_LIB}"
 		advapi32 user32 setupapi version shell32 ole32 avrt winmm)
-	message(STATUS "NVIDIA NGX enabled: RTX Video Super Resolution, DLSS Frame Generation (${CHIAKI_NGX_LIB})")
+	message(STATUS "NVIDIA NGX enabled: RTX Video Super Resolution, DLSS Frame Generation, DLSS neural rendering through D3D12 (${CHIAKI_NGX_LIB})")
 endif()
 
 if(CHIAKI_ENABLE_FFX)

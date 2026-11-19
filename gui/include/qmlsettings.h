@@ -106,6 +106,8 @@ class QmlSettings : public QObject
 	Q_PROPERTY(bool rtxVsrSupported READ rtxVsrSupported CONSTANT)
 	Q_PROPERTY(bool rtxVsrExtendedModes READ rtxVsrExtendedModes CONSTANT)
 	Q_PROPERTY(QString rtxVsrDllVersion READ rtxVsrDllVersion CONSTANT)
+	Q_PROPERTY(bool neuralRender READ neuralRender WRITE setNeuralRender NOTIFY neuralRenderChanged)
+	Q_PROPERTY(bool neuralRenderSupported READ neuralRenderSupported CONSTANT)
 	Q_PROPERTY(int frameGenBackend READ frameGenBackend WRITE setFrameGenBackend NOTIFY frameGenBackendChanged)
 	Q_PROPERTY(int frameGenMultiplier READ frameGenMultiplier WRITE setFrameGenMultiplier NOTIFY frameGenMultiplierChanged)
 	Q_PROPERTY(bool frameGenSupported READ frameGenSupported CONSTANT)
@@ -380,6 +382,9 @@ public:
     bool rtxVsrSupported() const;
     bool rtxVsrExtendedModes() const;
     QString rtxVsrDllVersion() const;
+    bool neuralRender() const;
+    void setNeuralRender(bool enabled);
+    bool neuralRenderSupported() const;
     int frameGenBackend() const;
     void setFrameGenBackend(int backend);
     int frameGenMultiplier() const;
@@ -776,6 +781,7 @@ signals:
     void placeboFrameMixerChanged();
     void directFrameMappingChanged();
     void rtxVsrQualityChanged();
+    void neuralRenderChanged();
     void frameGenBackendChanged();
     void frameGenMultiplierChanged();
     void placeboDeinterlaceEnabledChanged();

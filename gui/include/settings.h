@@ -539,17 +539,21 @@ class Settings : public QObject
 		}
 		static int ValidRtxVsrQuality(int q) { return ((q >= 1 && q <= 4) || (q >= 8 && q <= 11) || q == 21 || q == 23) ? q : 0; }
 		// Frame generation backend: 0 = off, 1 = DLSS Frame Generation, 2 = FSR 3.1 Frame Generation,
-		// 3 = Flow (chiaki-ng's own, any GPU / OS), 4 = NVIDIA VFG (Windows)
+		// 3 = Flow (chiaki-ng's own, any GPU / OS), 4 = NVIDIA VFG (Windows), 5 = DLSS Frame Generation
+		// through NGX D3D12 (FrameGen::Backend::Dlss12)
 		int GetFrameGenBackend() const { return qBound(0, settings.value("settings/frame_gen_backend", 0).toInt(), 5); }
 		void SetFrameGenBackend(int backend)
 		{
-			backend = qBound(0, backend, 4);
+			backend = qBound(0, backend, 5);
 			settings.setValue("settings/frame_gen_backend", backend);
 			if (backend)
 				settings.setValue("settings/frame_gen_last_backend", backend);
 		}
 		// Backend restored when frame generation is switched back on from the stream menu (0 = never chosen).
-		int GetFrameGenLastBackend() const { return qBound(0, settings.value("settings/frame_gen_last_backend", 0).toInt(), 4); }
+		int GetFrameGenLastBackend() const { return qBound(0, settings.value("settings/frame_gen_last_backend", 0).toInt(), 5); }
+		// DLSS neural rendering (DLSS 5) on the video through the NGX D3D12 bridge, see neuralrender.h.
+		bool GetNeuralRender() const { return settings.value("settings/neural_render", false).toBool(); }
+		void SetNeuralRender(bool enabled) { settings.setValue("settings/neural_render", enabled); }
 		// AMD RCAS sharpening of the final image: 0 = off, 1-100 = strength in percent
 		int GetRcasStrength() const { return qBound(0, settings.value("settings/rcas_strength", 0).toInt(), 100); }
 		void SetRcasStrength(int strength) { settings.setValue("settings/rcas_strength", qBound(0, strength, 100)); }

@@ -46,6 +46,7 @@ class QOffscreenSurface;
 class QOpenGLContext;
 class QOpenGLFramebufferObject;
 class RtxVsr;
+class NeuralRender;
 class FrameGen;
 class QWidget;
 class QLabel;
@@ -345,6 +346,10 @@ private:
     QAtomicInteger<int> fg_status_backend = 0;
     QAtomicInteger<int> fg_status_multiplier = 0;
     QAtomicInteger<int> fg_status_reason = 0;
+    // DLSS neural rendering: 0 off, 1 active, 2 idle (HDR, warming up, ...), 3 unavailable;
+    // its D3D12 GPU time in hundredths of a millisecond.
+    QAtomicInteger<int> nr_status_state = 0;
+    QAtomicInteger<int> nr_status_gpu_cms = 0;
     // Stream frames per game picture (2 = 30 fps game in a 60 fps stream,
     // repeats dropped before frame generation); set by presentFrame.
     RepeatCadenceDetector repeat_detector;
@@ -387,6 +392,8 @@ private:
     pl_renderer placebo_renderer = {};
     RtxVsr *rtx_vsr = nullptr;
     bool rtx_vsr_active = false;
+    NeuralRender *neural_render = nullptr;
+    bool neural_render_active = false;
     FrameGen *frame_gen = nullptr;
     // Frames still to be presented for the last stream frame: generated ones first, the real one last.
     std::vector<struct pl_frame> fg_pending_frames;

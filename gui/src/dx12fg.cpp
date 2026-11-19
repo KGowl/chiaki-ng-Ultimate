@@ -10,6 +10,7 @@
 #include <vulkan/vulkan_win32.h>
 
 #include "nvsdk_ngx.h"
+#include "nvsdk_ngx_helpers.h"
 #include "nvsdk_ngx_helpers_dlssg_d3d.h"
 
 #include <algorithm>
@@ -18,7 +19,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -151,6 +154,8 @@ struct Dx12Fg::Impl
 
     // ---- NGX ----
     bool ngx_up = false;
+    bool fg_available = false;
+    bool sr_available = false;
     NVSDK_NGX_Parameter *params = nullptr;
     NVSDK_NGX_Handle *handle = nullptr;
     int max_generated = 1;
@@ -181,12 +186,36 @@ struct Dx12Fg::Impl
     std::array<Shared, kMaxOutputs> out_bufs;
     bool sized = false;
 
+    // ---- neural rendering: DLSS Super Resolution in DLAA mode, own size ----
+    NVSDK_NGX_Parameter *nr_params = nullptr;
+    NVSDK_NGX_Handle *nr_handle = nullptr;
+    int nr_width = 0;
+    int nr_height = 0;
+    Tex nr_in, nr_out, nr_depth, nr_motion;
+    Shared nr_in_buf, nr_out_buf;
+    bool nr_sized = false;
+    // GPU time of the evaluation: two timestamps resolved into a readback buffer, read
+    // once the command list that wrote them has finished.
+    ComPtr<ID3D12QueryHeap> nr_queries;
+    ComPtr<ID3D12Resource> nr_query_readback;
+    UINT64 timestamp_frequency = 0;
+    uint64_t nr_query_done = 0;
+    double nr_gpu_ms = 0.0;
+    // The runtime crashed while one of the users called it; never handed out again.
+    bool crashed = false;
+
     bool loadVulkan();
+    bool signalShared(uint64_t value);
     bool createDevice();
     bool createSwapchain();
     bool initNgx();
     bool createSharedFence();
-    bool makeTex(Tex &t, DXGI_FORMAT format, UINT bytes_per_texel);
+    bool makeTex(Tex &t, int w, int h, DXGI_FORMAT format, UINT bytes_per_texel);
+    bool fill(const std::vector<Tex *> &zero, Tex *half);
+    bool nrCreateFeature();
+    bool nrEvaluate(bool reset, int log_level = 1);
+    bool nrWarmUp();
+    void destroyNr();
     bool makeShared(Shared &s, UINT64 size);
     void freeShared(Shared &s);
     bool waitIdle();
@@ -425,17 +454,17 @@ bool Dx12Fg::Impl::initNgx()
         log(1, "NGX D3D12 capability query failed: %s", ngxResultString(r));
         return false;
     }
-    unsigned int available = 0;
-    if (NVSDK_NGX_FAILED(NVSDK_NGX_Parameter_GetUI(caps, NVSDK_NGX_Parameter_FrameGeneration_Available, &available))) {
-        int available_i = 0;
-        NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_FrameGeneration_Available, &available_i);
-        available = available_i > 0 ? 1 : 0;
-    }
-    if (!available) {
-        log(1, "DLSS Frame Generation is not available through NGX D3D12 on this GPU");
-        NVSDK_NGX_D3D12_DestroyParameters(caps);
-        return false;
-    }
+    auto capability = [caps](const char *name) {
+        unsigned int value = 0;
+        if (NVSDK_NGX_FAILED(NVSDK_NGX_Parameter_GetUI(caps, name, &value))) {
+            int value_i = 0;
+            NVSDK_NGX_Parameter_GetI(caps, name, &value_i);
+            value = value_i > 0 ? 1 : 0;
+        }
+        return value != 0;
+    };
+    fg_available = capability(NVSDK_NGX_Parameter_FrameGeneration_Available);
+    sr_available = capability(NVSDK_NGX_Parameter_SuperSampling_Available);
     unsigned int multi_frame_max = 0;
     if (NVSDK_NGX_SUCCEED(NVSDK_NGX_Parameter_GetUI(caps, NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &multi_frame_max))
         && multi_frame_max > 0)
@@ -443,11 +472,18 @@ bool Dx12Fg::Impl::initNgx()
     NVSDK_NGX_D3D12_DestroyParameters(caps);
     stage = "NVSDK_NGX_D3D12_AllocateParameters";
     r = NVSDK_NGX_D3D12_AllocateParameters(&params);
-    if (NVSDK_NGX_FAILED(r) || !params) {
-        params = nullptr;
+    if (NVSDK_NGX_SUCCEED(r) && params)
+        r = NVSDK_NGX_D3D12_AllocateParameters(&nr_params);
+    if (NVSDK_NGX_FAILED(r) || !params || !nr_params) {
+        log(1, "NGX D3D12 parameter allocation failed: %s", ngxResultString(r));
         return false;
     }
-    log(0, "DLSS Frame Generation (D3D12) available, up to %d generated frames", max_generated);
+    if (fg_available)
+        log(0, "DLSS Frame Generation (D3D12) available, up to %d generated frames", max_generated);
+    else
+        log(1, "DLSS Frame Generation is not available through NGX D3D12 on this GPU");
+    log(sr_available ? 0 : 1, "DLSS Super Resolution (D3D12, used for neural rendering) %s",
+        sr_available ? "available" : "is not available");
     return true;
 }
 
@@ -486,7 +522,7 @@ bool Dx12Fg::Impl::createSharedFence()
     return ok;
 }
 
-bool Dx12Fg::Impl::makeTex(Tex &t, DXGI_FORMAT format, UINT bytes_per_texel)
+bool Dx12Fg::Impl::makeTex(Tex &t, int w, int h, DXGI_FORMAT format, UINT bytes_per_texel)
 {
     t.format = format;
     t.bytes_per_texel = bytes_per_texel;
@@ -494,8 +530,8 @@ bool Dx12Fg::Impl::makeTex(Tex &t, DXGI_FORMAT format, UINT bytes_per_texel)
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = static_cast<UINT64>(width);
-    rd.Height = static_cast<UINT>(height);
+    rd.Width = static_cast<UINT64>(w);
+    rd.Height = static_cast<UINT>(h);
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
     rd.Format = format;
@@ -505,7 +541,7 @@ bool Dx12Fg::Impl::makeTex(Tex &t, DXGI_FORMAT format, UINT bytes_per_texel)
     HRESULT hr = device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                  IID_PPV_ARGS(&t.res));
     if (FAILED(hr)) {
-        log(1, "could not create a %dx%d D3D12 texture (0x%08x)", width, height, static_cast<unsigned>(hr));
+        log(1, "could not create a %dx%d D3D12 texture (0x%08x)", w, h, static_cast<unsigned>(hr));
         return false;
     }
     t.state = D3D12_RESOURCE_STATE_COMMON;
@@ -774,13 +810,13 @@ bool Dx12Fg::Impl::evaluate(int count, bool reset, float msx, float msy, int log
     return true;
 }
 
-// The runtime builds its pipelines in the first two evaluations (about 0.2 s of CPU
-// each): do it here, on dummy data, instead of during the stream.
-bool Dx12Fg::Impl::warmUp()
+// Uploads zeros into `zero` and a constant 0.5 into the R32_FLOAT texture `half`
+// (a constant mid-range depth keeps disocclusion logic neutral), and waits for it.
+bool Dx12Fg::Impl::fill(const std::vector<Tex *> &zero, Tex *half)
 {
-    // Dummy content: zeroed colour and motion, constant depth. An upload buffer big
-    // enough for every texture's footprint, filled with zeros, and one for the depth.
-    const UINT64 size = std::max({ color.total, motion.total, depth.total });
+    UINT64 size = half ? half->total : 0;
+    for (Tex *t : zero)
+        size = std::max(size, t->total);
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC rd = {};
@@ -792,39 +828,52 @@ bool Dx12Fg::Impl::warmUp()
     rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> upload_zero;
-    ComPtr<ID3D12Resource> upload_depth;
+    ComPtr<ID3D12Resource> upload_half;
     if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(&upload_zero))) ||
-        FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(&upload_depth))))
+                                               IID_PPV_ARGS(&upload_zero))))
         return false;
     void *p = nullptr;
     if (FAILED(upload_zero->Map(0, nullptr, &p)))
         return false;
     std::memset(p, 0, static_cast<size_t>(size));
     upload_zero->Unmap(0, nullptr);
-    if (FAILED(upload_depth->Map(0, nullptr, &p)))
-        return false;
-    for (int y = 0; y < height; y++) {
-        float *row = reinterpret_cast<float *>(static_cast<uint8_t *>(p) + static_cast<size_t>(y) * depth.footprint.Footprint.RowPitch);
-        for (int x = 0; x < width; x++)
-            row[x] = 0.5f; // a constant mid-range value keeps disocclusion logic neutral
+    if (half) {
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   nullptr, IID_PPV_ARGS(&upload_half))) ||
+            FAILED(upload_half->Map(0, nullptr, &p)))
+            return false;
+        const auto &fp = half->footprint.Footprint;
+        for (UINT y = 0; y < fp.Height; y++) {
+            float *row = reinterpret_cast<float *>(static_cast<uint8_t *>(p) + static_cast<size_t>(y) * fp.RowPitch);
+            for (UINT x = 0; x < fp.Width; x++)
+                row[x] = 0.5f;
+        }
+        upload_half->Unmap(0, nullptr);
     }
-    upload_depth->Unmap(0, nullptr);
-
     Slot *slot = nullptr;
     if (!beginList(&slot))
         return false;
-    copyBufferToTex(color, upload_zero.Get());
-    copyBufferToTex(motion, upload_zero.Get());
-    copyBufferToTex(depth, upload_depth.Get());
+    for (Tex *t : zero)
+        copyBufferToTex(*t, upload_zero.Get());
+    if (half)
+        copyBufferToTex(*half, upload_half.Get());
+    return endList(*slot) && waitIdle();
+}
+
+// The runtime builds its pipelines in the first two evaluations (about 0.2 s of CPU
+// each): do it here, on dummy data, instead of during the stream.
+bool Dx12Fg::Impl::warmUp()
+{
+    // Dummy content: zeroed colour and motion, constant depth.
+    std::vector<Tex *> zero = { &color, &motion };
     for (auto &out : outs) {
         if (out.res)
-            copyBufferToTex(out, upload_zero.Get());
+            zero.push_back(&out);
     }
-    if (!endList(*slot) || !waitIdle())
+    if (!fill(zero, &depth))
         return false;
 
+    Slot *slot = nullptr;
     for (int i = 0; i < 2; i++) {
         constexpr int kAttempts = 4;
         bool done = false;
@@ -877,6 +926,126 @@ void Dx12Fg::Impl::destroySized()
     sized = false;
 }
 
+// ---- neural rendering ----
+// DLSS 5 Neural Rendering is not called directly (NGX feature 18 is not answered by
+// NeuralHub, and NVIDIA's driver only gives it to approved applications): this creates a
+// DLSS Super Resolution feature in DLAA mode (input size = output size), which NeuralHub
+// serves with its upscaling provider and runs its neural rendering pass in front of, the
+// same route as the DLSS 5 video players. Video has no depth and no motion vectors: the
+// depth is a constant 0.5 and the motion vectors are zero.
+
+bool Dx12Fg::Impl::nrCreateFeature()
+{
+    NVSDK_NGX_DLSS_Create_Params cp = {};
+    cp.Feature.InWidth = static_cast<unsigned int>(nr_width);
+    cp.Feature.InHeight = static_cast<unsigned int>(nr_height);
+    cp.Feature.InTargetWidth = cp.Feature.InWidth;
+    cp.Feature.InTargetHeight = cp.Feature.InHeight;
+    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    Slot *slot = nullptr;
+    if (!beginList(&slot))
+        return false;
+    stage = "NGX_D3D12_CREATE_DLSS_EXT";
+    const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(list.Get(), 1, 1, &nr_handle, nr_params, &cp);
+    const bool executed = endList(*slot) && waitIdle();
+    if (NVSDK_NGX_FAILED(r) || !nr_handle) {
+        log(1, "creating DLSS Super Resolution (D3D12, neural rendering) failed: %s (0x%08x)", ngxResultString(r),
+            static_cast<unsigned>(r));
+        nr_handle = nullptr;
+        return false;
+    }
+    return executed;
+}
+
+bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
+{
+    const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier(nr_in, srv);
+    barrier(nr_depth, srv);
+    barrier(nr_motion, srv);
+    barrier(nr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+    ep.Feature.pInColor = nr_in.res.Get();
+    ep.Feature.pInOutput = nr_out.res.Get();
+    ep.pInDepth = nr_depth.res.Get();
+    ep.pInMotionVectors = nr_motion.res.Get();
+    ep.InJitterOffsetX = 0.0f;
+    ep.InJitterOffsetY = 0.0f;
+    ep.InRenderSubrectDimensions = { static_cast<unsigned int>(nr_width), static_cast<unsigned int>(nr_height) };
+    ep.InReset = reset ? 1 : 0;
+    ep.InMVScaleX = 1.0f;
+    ep.InMVScaleY = 1.0f;
+    ep.InPreExposure = 1.0f;
+    ep.InExposureScale = 1.0f;
+    ep.InFrameTimeDeltaInMsec = 16.7f;
+    stage = "NGX_D3D12_EVALUATE_DLSS_EXT";
+    const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(list.Get(), nr_handle, nr_params, &ep);
+    if (NVSDK_NGX_FAILED(r)) {
+        log(log_level, "evaluating DLSS Super Resolution (D3D12, neural rendering) failed: %s (0x%08x)",
+            ngxResultString(r), static_cast<unsigned>(r));
+        return false;
+    }
+    return true;
+}
+
+// The first evaluations build the model's pipelines (1-5 s with NeuralHub): done here, on
+// a black frame, instead of during the stream.
+bool Dx12Fg::Impl::nrWarmUp()
+{
+    if (!fill({ &nr_in, &nr_motion, &nr_out }, &nr_depth))
+        return false;
+    for (int i = 0; i < 2; i++) {
+        constexpr int kAttempts = 4;
+        bool done = false;
+        for (int attempt = 0; attempt < kAttempts && !done; attempt++) {
+            if (attempt > 0) {
+                log(0, "the NGX runtime is not open yet, presenting a new swapchain (attempt %d of %d)", attempt + 1,
+                    kAttempts);
+                Sleep(100u * static_cast<unsigned>(attempt));
+                if (!createSwapchain())
+                    return false;
+            }
+            const D3D12_RESOURCE_STATES saved[] = { nr_in.state, nr_depth.state, nr_motion.state, nr_out.state };
+            Slot *slot = nullptr;
+            if (!beginList(&slot))
+                return false;
+            if (!nrEvaluate(true, attempt + 1 < kAttempts ? 0 : 1)) {
+                list->Close();
+                nr_in.state = saved[0];
+                nr_depth.state = saved[1];
+                nr_motion.state = saved[2];
+                nr_out.state = saved[3];
+                continue;
+            }
+            if (!endList(*slot) || !waitIdle())
+                return false;
+            done = true;
+        }
+        if (!done)
+            return false;
+    }
+    return true;
+}
+
+void Dx12Fg::Impl::destroyNr()
+{
+    if (queue)
+        waitIdle();
+    if (nr_handle)
+        NVSDK_NGX_D3D12_ReleaseFeature(nr_handle);
+    nr_handle = nullptr;
+    freeShared(nr_in_buf);
+    freeShared(nr_out_buf);
+    nr_in = Tex();
+    nr_out = Tex();
+    nr_depth = Tex();
+    nr_motion = Tex();
+    nr_width = nr_height = 0;
+    nr_sized = false;
+    nr_query_done = 0;
+}
+
 Dx12Fg::Dx12Fg(const VulkanDevice &vk, LogFn log, void *user)
     : impl(std::make_unique<Impl>())
 {
@@ -889,10 +1058,13 @@ Dx12Fg::~Dx12Fg()
 {
     Impl &d = *impl;
     d.destroySized();
+    d.destroyNr();
     if (d.semaphore)
         d.vkDestroySemaphore(d.vk.device, d.semaphore, nullptr);
     if (d.params)
         NVSDK_NGX_D3D12_DestroyParameters(d.params);
+    if (d.nr_params)
+        NVSDK_NGX_D3D12_DestroyParameters(d.nr_params);
     if (d.ngx_up && d.device)
         NVSDK_NGX_D3D12_Shutdown1(d.device.Get());
     d.swapchain.Reset();
@@ -942,13 +1114,17 @@ bool Dx12Fg::ensureSize(int w, int h)
     if (sizeMatches(w, h))
         return true;
     d.destroySized();
+    if (!d.fg_available) {
+        d.log(1, "DLSS Frame Generation is not available through NGX D3D12 on this GPU");
+        return false;
+    }
     d.width = w;
     d.height = h;
     d.stage = "textures";
-    bool ok = d.makeTex(d.color, DXGI_FORMAT_R8G8B8A8_UNORM, 4) && d.makeTex(d.motion, DXGI_FORMAT_R16G16_FLOAT, 4) &&
-              d.makeTex(d.depth, DXGI_FORMAT_R32_FLOAT, 4);
+    bool ok = d.makeTex(d.color, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) &&
+              d.makeTex(d.motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4) && d.makeTex(d.depth, w, h, DXGI_FORMAT_R32_FLOAT, 4);
     for (int i = 0; ok && i < d.max_generated; i++)
-        ok = d.makeTex(d.outs[static_cast<size_t>(i)], DXGI_FORMAT_R8G8B8A8_UNORM, 4);
+        ok = d.makeTex(d.outs[static_cast<size_t>(i)], w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4);
     d.stage = "shared buffers";
     ok = ok && d.makeShared(d.color_buf, d.color.total) && d.makeShared(d.motion_buf, d.motion.total);
     for (int i = 0; ok && i < d.max_generated; i++)
@@ -1063,19 +1239,219 @@ bool Dx12Fg::generate(int count, uint64_t wait_value, uint64_t signal_value, boo
                 d.outs[i].state = saved_outs[i];
         }
     }
-    // Always signalled, so the Vulkan work waiting for it cannot hang.
-    d.stage = "queue signal";
-    const bool signalled = SUCCEEDED(d.queue->Signal(d.shared_fence.Get(), signal_value));
-    if (!signalled) {
-        // The device is probably lost; let the Vulkan side go on from the host.
-        VkSemaphoreSignalInfo signal_info = {};
-        signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
-        signal_info.semaphore = d.semaphore;
-        signal_info.value = signal_value;
-        d.vkSignalSemaphore(d.vk.device, &signal_info);
-        d.log(1, "the D3D12 queue could not signal the shared fence");
+    return d.signalShared(signal_value) && ok;
+}
+
+// Always signalled, so the Vulkan work waiting for it cannot hang.
+bool Dx12Fg::Impl::signalShared(uint64_t value)
+{
+    stage = "queue signal";
+    if (SUCCEEDED(queue->Signal(shared_fence.Get(), value)))
+        return true;
+    // The device is probably lost; let the Vulkan side go on from the host.
+    VkSemaphoreSignalInfo signal_info = {};
+    signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+    signal_info.semaphore = semaphore;
+    signal_info.value = value;
+    vkSignalSemaphore(vk.device, &signal_info);
+    log(1, "the D3D12 queue could not signal the shared fence");
+    return false;
+}
+
+bool Dx12Fg::fgAvailable() const
+{
+    return impl->fg_available;
+}
+
+bool Dx12Fg::nrAvailable() const
+{
+    return impl->sr_available;
+}
+
+bool Dx12Fg::nrSizeMatches(int w, int h) const
+{
+    return impl->nr_sized && impl->nr_width == w && impl->nr_height == h;
+}
+
+void Dx12Fg::nrInvalidate()
+{
+    impl->destroyNr();
+}
+
+bool Dx12Fg::nrEnsureSize(int w, int h)
+{
+    Impl &d = *impl;
+    if (nrSizeMatches(w, h))
+        return true;
+    d.destroyNr();
+    if (!d.sr_available) {
+        d.log(1, "DLSS Super Resolution is not available through NGX D3D12 on this GPU, no neural rendering");
+        return false;
     }
-    return ok && signalled;
+    d.nr_width = w;
+    d.nr_height = h;
+    d.stage = "neural rendering textures";
+    bool ok = d.makeTex(d.nr_in, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) &&
+              d.makeTex(d.nr_out, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) &&
+              d.makeTex(d.nr_depth, w, h, DXGI_FORMAT_R32_FLOAT, 4) &&
+              d.makeTex(d.nr_motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4);
+    d.stage = "neural rendering shared buffers";
+    ok = ok && d.makeShared(d.nr_in_buf, d.nr_in.total) && d.makeShared(d.nr_out_buf, d.nr_out.total);
+    if (!ok || !d.nrCreateFeature()) {
+        d.destroyNr();
+        return false;
+    }
+    d.log(0, "warming up neural rendering (the first evaluations build the model, a few seconds)");
+    if (!d.nrWarmUp()) {
+        d.log(1, "the neural rendering warm-up evaluations failed");
+        d.destroyNr();
+        return false;
+    }
+    // Timing is optional.
+    if (!d.nr_queries && SUCCEEDED(d.queue->GetTimestampFrequency(&d.timestamp_frequency))) {
+        D3D12_QUERY_HEAP_DESC qd = {};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qd.Count = 2;
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 2 * sizeof(UINT64);
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(d.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&d.nr_queries))) ||
+            FAILED(d.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                     nullptr, IID_PPV_ARGS(&d.nr_query_readback)))) {
+            d.nr_queries.Reset();
+            d.nr_query_readback.Reset();
+        }
+    }
+    d.nr_query_done = 0;
+    d.nr_gpu_ms = 0.0;
+    d.nr_sized = true;
+    d.log(0, "neural rendering (DLSS Super Resolution DLAA, D3D12) ready: %dx%d", w, h);
+    return true;
+}
+
+float Dx12Fg::nrGpuTimeMs() const
+{
+    return static_cast<float>(impl->nr_gpu_ms);
+}
+
+void Dx12Fg::recordNrInput(VkCommandBuffer cmd, VkImage image)
+{
+    Impl &d = *impl;
+    VkBufferImageCopy region = {};
+    region.bufferRowLength = d.nr_in.footprint.Footprint.RowPitch / d.nr_in.bytes_per_texel;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { static_cast<uint32_t>(d.nr_width), static_cast<uint32_t>(d.nr_height), 1 };
+    d.vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_GENERAL, d.nr_in_buf.buffer, 1, &region);
+}
+
+void Dx12Fg::recordNrOutput(VkCommandBuffer cmd, VkImage image)
+{
+    Impl &d = *impl;
+    VkBufferImageCopy region = {};
+    region.bufferRowLength = d.nr_out.footprint.Footprint.RowPitch / d.nr_out.bytes_per_texel;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { static_cast<uint32_t>(d.nr_width), static_cast<uint32_t>(d.nr_height), 1 };
+    d.vkCmdCopyBufferToImage(cmd, d.nr_out_buf.buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+}
+
+bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset)
+{
+    Impl &d = *impl;
+    d.stage = "queue wait";
+    bool ok = d.nr_sized && d.nr_handle && SUCCEEDED(d.queue->Wait(d.shared_fence.Get(), wait_value));
+    if (ok) {
+        const D3D12_RESOURCE_STATES saved[] = { d.nr_in.state, d.nr_depth.state, d.nr_motion.state, d.nr_out.state };
+        // Timestamps of an earlier evaluation are read once its list has finished; new
+        // ones are only written when the readback buffer is free.
+        bool timed = false;
+        if (d.nr_queries) {
+            const uint64_t completed = d.idle_fence->GetCompletedValue();
+            if (d.nr_query_done && completed >= d.nr_query_done) {
+                void *p = nullptr;
+                const D3D12_RANGE range = { 0, 2 * sizeof(UINT64) };
+                if (SUCCEEDED(d.nr_query_readback->Map(0, &range, &p))) {
+                    const UINT64 *ts = static_cast<const UINT64 *>(p);
+                    if (ts[1] > ts[0] && d.timestamp_frequency) {
+                        const double ms = static_cast<double>(ts[1] - ts[0]) * 1000.0 /
+                                          static_cast<double>(d.timestamp_frequency);
+                        d.nr_gpu_ms = d.nr_gpu_ms > 0.0 ? d.nr_gpu_ms * 0.9 + ms * 0.1 : ms;
+                    }
+                    const D3D12_RANGE none = { 0, 0 };
+                    d.nr_query_readback->Unmap(0, &none);
+                }
+                d.nr_query_done = 0;
+            }
+            timed = d.nr_query_done == 0;
+        }
+        Impl::Slot *slot = nullptr;
+        const bool begun = d.beginList(&slot);
+        ok = begun;
+        if (ok) {
+            d.copyBufferToTex(d.nr_in, d.nr_in_buf.res.Get());
+            if (timed)
+                d.list->EndQuery(d.nr_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            ok = d.nrEvaluate(reset);
+            if (ok && timed) {
+                d.list->EndQuery(d.nr_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                d.list->ResolveQueryData(d.nr_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                                         d.nr_query_readback.Get(), 0);
+            }
+            if (ok)
+                d.copyTexToBuffer(d.nr_out_buf.res.Get(), d.nr_out);
+        }
+        if (ok) {
+            d.stage = "ExecuteCommandLists";
+            ok = d.endList(*slot);
+            if (ok && timed)
+                d.nr_query_done = slot->done_value;
+        } else if (begun) {
+            d.list->Close();
+        }
+        if (!ok) {
+            d.nr_in.state = saved[0];
+            d.nr_depth.state = saved[1];
+            d.nr_motion.state = saved[2];
+            d.nr_out.state = saved[3];
+        }
+    }
+    return d.signalShared(signal_value) && ok;
+}
+
+void Dx12Fg::markCrashed()
+{
+    impl->crashed = true;
+}
+
+bool Dx12Fg::crashed() const
+{
+    return impl->crashed;
+}
+
+std::shared_ptr<Dx12Fg> Dx12Fg::shared(const VulkanDevice &vk, LogFn log, void *user)
+{
+    static std::mutex mutex;
+    static std::weak_ptr<Dx12Fg> instance;
+    static VkDevice instance_device = VK_NULL_HANDLE;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (auto existing = instance.lock()) {
+        if (instance_device == vk.device)
+            return existing->crashed() ? nullptr : existing;
+    }
+    auto created = std::make_shared<Dx12Fg>(vk, log, user);
+    if (!created->init())
+        return nullptr;
+    instance = created;
+    instance_device = vk.device;
+    return created;
 }
 
 const char *Dx12Fg::stage() const

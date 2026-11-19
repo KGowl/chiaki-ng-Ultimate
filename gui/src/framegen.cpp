@@ -1137,11 +1137,12 @@ void dx12FgLog(int level, const char *message, void *)
         qCInfo(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << message;
 }
 
-// Runs on a D3D12 device of its own, see dx12fg.h. Driven by FrameGen::Impl::processDx12.
+// Runs on a D3D12 device of its own, see dx12fg.h (shared with neural rendering). Driven by
+// FrameGen::Impl::processDx12.
 class Dx12Backend : public FgBackendImpl
 {
 public:
-    std::unique_ptr<Dx12Fg> runner;
+    std::shared_ptr<Dx12Fg> runner;
 
     bool init(FrameGen::Impl &fg) override
     {
@@ -1150,8 +1151,12 @@ public:
         device.physical_device = fg.vk->phys_device;
         device.device = fg.vk->device;
         device.get_instance_proc_addr = fg.vk->get_proc_addr;
-        runner = std::make_unique<Dx12Fg>(device, &dx12FgLog, nullptr);
-        return runner->init();
+        runner = Dx12Fg::shared(device, &dx12FgLog, nullptr);
+        if (runner && !runner->fgAvailable()) {
+            qCWarning(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12): not offered by the NGX runtime on this GPU";
+            runner.reset();
+        }
+        return runner != nullptr;
     }
     int maxGenerated() const override { return runner ? std::min(kMaxGenerated, runner->maxGenerated()) : 1; }
     bool record(FrameGen::Impl &, VkCommandBuffer, FgImage &, FgImage *const *, int, bool, float) override
@@ -1164,7 +1169,13 @@ public:
         if (runner)
             runner->invalidate();
     }
-    void shutdown() override { runner.reset(); }
+    void shutdown() override
+    {
+        // Neural rendering may keep the shared instance alive: drop this side's buffers.
+        if (runner && !runner->crashed())
+            runner->invalidate();
+        runner.reset();
+    }
 };
 #endif // CHIAKI_HAVE_DX12FG
 
@@ -1531,6 +1542,16 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl
     Dx12Fg *runner = backend_dx ? backend_dx->runner.get() : nullptr;
     if (!runner)
         return false;
+    if (runner->crashed()) {
+        // Neural rendering, which shares the D3D12 runtime, saw it crash: leave it alone.
+        qCWarning(chiakiGui) << "[framegen] Disabling" << backendName(backend) << "(its D3D12 runtime crashed)";
+        backend_failed[static_cast<size_t>(backend)] = true;
+        (void)new std::shared_ptr<Dx12Fg>(std::move(backend_dx->runner));
+        (void)backend_impl.release();
+        backend = FrameGen::Backend::None;
+        have_history = false;
+        return false;
+    }
     auto disable = [&](const char *why) {
         qCWarning(chiakiGui) << "[framegen] Disabling" << backendName(backend) << why;
         backend_failed[static_cast<size_t>(backend)] = true;
@@ -1550,7 +1571,8 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl
                                         << Qt::hex << code << Qt::dec << ", in " << stage << ")";
         // Its state is unknown: leak it rather than call into it again.
         backend_failed[static_cast<size_t>(backend)] = true;
-        (void)backend_dx->runner.release();
+        backend_dx->runner->markCrashed();
+        (void)new std::shared_ptr<Dx12Fg>(std::move(backend_dx->runner));
         (void)backend_impl.release();
         backend = FrameGen::Backend::None;
         have_history = false;

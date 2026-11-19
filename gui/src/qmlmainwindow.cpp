@@ -1,5 +1,6 @@
 #include "qmlmainwindow.h"
 #include "rtxvsr.h"
+#include "neuralrender.h"
 #include "framegen.h"
 #include "qmlbackend.h"
 #include "qmlsvgprovider.h"
@@ -2837,6 +2838,8 @@ QmlMainWindow::~QmlMainWindow()
     QFile::remove(frameGenCrashGuardPath());
     delete rtx_vsr;
     rtx_vsr = nullptr;
+    delete neural_render;
+    neural_render = nullptr;
     pl_renderer_destroy(&placebo_renderer);
     // User shader hooks hold a reference to the GPU (their descriptors destroy
     // buffers/textures via p->gpu), so they must be released before the GPU is.
@@ -5256,6 +5259,8 @@ renderer_backend_ready:
     );
     if (render_backend == RenderBackend::Vulkan && RtxVsr::compiledIn())
         rtx_vsr = new RtxVsr(placebo_log);
+    if (render_backend == RenderBackend::Vulkan && NeuralRender::compiledIn())
+        neural_render = new NeuralRender(placebo_log);
     if (render_backend == RenderBackend::Vulkan && FrameGen::compiledIn())
         frame_gen = new FrameGen(placebo_log);
     if (QFile::exists(frameGenCrashGuardPath())) {
@@ -5505,6 +5510,19 @@ renderer_backend_ready:
         fps_sample_us = fps_now_us;
 
         QStringList parts;
+        switch (nr_status_state.loadRelaxed()) {
+        case 1: {
+            QString part = QStringLiteral("DLSS NR");
+            const int cms = nr_status_gpu_cms.loadRelaxed();
+            if (cms > 0)
+                part += QStringLiteral(" %1 ms").arg(cms / 100.0, 0, 'f', 1);
+            parts << part;
+            break;
+        }
+        case 2: parts << tr("DLSS NR: idle"); break;
+        case 3: parts << tr("DLSS NR: unavailable (see log)"); break;
+        default: break;
+        }
         const int vsr_quality = vsr_status_quality.loadRelaxed();
         if (RtxVsr::isValidQuality(vsr_quality) && rtx_vsr) {
             QString part = QStringLiteral("RTX VSR %1").arg(QLatin1String(RtxVsr::qualityName(vsr_quality)));
@@ -7840,6 +7858,49 @@ void QmlMainWindow::render()
         }
     }
 
+    // DLSS neural rendering (DLSS 5 through the NGX D3D12 bridge; NeuralHub on AMD):
+    // replace each source frame with a neural rendered RGB frame at its own size,
+    // before RTX VSR and frame generation, which then work on it. Any failure keeps
+    // the decoded frame.
+    constexpr int kNeuralMaxMixFrames = 8;
+    std::array<struct pl_frame, kNeuralMaxMixFrames> nr_frames;
+    std::array<const struct pl_frame *, kNeuralMaxMixFrames> nr_frame_ptrs;
+    std::array<uint64_t, kNeuralMaxMixFrames> nr_signatures;
+    uint64_t direct_signature = direct_frame_serial;
+    bool nr_applied = false;
+    const bool nr_wanted = neural_render && has_settings && settings->GetNeuralRender() && stream_active;
+    if (!fg_override && nr_wanted && neural_render->ensureInitialized(placebo_vulkan)) {
+        if (bypass_frame_queue) {
+            struct pl_frame rendered = {};
+            uint64_t rendered_signature = 0;
+            if (direct_render_frame.num_planes > 0 &&
+                neural_render->process(&direct_render_frame, direct_frame_serial, &rendered, &rendered_signature)) {
+                direct_render_frame = rendered;
+                direct_signature = rendered_signature;
+                nr_applied = true;
+            }
+        } else if (frame_mix.num_frames > 0 && frame_mix.num_frames <= kNeuralMaxMixFrames) {
+            nr_applied = true;
+            for (int i = 0; i < frame_mix.num_frames && nr_applied; i++) {
+                nr_applied = neural_render->process(frame_mix.frames[i], frame_mix.signatures[i], &nr_frames[i],
+                                                    &nr_signatures[i]);
+                nr_frame_ptrs[i] = &nr_frames[i];
+            }
+            if (nr_applied) {
+                frame_mix.frames = nr_frame_ptrs.data();
+                frame_mix.signatures = nr_signatures.data();
+            }
+        }
+    }
+    if (!fg_override) {
+        if (nr_applied != neural_render_active) {
+            neural_render_active = nr_applied;
+            qCInfo(chiakiGui) << "DLSS neural rendering" << (nr_applied ? "active" : "inactive");
+        }
+        nr_status_state.storeRelaxed(!nr_wanted ? 0 : nr_applied ? 1 : neural_render->failed() ? 3 : 2);
+        nr_status_gpu_cms.storeRelaxed(nr_applied ? static_cast<int>(neural_render->gpuTimeMs() * 100.0f) : 0);
+    }
+
     // RTX Video Super Resolution: replace each source frame with an NVIDIA
     // upscaled RGB frame at the output size, so libplacebo only color maps it
     // and scales it ~1:1. Any failure keeps the regular libplacebo path.
@@ -7857,7 +7918,7 @@ void QmlMainWindow::render()
             struct pl_frame upscaled = {};
             uint64_t upscaled_signature = 0;
             if (direct_render_frame.num_planes > 0 &&
-                rtx_vsr->process(&direct_render_frame, direct_frame_serial, vsr_out_w, vsr_out_h,
+                rtx_vsr->process(&direct_render_frame, direct_signature, vsr_out_w, vsr_out_h,
                                  rtx_vsr_quality, &upscaled, &upscaled_signature)) {
                 direct_render_frame = upscaled;
                 vsr_applied = true;
@@ -7878,6 +7939,7 @@ void QmlMainWindow::render()
     }
     if (enhancement_log_reset.fetchAndStoreAcquire(0)) {
         rtx_vsr_active = false;
+        neural_render_active = false;
         fg_skip_logged = 0;
     }
 
