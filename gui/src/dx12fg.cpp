@@ -197,8 +197,15 @@ struct Dx12Fg::Impl
     void copyTexToBuffer(ID3D12Resource *buffer, Tex &t);
     bool createFeature();
     void releaseFeature();
-    bool evaluate(int count, bool reset, float msx, float msy);
+    bool evaluate(int count, bool reset, float msx, float msy, int log_level = 1);
     bool warmUp();
+    struct States
+    {
+        D3D12_RESOURCE_STATES color, motion, depth;
+        std::array<D3D12_RESOURCE_STATES, kMaxOutputs> outs;
+    };
+    States saveStates() const;
+    void restoreStates(const States &s);
     void destroySized();
 };
 
@@ -330,21 +337,27 @@ bool Dx12Fg::Impl::waitIdle()
 bool Dx12Fg::Impl::createSwapchain()
 {
     // The NGX D3D12 runtime of NeuralHub opens at the first Present of a swapchain on
-    // the device; without one the evaluation fails. A hidden window is enough.
+    // the device; without one the evaluation fails. A hidden window is enough. The
+    // provider installs its hooks on the swapchain calls a moment after the first
+    // device is created, so a swapchain made too early goes unnoticed: this is called
+    // again (with a new swapchain on the same window) when the runtime stays closed.
+    swapchain.Reset();
     WNDCLASSW wc = {};
     wc.lpfnWndProc = hiddenWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"chiaki_dx12fg_hidden_window";
-    window_class = RegisterClassW(&wc);
-    if (!window_class && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        log(1, "could not register the hidden window class");
-        return false;
-    }
-    hwnd = CreateWindowExW(0, wc.lpszClassName, L"chiaki D3D12 frame generation", WS_OVERLAPPEDWINDOW, 0, 0,
-                           kHiddenWindowSize, kHiddenWindowSize * 9 / 16, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) {
-        log(1, "could not create the hidden window");
-        return false;
+        window_class = RegisterClassW(&wc);
+        if (!window_class && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            log(1, "could not register the hidden window class");
+            return false;
+        }
+        hwnd = CreateWindowExW(0, wc.lpszClassName, L"chiaki D3D12 frame generation", WS_OVERLAPPEDWINDOW, 0, 0,
+                               kHiddenWindowSize, kHiddenWindowSize * 9 / 16, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!hwnd) {
+            log(1, "could not create the hidden window");
+            return false;
+        }
     }
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.Width = kHiddenWindowSize;
@@ -363,6 +376,16 @@ bool Dx12Fg::Impl::createSwapchain()
         return false;
     }
     factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+    // Test hook (dev builds only): the first swapchain is never presented, as if the provider
+    // had missed it, to exercise the retry in warmUp().
+    static bool skipped_first = false;
+    if (!skipped_first && std::getenv("CHIAKI_DX12FG_SKIP_FIRST_PRESENT")) {
+        skipped_first = true;
+        log(0, "test hook: not presenting the first swapchain");
+        return true;
+    }
+#endif
     hr = swapchain->Present(0, 0);
     if (FAILED(hr)) {
         log(1, "the first Present failed (0x%08x)", static_cast<unsigned>(hr));
@@ -688,7 +711,27 @@ void Dx12Fg::Impl::releaseFeature()
 
 // Records the evaluations for the current frame into `list`; the colour and motion
 // textures hold the current frame.
-bool Dx12Fg::Impl::evaluate(int count, bool reset, float msx, float msy)
+Dx12Fg::Impl::States Dx12Fg::Impl::saveStates() const
+{
+    States s = {};
+    s.color = color.state;
+    s.motion = motion.state;
+    s.depth = depth.state;
+    for (size_t i = 0; i < outs.size(); i++)
+        s.outs[i] = outs[i].state;
+    return s;
+}
+
+void Dx12Fg::Impl::restoreStates(const States &s)
+{
+    color.state = s.color;
+    motion.state = s.motion;
+    depth.state = s.depth;
+    for (size_t i = 0; i < outs.size(); i++)
+        outs[i].state = s.outs[i];
+}
+
+bool Dx12Fg::Impl::evaluate(int count, bool reset, float msx, float msy, int log_level)
 {
     barrier(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     barrier(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -723,7 +766,7 @@ bool Dx12Fg::Impl::evaluate(int count, bool reset, float msx, float msy)
         stage = "NGX_D3D12_EVALUATE_DLSSG";
         const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSSG(list.Get(), handle, params, &eval, &opt);
         if (NVSDK_NGX_FAILED(r)) {
-            log(1, "evaluating DLSS Frame Generation (D3D12) failed: %s (0x%08x)", ngxResultString(r),
+            log(log_level, "evaluating DLSS Frame Generation (D3D12) failed: %s (0x%08x)", ngxResultString(r),
                 static_cast<unsigned>(r));
             return false;
         }
@@ -783,14 +826,34 @@ bool Dx12Fg::Impl::warmUp()
         return false;
 
     for (int i = 0; i < 2; i++) {
-        if (!beginList(&slot))
-            return false;
-        const bool ok = evaluate(1, true, 1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height));
-        if (!ok) {
-            list->Close();
-            return false;
+        constexpr int kAttempts = 4;
+        bool done = false;
+        for (int attempt = 0; attempt < kAttempts && !done; attempt++) {
+            if (attempt > 0) {
+                // The provider's runtime is still closed: it did not see the first swapchain.
+                log(0, "the NGX runtime is not open yet, presenting a new swapchain (attempt %d of %d)", attempt + 1,
+                    kAttempts);
+                Sleep(100u * static_cast<unsigned>(attempt));
+                if (!createSwapchain())
+                    return false;
+            }
+            const States saved = saveStates();
+            if (!beginList(&slot))
+                return false;
+            // Quiet while a later attempt can still succeed.
+            const bool ok = evaluate(1, true, 1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height),
+                                     attempt + 1 < kAttempts ? 0 : 1);
+            if (!ok) {
+                // Nothing of this list runs: the textures keep the states they had.
+                list->Close();
+                restoreStates(saved);
+                continue;
+            }
+            if (!endList(*slot) || !waitIdle())
+                return false;
+            done = true;
         }
-        if (!endList(*slot) || !waitIdle())
+        if (!done)
             return false;
     }
     return true;
@@ -851,7 +914,11 @@ Dx12Fg::~Dx12Fg()
 bool Dx12Fg::init()
 {
     Impl &d = *impl;
-    return d.loadVulkan() && d.createDevice() && d.createSwapchain() && d.initNgx() && d.createSharedFence();
+    if (!d.loadVulkan() || !d.createDevice())
+        return false;
+    // Give the NGX provider time to hook the swapchain calls after the first device.
+    Sleep(60);
+    return d.createSwapchain() && d.initNgx() && d.createSharedFence();
 }
 
 int Dx12Fg::maxGenerated() const
