@@ -236,6 +236,44 @@ struct PanelLog
     }
 };
 
+// Whether Windows shows HDR on this monitor ("Use HDR"). There scRGB 1.0 is 80 nits, so an HDR
+// frame (1.0 = 203 nits) is scaled by 203/80; on an SDR desktop scRGB 1.0 is SDR white and the
+// frame goes in unscaled (2.5 times too bright otherwise). Auto colour management also sets
+// advancedColorEnabled on SDR monitors, with wideColorEnforced.
+bool monitorShowsHdr(HMONITOR monitor)
+{
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, &info))
+        return false;
+    UINT32 path_count = 0, mode_count = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS)
+        return false;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr)
+        != ERROR_SUCCESS)
+        return false;
+    for (UINT32 i = 0; i < path_count; i++) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source = {};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = paths[i].sourceInfo.adapterId;
+        source.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || wcscmp(source.viewGdiDeviceName, info.szDevice) != 0)
+            continue;
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color = {};
+        color.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        color.header.size = sizeof(color);
+        color.header.adapterId = paths[i].targetInfo.adapterId;
+        color.header.id = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&color.header) != ERROR_SUCCESS)
+            return false;
+        return color.advancedColorEnabled && !color.wideColorEnforced;
+    }
+    return false;
+}
+
 LRESULT CALLBACK hiddenWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     // Shown as NeuralHub's panel window it never takes the focus from chiaki's window.
@@ -435,6 +473,10 @@ struct Dx12Fg::Impl
     DXGI_FORMAT panel_format = DXGI_FORMAT_R8G8B8A8_UNORM;
     Tex nr_panel; // HDR: the frame in scRGB units, copied into the swapchain
     bool panel_desc_ready = false;
+    HMONITOR panel_monitor = nullptr; // where the panel is, checked for HDR every 2 s
+    ULONGLONG panel_monitor_checked = 0;
+    int panel_monitor_hdr = -1; // -1 not checked yet
+    float panel_scrgb = 1.0f;   // HDR frames into scRGB: 203/80 on an HDR desktop, 1 on SDR
     ComPtr<ID3D12PipelineState> cs_scrgb;
     bool panelRoute() const { return !gate_ready && nr_sized && swapchain; }
     void panelUpdate();
@@ -1538,7 +1580,7 @@ void Dx12Fg::Impl::panelUpdate()
     }
     if (nr_cfg.hdr && !panel_desc_ready && !cs_failed) {
         // The frame in scRGB units through a compute pass; without it it is copied as it is
-        // (2.5 times darker).
+        // (2.5 times darker on an HDR desktop).
         if (!nr_panel.res && !makeTex(nr_panel, static_cast<int>(w), static_cast<int>(h), DXGI_FORMAT_R16G16B16A16_FLOAT, 8))
             nr_panel = Tex();
         if (nr_panel.res && createProxyPipeline()) {
@@ -1587,6 +1629,22 @@ void Dx12Fg::Impl::panelUpdate()
     if (panel_shown && !EqualRect(&r, &panel_rect))
         SetWindowPos(hwnd, HWND_TOPMOST, r.left, r.top, pw, ph, SWP_NOACTIVATE);
     panel_rect = r;
+    if (nr_cfg.hdr) {
+        // Windows' HDR switch can change while streaming, and the window can move to another monitor.
+        const HMONITOR monitor = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        const ULONGLONG now = GetTickCount64();
+        if (monitor != panel_monitor || now - panel_monitor_checked > 2000) {
+            panel_monitor = monitor;
+            panel_monitor_checked = now;
+            const int hdr = monitorShowsHdr(monitor) ? 1 : 0;
+            if (hdr != panel_monitor_hdr) {
+                panel_monitor_hdr = hdr;
+                panel_scrgb = hdr ? 203.0f / 80.0f : 1.0f;
+                log(0, "NeuralHub's panel window is on a monitor with HDR %s: HDR frames go in scaled by %.2f", hdr ? "on" : "off",
+                    panel_scrgb);
+            }
+        }
+    }
     panel_copy = true;
 }
 
@@ -1613,7 +1671,7 @@ void Dx12Fg::Impl::panelRecordCopy()
         table.ptr += static_cast<UINT64>(8) * cs_increment;
         list->SetComputeRootDescriptorTable(0, table);
         const UINT w = static_cast<UINT>(nr_cfg.out_width), h = static_cast<UINT>(nr_cfg.out_height);
-        const float to_scrgb = 203.0f / 80.0f;
+        const float to_scrgb = panel_scrgb;
         UINT constants[4] = { w, h, 0, 0 };
         std::memcpy(&constants[2], &to_scrgb, sizeof(to_scrgb));
         list->SetComputeRoot32BitConstants(1, 4, constants, 0);
