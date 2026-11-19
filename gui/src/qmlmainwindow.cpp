@@ -5528,6 +5528,7 @@ renderer_backend_ready:
                 : fg_backend_status == static_cast<int>(FrameGen::Backend::Flow)
                     ? (this->settings && this->settings->GetFrameGenFlowHighQuality() ? QStringLiteral("Flow FG HQ") : QStringLiteral("Flow FG"))
                 : fg_backend_status == static_cast<int>(FrameGen::Backend::Vfg) ? QStringLiteral("NVIDIA VFG")
+                : fg_backend_status == static_cast<int>(FrameGen::Backend::Dlss12) ? QStringLiteral("DLSS FG D3D12")
                 : QStringLiteral("FSR FG");
             const int multiplier = fg_status_multiplier.loadRelaxed();
             if (multiplier > 1) {

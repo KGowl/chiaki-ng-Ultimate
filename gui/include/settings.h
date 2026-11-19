@@ -540,7 +540,7 @@ class Settings : public QObject
 		static int ValidRtxVsrQuality(int q) { return ((q >= 1 && q <= 4) || (q >= 8 && q <= 11) || q == 21 || q == 23) ? q : 0; }
 		// Frame generation backend: 0 = off, 1 = DLSS Frame Generation, 2 = FSR 3.1 Frame Generation,
 		// 3 = Flow (chiaki-ng's own, any GPU / OS), 4 = NVIDIA VFG (Windows)
-		int GetFrameGenBackend() const { return qBound(0, settings.value("settings/frame_gen_backend", 0).toInt(), 4); }
+		int GetFrameGenBackend() const { return qBound(0, settings.value("settings/frame_gen_backend", 0).toInt(), 5); }
 		void SetFrameGenBackend(int backend)
 		{
 			backend = qBound(0, backend, 4);

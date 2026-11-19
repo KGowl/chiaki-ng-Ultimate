@@ -138,8 +138,11 @@ if(CHIAKI_ENABLE_NGX)
 		message(FATAL_ERROR "NGX library not found: ${CHIAKI_NGX_LIB}")
 	endif()
 	target_include_directories(chiaki PRIVATE "${CHIAKI_NGX_SDK_DIR}/include")
-	target_link_libraries(chiaki "${CHIAKI_NGX_LIB}" advapi32 user32)
-	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_NGX)
+	# setupapi, version, shell32 and ole32: needed by the D3D12 half of the NGX library (dx12fg.cpp).
+	target_link_libraries(chiaki "${CHIAKI_NGX_LIB}" advapi32 user32 setupapi version shell32 ole32)
+	# DLSS Frame Generation through NGX D3D12 (AMD GPUs with NeuralHub's NGX stub), see dx12fg.h.
+	target_sources(chiaki PRIVATE include/dx12fg.h src/dx12fg.cpp)
+	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG)
 	message(STATUS "NVIDIA NGX enabled: RTX Video Super Resolution, DLSS Frame Generation (${CHIAKI_NGX_LIB})")
 endif()
 

@@ -5,6 +5,9 @@
 #include "ffxfi.h"
 #endif
 #include "vfg.h"
+#if defined(CHIAKI_HAVE_DX12FG)
+#include "dx12fg.h"
+#endif
 #include "ngxcore.h"
 #include "gputimer.h"
 #include "vkguard.h"
@@ -121,7 +124,7 @@ struct FrameGen::Impl
 
     FrameGen::Backend backend = FrameGen::Backend::None;
     std::unique_ptr<FgBackendImpl> backend_impl;
-    std::array<bool, 5> backend_failed = {};
+    std::array<bool, 6> backend_failed = {};
     int consecutive_failures = 0;
 
     VkQueue queue = VK_NULL_HANDLE;
@@ -204,6 +207,10 @@ struct FrameGen::Impl
                   const SemValue *extra_signals, size_t num_extra_signals);
     bool processVfg(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
                     const std::function<void(const char *)> &trace_step);
+#if defined(CHIAKI_HAVE_DX12FG)
+    bool processDx12(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
+                     const std::function<void(const char *)> &trace_step);
+#endif
     static void fillFrame(const FgImage &img, struct pl_frame *frame);
 };
 
@@ -1121,6 +1128,46 @@ public:
     void shutdown() override { interp.reset(); }
 };
 
+#if defined(CHIAKI_HAVE_DX12FG)
+void dx12FgLog(int level, const char *message, void *)
+{
+    if (level > 0)
+        qCWarning(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << message;
+    else
+        qCInfo(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << message;
+}
+
+// Runs on a D3D12 device of its own, see dx12fg.h. Driven by FrameGen::Impl::processDx12.
+class Dx12Backend : public FgBackendImpl
+{
+public:
+    std::unique_ptr<Dx12Fg> runner;
+
+    bool init(FrameGen::Impl &fg) override
+    {
+        Dx12Fg::VulkanDevice device;
+        device.instance = fg.vk->instance;
+        device.physical_device = fg.vk->phys_device;
+        device.device = fg.vk->device;
+        device.get_instance_proc_addr = fg.vk->get_proc_addr;
+        runner = std::make_unique<Dx12Fg>(device, &dx12FgLog, nullptr);
+        return runner->init();
+    }
+    int maxGenerated() const override { return runner ? std::min(kMaxGenerated, runner->maxGenerated()) : 1; }
+    bool record(FrameGen::Impl &, VkCommandBuffer, FgImage &, FgImage *const *, int, bool, float) override
+    {
+        return false;
+    }
+    const char *stage() const override { return runner ? runner->stage() : ""; }
+    void invalidate() override
+    {
+        if (runner)
+            runner->invalidate();
+    }
+    void shutdown() override { runner.reset(); }
+};
+#endif // CHIAKI_HAVE_DX12FG
+
 } // namespace
 
 bool FrameGen::compiledIn()
@@ -1141,6 +1188,9 @@ bool FrameGen::backendCompiledIn(Backend backend)
 #if defined(_WIN32)
     case Backend::Vfg: return true;
 #endif
+#if defined(CHIAKI_HAVE_DX12FG)
+    case Backend::Dlss12: return true;
+#endif
     default: return false;
     }
 }
@@ -1152,6 +1202,7 @@ const char *FrameGen::backendName(Backend backend)
     case Backend::Fsr: return "FSR 3.1 Frame Generation";
     case Backend::Flow: return "Flow Frame Generation";
     case Backend::Vfg: return "NVIDIA VFG";
+    case Backend::Dlss12: return "DLSS Frame Generation (D3D12)";
     default: return "None";
     }
 }
@@ -1199,6 +1250,9 @@ bool FrameGen::ensureInitialized(pl_vulkan vk, Backend backend)
     case Backend::Flow: impl_backend = std::make_unique<FlowBackend>(); break;
 #if defined(_WIN32)
     case Backend::Vfg: impl_backend = std::make_unique<VfgBackend>(); break;
+#endif
+#if defined(CHIAKI_HAVE_DX12FG)
+    case Backend::Dlss12: impl_backend = std::make_unique<Dx12Backend>(); break;
 #endif
     default: break;
     }
@@ -1461,6 +1515,173 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
     return true;
 }
 
+#if defined(CHIAKI_HAVE_DX12FG)
+// DLSS Frame Generation through D3D12 (dx12fg.h): (1) Vulkan copies the real frame into a
+// buffer shared with D3D12 and signals the shared timeline semaphore, (2) the D3D12 queue
+// waits for it, runs the NGX feature on it and signals the next value, (3) Vulkan waits for
+// that and copies the generated frames out of the shared buffers. Both APIs are driven from
+// this thread; only the GPUs wait for each other. The runtime remembers the previous frame
+// itself, so the first frame of a sequence goes through it as well (reset set) and only its
+// own output is dropped. Motion vectors are not passed: NeuralHub's runtime finds the motion
+// itself and ignores them.
+bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
+                                 const std::function<void(const char *)> &trace_step)
+{
+    auto *backend_dx = static_cast<Dx12Backend *>(backend_impl.get());
+    Dx12Fg *runner = backend_dx ? backend_dx->runner.get() : nullptr;
+    if (!runner)
+        return false;
+    auto disable = [&](const char *why) {
+        qCWarning(chiakiGui) << "[framegen] Disabling" << backendName(backend) << why;
+        backend_failed[static_cast<size_t>(backend)] = true;
+        destroyBackend();
+        return false;
+    };
+    auto fail = [&](const char *what) {
+        qCWarning(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << what;
+        have_history = false;
+        last_real = nullptr;
+        if (++consecutive_failures >= kMaxConsecutiveFailures)
+            return disable("after repeated failures");
+        return false;
+    };
+    auto crashed = [&](unsigned long code, const char *stage) {
+        qCCritical(chiakiGui).nospace() << "[framegen] DLSS Frame Generation (D3D12) crashed inside its runtime (exception 0x"
+                                        << Qt::hex << code << Qt::dec << ", in " << stage << ")";
+        // Its state is unknown: leak it rather than call into it again.
+        backend_failed[static_cast<size_t>(backend)] = true;
+        (void)backend_dx->runner.release();
+        (void)backend_impl.release();
+        backend = FrameGen::Backend::None;
+        have_history = false;
+        return false;
+    };
+    auto begin_slot = [&]() -> CommandSlot * {
+        CommandSlot &slot = cmd_slots[next_slot];
+        next_slot = (next_slot + 1) % cmd_slots.size();
+        if (!waitDone(slot.done_value) || vkResetCommandBuffer(slot.cmd, 0) != VK_SUCCESS)
+            return nullptr;
+        VkCommandBufferBeginInfo begin_info = {};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        return vkBeginCommandBuffer(slot.cmd, &begin_info) == VK_SUCCESS ? &slot : nullptr;
+    };
+
+    const int w = set.real.w;
+    const int h = set.real.h;
+    if (!runner->sizeMatches(w, h)) {
+        // The shared buffers are rebuilt: nothing may still use them.
+        if (!waitDone(done_value))
+            return false;
+        unsigned long seh_code = 0;
+        const bool sized = guardedCall([&]() { return runner->ensureSize(w, h); }, &seh_code);
+        if (seh_code)
+            return crashed(seh_code, runner->stage());
+        if (!sized)
+            return disable("(the D3D12 side could not be set up, see above)");
+        reset_pending = true;
+        trace_step("dx12 buffers ready");
+    }
+    const bool fresh = reset_pending || !have_history || !last_real;
+    count = std::clamp(count, 1, runner->maxGenerated());
+
+    // (1) Real frame -> shared color buffer.
+    CommandSlot *slot = begin_slot();
+    if (!slot)
+        return fail("command buffer unavailable");
+    if (!hold(set.real))
+        return fail("could not take the frame from libplacebo");
+    runner->recordColor(slot->cmd, set.real.image);
+    bool ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
+    const uint64_t input_value = runner->lastValue() + 1;
+    {
+        FgImage *waits[] = { &set.real };
+        // D3D12 has finished with the buffer being overwritten.
+        const SemValue extra_waits[] = { { runner->semaphore(), runner->lastValue() } };
+        const SemValue input_signal[] = { { runner->semaphore(), input_value } };
+        ok = ok && submitEx(slot->cmd, waits, 1, extra_waits, 1, input_signal, 1);
+    }
+    if (ok) {
+        slot->done_value = done_value;
+        runner->setLastValue(input_value);
+        release(set.real, sem_done, done_value);
+    } else {
+        release(set.real, set.real.sem, set.real.value);
+        return fail("copying the frame failed");
+    }
+    trace_step("dx12 input copied");
+
+    // (2) The D3D12 half; it always signals `output_value`.
+    const uint64_t output_value = input_value + 1;
+    unsigned long seh_code = 0;
+    const bool generated_ok = guardedCall([&]() {
+        return runner->generate(fresh ? 1 : count, input_value, output_value, fresh, false, 1.0f, 1.0f);
+    }, &seh_code);
+    runner->setLastValue(output_value);
+    if (seh_code)
+        return crashed(seh_code, runner->stage());
+    trace_step(generated_ok ? "dx12 generation queued" : "dx12 generation failed");
+    if (!generated_ok)
+        return fail("generation failed");
+
+    if (fresh) {
+        // Only the runtime needed this frame (it keeps it as the previous one).
+        consecutive_failures = 0;
+        have_history = true;
+        reset_pending = false;
+        last_real = &set.real;
+        outputs.emplace_back();
+        fillFrame(set.real, &outputs.back());
+        return true;
+    }
+
+    // (3) Shared output buffers -> generated textures, once D3D12 is done.
+    slot = begin_slot();
+    if (!slot)
+        return fail("command buffer unavailable");
+    std::array<FgImage *, kMaxGenerated> held = {};
+    size_t num_held = 0;
+    bool holds_ok = true;
+    for (int i = 0; i < count; i++) {
+        FgImage &img = set.generated[static_cast<size_t>(i)];
+        if (!hold(img)) {
+            holds_ok = false;
+            break;
+        }
+        held[num_held++] = &img;
+        runner->recordDownload(slot->cmd, img.image, i);
+    }
+    ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
+    {
+        const SemValue extra_waits[] = { { runner->semaphore(), output_value } };
+        ok = ok && submitEx(slot->cmd, held.data(), num_held, extra_waits, 1, nullptr, 0);
+    }
+    if (ok)
+        slot->done_value = done_value;
+    for (size_t i = 0; i < num_held; i++) {
+        if (ok)
+            release(*held[i], sem_done, done_value);
+        else
+            release(*held[i], held[i]->sem, held[i]->value);
+    }
+    if (!ok || !holds_ok)
+        return fail("copying the generated frames failed");
+    trace_step("dx12 frames submitted");
+
+    consecutive_failures = 0;
+    have_history = true;
+    reset_pending = false;
+    last_real = &set.real;
+    for (int i = 0; i < count; i++) {
+        outputs.emplace_back();
+        fillFrame(set.generated[static_cast<size_t>(i)], &outputs.back());
+    }
+    outputs.emplace_back();
+    fillFrame(set.real, &outputs.back());
+    return true;
+}
+#endif // CHIAKI_HAVE_DX12FG
+
 bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int multiplier,
                        float frame_interval_ms, std::vector<struct pl_frame> &outputs)
 {
@@ -1618,6 +1839,10 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
 
     if (d.backend == FrameGen::Backend::Vfg)
         return d.processVfg(set, count, outputs, trace_step);
+#if defined(CHIAKI_HAVE_DX12FG)
+    if (d.backend == FrameGen::Backend::Dlss12)
+        return d.processDx12(set, count, outputs, trace_step);
+#endif
 
     if (d.backend == FrameGen::Backend::Flow) {
         auto *flow = static_cast<FlowBackend *>(d.backend_impl.get());

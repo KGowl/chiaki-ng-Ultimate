@@ -32,6 +32,10 @@ public:
         Flow = 3,
         // NVIDIA Video Frame Generation (Video Effects SDK), Windows only.
         Vfg = 4,
+        // DLSS Frame Generation through the NGX D3D12 API (dx12fg.h), Windows only. Meant
+        // for GPUs without NVIDIA's runtime that get an NGX provider next to chiaki.exe
+        // (NeuralHub's dxgi.dll stub); Vulkan frames are shared with a D3D12 device.
+        Dlss12 = 5,
     };
 
     static bool compiledIn();
