@@ -53,6 +53,14 @@ public:
     // paused, so the model does not blend in frames from before the pause).
     void resetHistory();
 
+    // NeuralHub's in-game panel (End), shown over the video like in games (dx12fg.h):
+    // `window` is chiaki's top-level window (an HWND on Windows). hasProviderPanel() says
+    // whether NeuralHub runs the neural rendering (it then owns the End key); any thread.
+    // hidePanel() while neural rendering is paused.
+    void setPanelWindow(void *window);
+    bool hasProviderPanel() const;
+    void hidePanel();
+
     struct Options
     {
         // Output size; 0 (or not larger than the frame) keeps the frame's own size.

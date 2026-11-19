@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <vector>
 
@@ -72,6 +73,10 @@ struct NeuralRender::Impl
     bool reset_pending = true;
     int failures = 0;
     std::shared_ptr<Dx12Fg> runner;
+    // NeuralHub's in-game panel: chiaki's window it is shown over, and whether NeuralHub runs
+    // the neural rendering (read from the GUI thread).
+    void *panel_window = nullptr;
+    std::atomic<bool> provider_panel{ false };
 
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queue_family = 0;
@@ -209,6 +214,9 @@ bool NeuralRender::Impl::init(pl_vulkan vk_)
         runner.reset();
         return false;
     }
+    provider_panel.store(runner->nrProviderPanel());
+    if (provider_panel.load())
+        qCInfo(chiakiGui) << "[neural-render] NeuralHub runs DLSS 5: End opens its in-game panel over the video";
     return true;
 }
 
@@ -399,6 +407,7 @@ bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool re
 
     // (2) Always signals `output_value`.
     const uint64_t output_value = input_value + 1;
+    runner->nrSetPanelWindow(panel_window);
     unsigned long seh_code = 0;
     const bool rendered = guardedCall([&]() { return runner->neuralRender(input_value, output_value, reset); },
                                       &seh_code);
@@ -461,6 +470,7 @@ void NeuralRender::Impl::shutdown()
     in_value = out_value = done_value = 0;
     initialized = false;
     reset_pending = true;
+    provider_panel.store(false);
     vk = nullptr;
     gpu = nullptr;
 }
@@ -522,6 +532,22 @@ void NeuralRender::destroy()
 void NeuralRender::resetHistory()
 {
     impl->reset_pending = true;
+}
+
+void NeuralRender::setPanelWindow(void *window)
+{
+    impl->panel_window = window;
+}
+
+bool NeuralRender::hasProviderPanel() const
+{
+    return impl->provider_panel.load();
+}
+
+void NeuralRender::hidePanel()
+{
+    if (impl->runner)
+        impl->runner->nrHidePanel();
 }
 
 bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, const Options &options,
@@ -662,6 +688,9 @@ bool NeuralRender::canUpscale() const { return false; }
 float NeuralRender::gpuTimeMs() const { return 0.0f; }
 void NeuralRender::destroy() {}
 void NeuralRender::resetHistory() {}
+void NeuralRender::setPanelWindow(void *) {}
+bool NeuralRender::hasProviderPanel() const { return false; }
+void NeuralRender::hidePanel() {}
 bool NeuralRender::process(const struct pl_frame *, uint64_t, const Options &, struct pl_frame *, uint64_t *)
 {
     return false;

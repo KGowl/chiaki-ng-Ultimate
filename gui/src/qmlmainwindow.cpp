@@ -7886,6 +7886,10 @@ void QmlMainWindow::render()
         neural_render->resetHistory();
     nr_user_off_seen = nr_user_off_now;
     if (!fg_override && nr_wanted && neural_render->ensureInitialized(placebo_vulkan)) {
+#ifdef Q_OS_WIN
+        // NeuralHub's in-game panel (End) is shown over the video in this window.
+        neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
+#endif
         // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
         // the largest step DLSS Performance covers well), or the source size.
         auto nr_options_for = [&](const struct pl_frame *src) {
@@ -7939,6 +7943,13 @@ void QmlMainWindow::render()
     }
     if (!nr_applied)
         nr_upscaled = false;
+    if (neural_render) {
+        // NeuralHub's panel window only stays up while neural rendering runs (a failure hides
+        // it on its own; a render without a new frame keeps it).
+        if (!nr_wanted || fg_override)
+            neural_render->hidePanel();
+        nr_provider_panel.storeRelaxed(neural_render->hasProviderPanel() ? 1 : 0);
+    }
     if (!fg_override) {
         if (nr_applied != neural_render_active) {
             neural_render_active = nr_applied;
@@ -8181,7 +8192,12 @@ bool QmlMainWindow::handleShortcut(QKeyEvent *event)
                 normalTime();
             return true;
         case Qt::Key_End:
-            // DLSS 5 on/off while streaming, on the key NeuralHub uses in games.
+            // NeuralHub runs DLSS 5: End is its in-game panel's key, as in games (NeuralHub polls
+            // the key itself and the panel is shown over the video); it only stays away from the
+            // console here.
+            if (session && settings && settings->GetNeuralRender() && nr_provider_panel.loadRelaxed())
+                return true;
+            // NVIDIA: DLSS 5 on/off while streaming.
             if (session && settings && settings->GetNeuralRender()) {
                 const bool enabled = nr_user_off.fetchAndXorRelaxed(1) != 0;
                 qCInfo(chiakiGui) << "DLSS neural rendering switched" << (enabled ? "on" : "off") << "with the End key";

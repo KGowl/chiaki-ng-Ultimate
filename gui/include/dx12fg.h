@@ -132,6 +132,20 @@ public:
     // upscaling and the HDR proxy passes included.
     float nrGpuTimeMs() const;
 
+    // NeuralHub's in-game panel (its key, End by default), as in games. NeuralHub polls its
+    // keys and draws the panel when its swapchain is presented, so on the NeuralHub route the
+    // hidden swapchain is presented after every neuralRender(). NeuralHub logs when the panel
+    // opens and closes (dlssnr_on_amd.log next to the executable); while it is open and
+    // `window` (chiaki's top-level window, an HWND) has the focus, the swapchain's window is
+    // shown over the video in that window, every frame copied into it under the panel.
+    // NeuralHub keeps the panel's keys from the process's message loop while it is open.
+    void nrSetPanelWindow(void *window);
+    // Whether neural rendering runs through NeuralHub, which then owns its panel key.
+    bool nrProviderPanel() const;
+    // Hides the panel's window (neural rendering paused or stopped; it comes back with the
+    // next neuralRender() while NeuralHub's panel is still open).
+    void nrHidePanel();
+
     // One instance per Vulkan device, shared by frame generation and neural rendering
     // (one D3D12 device and one NGX runtime for both). Created and initialised on first
     // use; nullptr when init() fails. The log callback of the first caller is used.

@@ -161,10 +161,86 @@ void compose(uint3 id : SV_DispatchThreadID)
     float3 o = max(c + delta * (1.0 + m), min(c, 0.0));
     dst[id.xy] = float4(min(o, max_out), 1.0);
 }
+// NeuralHub's panel window on an HDR stream: the frame (1.0 = SDR white, 203 nits) in scRGB
+// units (1.0 = 80 nits); max_out carries the scale.
+[numthreads(8, 8, 1)]
+void scrgb(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+    dst[id.xy] = float4(src0[id.xy].rgb * max_out, 1.0);
+}
 )";
+
+// NeuralHub writes "overlay shown (...)" and "overlay hidden" to its log (dlssnr_on_amd.log
+// next to the executable) when its in-game panel opens and closes; this follows the log from
+// where it was when opened.
+struct PanelLog
+{
+    HANDLE file = INVALID_HANDLE_VALUE;
+    LONGLONG pos = 0;
+    std::string carry;
+
+    ~PanelLog()
+    {
+        if (file != INVALID_HANDLE_VALUE)
+            CloseHandle(file);
+    }
+    bool open(const std::wstring &path)
+    {
+        file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        LARGE_INTEGER size = {};
+        if (file == INVALID_HANDLE_VALUE || !GetFileSizeEx(file, &size))
+            return false;
+        pos = size.QuadPart;
+        return true;
+    }
+    // +1: the panel opened, -1: it closed (the last of the new lines decides), 0: neither.
+    int poll()
+    {
+        LARGE_INTEGER size = {};
+        if (file == INVALID_HANDLE_VALUE || !GetFileSizeEx(file, &size))
+            return 0;
+        if (size.QuadPart < pos) { // a new log
+            pos = 0;
+            carry.clear();
+        }
+        if (size.QuadPart == pos)
+            return 0;
+        const DWORD want = static_cast<DWORD>(std::min<LONGLONG>(size.QuadPart - pos, 1 << 18));
+        std::string text = carry;
+        text.resize(carry.size() + want);
+        LARGE_INTEGER at = {};
+        at.QuadPart = pos;
+        DWORD got = 0;
+        if (!SetFilePointerEx(file, at, nullptr, FILE_BEGIN) || !ReadFile(file, &text[carry.size()], want, &got, nullptr))
+            return 0;
+        text.resize(carry.size() + got);
+        pos += got;
+        const size_t nl = text.find_last_of('\n');
+        if (nl == std::string::npos) {
+            carry = text.size() < 4096 ? text : std::string();
+            return 0;
+        }
+        carry = text.substr(nl + 1);
+        text.resize(nl);
+        const size_t shown = text.rfind("overlay shown"), hidden = text.rfind("overlay hidden");
+        if (shown == std::string::npos && hidden == std::string::npos)
+            return 0;
+        if (hidden == std::string::npos)
+            return 1;
+        if (shown == std::string::npos)
+            return -1;
+        return shown > hidden ? 1 : -1;
+    }
+};
 
 LRESULT CALLBACK hiddenWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    // Shown as NeuralHub's panel window it never takes the focus from chiaki's window.
+    if (msg == WM_MOUSEACTIVATE)
+        return MA_NOACTIVATE;
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -339,6 +415,34 @@ struct Dx12Fg::Impl
     // The runtime crashed while one of the users called it; never handed out again.
     bool crashed = false;
 
+    // ---- NeuralHub's in-game panel (its key, End by default), NeuralHub route only ----
+    // NeuralHub polls its keys and draws its panel when it sees its swapchain presented, so
+    // the hidden swapchain is presented after every evaluation. Its log says when the panel
+    // opens and closes; while it is open and chiaki's window has the focus, the window is
+    // shown over the video and each frame is copied into the swapchain, under the panel.
+    // NeuralHub keeps the panel's keys from the process's message loop while it is open.
+    HWND panel_owner = nullptr;
+    PanelLog panel_log;
+    bool panel_log_tried = false;
+    bool panel_open = false;   // NeuralHub's panel, as its log says
+    bool panel_copy = false;   // this frame goes into the swapchain
+    bool panel_shown = false;  // the window is on screen
+    bool panel_styled = false; // the window has its popup styles
+    bool panel_failed = false; // the swapchain could not take the frame's size: not shown
+    bool panel_present_warned = false;
+    RECT panel_rect = {};
+    UINT panel_w = kHiddenWindowSize, panel_h = kHiddenWindowSize * 9 / 16;
+    DXGI_FORMAT panel_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    Tex nr_panel; // HDR: the frame in scRGB units, copied into the swapchain
+    bool panel_desc_ready = false;
+    ComPtr<ID3D12PipelineState> cs_scrgb;
+    bool panelRoute() const { return !gate_ready && nr_sized && swapchain; }
+    void panelUpdate();
+    void panelRecordCopy();
+    void panelPresent();
+    void panelHide();
+    bool panelResize(UINT w, UINT h, DXGI_FORMAT format);
+
     bool loadVulkan();
     bool signalShared(uint64_t value);
     bool createDevice();
@@ -357,7 +461,7 @@ struct Dx12Fg::Impl
     std::vector<Tex *> nrTextures()
     {
         std::vector<Tex *> all;
-        for (Tex *t : { &nr_in, &nr_out, &nr_depth, &nr_motion, &nr_mid, &nr_proxy_in, &nr_proxy_out }) {
+        for (Tex *t : { &nr_in, &nr_out, &nr_depth, &nr_motion, &nr_mid, &nr_proxy_in, &nr_proxy_out, &nr_panel }) {
             if (t->res)
                 all.push_back(t);
         }
@@ -1223,19 +1327,20 @@ bool Dx12Fg::Impl::nrCreateUpscaler()
 
 bool Dx12Fg::Impl::createProxyPipeline()
 {
-    if (cs_encode && cs_compose && cs_heap)
+    if (cs_encode && cs_compose && cs_scrgb && cs_heap)
         return true;
     if (cs_failed)
         return false;
     cs_failed = true; // until everything below succeeds
-    stage = "HDR proxy shaders";
+    stage = "HDR shaders";
     HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
     const auto compile = compiler ? reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
     using SerializeFn = HRESULT(WINAPI *)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **,
                                           ID3DBlob **);
     const auto serialize = reinterpret_cast<SerializeFn>(GetProcAddress(d3d12_dll, "D3D12SerializeRootSignature"));
     if (!compile || !serialize) {
-        log(1, "HDR neural rendering on NVIDIA needs d3dcompiler_47.dll and D3D12SerializeRootSignature");
+        log(1, "the HDR passes (NVIDIA's proxy, NeuralHub's panel window) need d3dcompiler_47.dll and "
+               "D3D12SerializeRootSignature");
         return false;
     }
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
@@ -1263,8 +1368,8 @@ bool Dx12Fg::Impl::createProxyPipeline()
         log(1, "could not create the HDR proxy root signature");
         return false;
     }
-    for (int i = 0; i < 2; i++) {
-        const char *entry = i == 0 ? "encode" : "compose";
+    for (int i = 0; i < 3; i++) {
+        const char *entry = i == 0 ? "encode" : i == 1 ? "compose" : "scrgb";
         ComPtr<ID3DBlob> code;
         errors.Reset();
         if (FAILED(compile(kProxyShaders, sizeof(kProxyShaders) - 1, "dx12fg_proxy", nullptr, nullptr, entry, "cs_5_0",
@@ -1277,7 +1382,7 @@ bool Dx12Fg::Impl::createProxyPipeline()
         pd.pRootSignature = cs_root.Get();
         pd.CS.pShaderBytecode = code->GetBufferPointer();
         pd.CS.BytecodeLength = code->GetBufferSize();
-        ComPtr<ID3D12PipelineState> &target = i == 0 ? cs_encode : cs_compose;
+        ComPtr<ID3D12PipelineState> &target = i == 0 ? cs_encode : i == 1 ? cs_compose : cs_scrgb;
         if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&target)))) {
             log(1, "could not create the HDR proxy pipeline %s", entry);
             return false;
@@ -1285,7 +1390,7 @@ bool Dx12Fg::Impl::createProxyPipeline()
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 8;
+    hd.NumDescriptors = 12; // 0-3 encode, 4-7 compose, 8-11 scrgb
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cs_heap)))) {
         log(1, "could not create the HDR proxy descriptor heap");
@@ -1354,6 +1459,196 @@ void Dx12Fg::Impl::dispatchProxy(bool compose)
     std::memcpy(&constants[2], &max_out, sizeof(max_out));
     list->SetComputeRoot32BitConstants(1, 4, constants, 0);
     list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+}
+
+// ---- NeuralHub's in-game panel ----
+
+bool Dx12Fg::Impl::panelResize(UINT w, UINT h, DXGI_FORMAT format)
+{
+    if (w == panel_w && h == panel_h && format == panel_format)
+        return true;
+    // Nothing may still use the buffers (a Present, NeuralHub drawing its panel). Two
+    // buffers: at the output size they are large (4K HDR: 66 MB each).
+    waitIdle();
+    const HRESULT hr = swapchain->ResizeBuffers(2, w, h, format, 0);
+    if (FAILED(hr)) {
+        log(1, "NeuralHub's panel window: the swapchain could not take %ux%u (0x%08x), the panel is not shown",
+            w, h, static_cast<unsigned>(hr));
+        return false;
+    }
+    panel_w = w;
+    panel_h = h;
+    panel_format = format;
+    ComPtr<IDXGISwapChain3> sc3;
+    if (SUCCEEDED(swapchain.As(&sc3))) {
+        const DXGI_COLOR_SPACE_TYPE space = format == DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                                : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        UINT support = 0;
+        if (SUCCEEDED(sc3->CheckColorSpaceSupport(space, &support))
+            && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
+            sc3->SetColorSpace1(space);
+    }
+    return true;
+}
+
+void Dx12Fg::Impl::panelHide()
+{
+    panel_copy = false;
+    if (panel_shown && hwnd)
+        ShowWindow(hwnd, SW_HIDE);
+    panel_shown = false;
+}
+
+// Before the evaluation's command list: follows the log, and decides whether this frame goes
+// into the swapchain (the panel is open and chiaki's window has the focus).
+void Dx12Fg::Impl::panelUpdate()
+{
+    panel_copy = false;
+    if (!panelRoute())
+        return;
+    if (!panel_log_tried) {
+        panel_log_tried = true;
+        const std::wstring path = exe_dir + L"\\dlssnr_on_amd.log";
+        if (panel_log.open(path))
+            log(0, "NeuralHub's in-game panel (End) is shown over the video when it opens");
+        else
+            log(1, "NeuralHub's log (%ls) could not be opened: its in-game panel is not shown", path.c_str());
+    }
+    const int event = panel_log.poll();
+    if (event) {
+        panel_open = event > 0;
+        log(0, "NeuralHub's in-game panel %s", panel_open ? "opened" : "closed");
+    }
+    HWND owner = panel_owner;
+    bool want = panel_open && !panel_failed && owner && IsWindow(owner) && IsWindowVisible(owner) && !IsIconic(owner);
+    if (want) {
+        HWND fg = GetForegroundWindow();
+        want = fg && (fg == owner || fg == hwnd || GetAncestor(fg, GA_ROOTOWNER) == owner);
+    }
+    if (!want) {
+        panelHide();
+        return;
+    }
+    const UINT w = static_cast<UINT>(nr_cfg.out_width), h = static_cast<UINT>(nr_cfg.out_height);
+    if (!panelResize(w, h, nr_cfg.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM)) {
+        panel_failed = true;
+        panelHide();
+        return;
+    }
+    if (nr_cfg.hdr && !panel_desc_ready && !cs_failed) {
+        // The frame in scRGB units through a compute pass; without it it is copied as it is
+        // (2.5 times darker).
+        if (!nr_panel.res && !makeTex(nr_panel, static_cast<int>(w), static_cast<int>(h), DXGI_FORMAT_R16G16B16A16_FLOAT, 8))
+            nr_panel = Tex();
+        if (nr_panel.res && createProxyPipeline()) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE base = cs_heap->GetCPUDescriptorHandleForHeapStart();
+            for (UINT i = 8; i < 11; i++) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+                d.Format = nr_out.format;
+                d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                d.Texture2D.MipLevels = 1;
+                D3D12_CPU_DESCRIPTOR_HANDLE at = base;
+                at.ptr += static_cast<SIZE_T>(i) * cs_increment;
+                device->CreateShaderResourceView(nr_out.res.Get(), &d, at);
+            }
+            D3D12_UNORDERED_ACCESS_VIEW_DESC u = {};
+            u.Format = nr_panel.format;
+            u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE at = base;
+            at.ptr += static_cast<SIZE_T>(11) * cs_increment;
+            device->CreateUnorderedAccessView(nr_panel.res.Get(), nullptr, &u, at);
+            panel_desc_ready = true;
+        }
+    }
+    if (!panel_styled) {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        panel_styled = true;
+    }
+    // Over the video: the frame's aspect fitted into chiaki's client area.
+    RECT client = {};
+    POINT origin = {};
+    if (!GetClientRect(owner, &client) || !ClientToScreen(owner, &origin) || client.right <= 0 || client.bottom <= 0) {
+        panelHide();
+        return;
+    }
+    const double scale = std::min(static_cast<double>(client.right) / w, static_cast<double>(client.bottom) / h);
+    const LONG pw = std::max<LONG>(1, static_cast<LONG>(w * scale + 0.5)),
+               ph = std::max<LONG>(1, static_cast<LONG>(h * scale + 0.5));
+    RECT r;
+    r.left = origin.x + (client.right - pw) / 2;
+    r.top = origin.y + (client.bottom - ph) / 2;
+    r.right = r.left + pw;
+    r.bottom = r.top + ph;
+    if (panel_shown && !EqualRect(&r, &panel_rect))
+        SetWindowPos(hwnd, HWND_TOPMOST, r.left, r.top, pw, ph, SWP_NOACTIVATE);
+    panel_rect = r;
+    panel_copy = true;
+}
+
+// In the evaluation's command list, after the output: the frame into the back buffer.
+void Dx12Fg::Impl::panelRecordCopy()
+{
+    if (!panel_copy)
+        return;
+    ComPtr<IDXGISwapChain3> sc3;
+    ComPtr<ID3D12Resource> back;
+    if (FAILED(swapchain.As(&sc3)) || FAILED(sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&back)))) {
+        panel_copy = false;
+        return;
+    }
+    Tex *src = &nr_out;
+    if (nr_cfg.hdr && panel_desc_ready && cs_scrgb) {
+        barrier(nr_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        barrier(nr_panel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = { cs_heap.Get() };
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRootSignature(cs_root.Get());
+        list->SetPipelineState(cs_scrgb.Get());
+        D3D12_GPU_DESCRIPTOR_HANDLE table = cs_heap->GetGPUDescriptorHandleForHeapStart();
+        table.ptr += static_cast<UINT64>(8) * cs_increment;
+        list->SetComputeRootDescriptorTable(0, table);
+        const UINT w = static_cast<UINT>(nr_cfg.out_width), h = static_cast<UINT>(nr_cfg.out_height);
+        const float to_scrgb = 203.0f / 80.0f;
+        UINT constants[4] = { w, h, 0, 0 };
+        std::memcpy(&constants[2], &to_scrgb, sizeof(to_scrgb));
+        list->SetComputeRoot32BitConstants(1, 4, constants, 0);
+        list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        src = &nr_panel;
+    }
+    barrier(*src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = back.Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b);
+    list->CopyResource(back.Get(), src->res.Get());
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    list->ResourceBarrier(1, &b);
+}
+
+// After the evaluation (and after the signal Vulkan waits for): NeuralHub sees the swapchain
+// presented, polls its keys and draws its panel; the window appears once it has a frame.
+void Dx12Fg::Impl::panelPresent()
+{
+    if (!panelRoute())
+        return;
+    const HRESULT hr = swapchain->Present(0, 0);
+    if (FAILED(hr) && !panel_present_warned) {
+        panel_present_warned = true;
+        log(1, "presenting the swapchain NeuralHub's panel is drawn on failed (0x%08x)", static_cast<unsigned>(hr));
+    }
+    if (panel_copy && !panel_shown) {
+        SetWindowPos(hwnd, HWND_TOPMOST, panel_rect.left, panel_rect.top, panel_rect.right - panel_rect.left,
+                     panel_rect.bottom - panel_rect.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        panel_shown = true;
+    }
 }
 
 bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
@@ -1518,6 +1813,10 @@ void Dx12Fg::Impl::destroyNr()
     nr_cfg = NrConfig();
     nr_sized = false;
     nr_query_done = 0;
+    panelHide();
+    nr_panel = Tex();
+    panel_desc_ready = false;
+    panel_failed = false;
 }
 
 Dx12Fg::Dx12Fg(const VulkanDevice &vk, LogFn log, void *user)
@@ -1840,6 +2139,11 @@ bool Dx12Fg::nrEnsure(const NrConfig &config)
     d.nr_query_done = 0;
     d.nr_gpu_ms = 0.0;
     d.nr_sized = true;
+    // NeuralHub's panel window: the swapchain takes the output's size and format now, while
+    // the panel is closed, so opening it needs no resize.
+    if (!d.gate_ready && d.swapchain
+        && !d.panelResize(static_cast<UINT>(ow), static_cast<UINT>(oh), color))
+        d.panel_failed = true;
     std::string route;
     if (d.gate_ready) {
         route = std::string("NGX feature 18 ") + (config.model == 1 ? "HT" : "CC");
@@ -1886,6 +2190,9 @@ void Dx12Fg::recordNrOutput(VkCommandBuffer cmd, VkImage image)
 bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset)
 {
     Impl &d = *impl;
+    // Before the queue waits for Vulkan: it may resize the swapchain (waits for the queue).
+    d.stage = "NeuralHub's panel";
+    d.panelUpdate();
     d.stage = "queue wait";
     bool ok = d.nr_sized && d.nr_handle && SUCCEEDED(d.queue->Wait(d.shared_fence.Get(), wait_value));
     if (ok) {
@@ -1928,8 +2235,10 @@ bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset
                 d.list->ResolveQueryData(d.nr_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
                                          d.nr_query_readback.Get(), 0);
             }
-            if (ok)
+            if (ok) {
                 d.copyTexToBuffer(d.nr_out_buf.res.Get(), d.nr_out);
+                d.panelRecordCopy();
+            }
         }
         if (ok) {
             d.stage = "ExecuteCommandLists";
@@ -1944,7 +2253,29 @@ bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset
                 textures[k]->state = saved[k];
         }
     }
-    return d.signalShared(signal_value) && ok;
+    const bool signalled = d.signalShared(signal_value);
+    if (ok) {
+        d.stage = "Present (NeuralHub's panel)";
+        d.panelPresent();
+    } else {
+        d.panel_copy = false;
+    }
+    return signalled && ok;
+}
+
+void Dx12Fg::nrSetPanelWindow(void *window)
+{
+    impl->panel_owner = static_cast<HWND>(window);
+}
+
+bool Dx12Fg::nrProviderPanel() const
+{
+    return !impl->gate_ready && nrAvailable();
+}
+
+void Dx12Fg::nrHidePanel()
+{
+    impl->panelHide();
 }
 
 void Dx12Fg::markCrashed()

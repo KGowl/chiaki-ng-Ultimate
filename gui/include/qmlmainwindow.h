@@ -358,6 +358,8 @@ private:
     // stays on); nr_user_off_seen is the render thread's last view of it.
     QAtomicInteger<int> nr_user_off = 0;
     bool nr_user_off_seen = false;
+    // 1 while NeuralHub runs neural rendering: End is then its in-game panel's key.
+    QAtomicInteger<int> nr_provider_panel = 0;
     // Stream frames per game picture (2 = 30 fps game in a 60 fps stream,
     // repeats dropped before frame generation); set by presentFrame.
     RepeatCadenceDetector repeat_detector;

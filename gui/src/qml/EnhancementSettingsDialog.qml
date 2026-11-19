@@ -107,7 +107,7 @@ DialogView {
                 currentIndex: Chiaki.settings.neuralRender ? 1 : 0
                 onActivated: index => Chiaki.settings.neuralRender = index === 1
                 ToolTip.visible: hovered
-                ToolTip.text: qsTr("End switches DLSS 5 on and off while streaming.")
+                ToolTip.text: qsTr("While streaming, End opens NeuralHub's in-game panel (AMD) or switches DLSS 5 on and off (NVIDIA).")
             }
 
             Label {
