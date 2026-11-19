@@ -192,7 +192,7 @@ struct Rig
     }
 
     // ---- neural rendering test: HDR source and readback at any size ----
-    pl_tex source_hdr = nullptr; // rgba16f, linear light
+    pl_tex source_hdr = nullptr; // rgba16hf, linear light
     pl_tex float_target = nullptr;
     float hdr_peak = 8.0f;
 
@@ -205,7 +205,8 @@ struct Rig
         struct pl_tex_params p = {};
         p.w = w;
         p.h = h;
-        p.format = pl_find_named_fmt(gpu, "rgba16f");
+        // "rgba16hf" takes half floats from the host; "rgba16f" is the same texture with a float32 upload format.
+        p.format = pl_find_named_fmt(gpu, "rgba16hf");
         p.sampleable = true;
         p.host_writable = true;
         source_hdr = p.format ? pl_tex_create(gpu, &p) : nullptr;
