@@ -1103,7 +1103,7 @@ DialogView {
                         currentIndex: Chiaki.settings.neuralRender ? 1 : 0
                         onActivated: index => Chiaki.settings.neuralRender = index === 1
                         ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Runs DLSS 5 neural rendering on each stream frame, before frame generation (Vulkan renderer, SDR and HDR).\nNVIDIA (RTX, driver 616.56+): needs NVIDIA's nvngx_dlssnr.dll next to chiaki.exe (not bundled); about 2-3 ms per frame at 1080p on an RTX 5090.\nAMD: needs NeuralHub's dxgi.dll and neuralhub.ini next to chiaki.exe; about 5-10 ms per frame at 1080p.\nThe model warms up for a few seconds when the stream starts.\nEnd switches it on and off while streaming. With NeuralHub, add \"[Overlay]\" and \"ToggleKey=ScrollLock\" to neuralhub.ini: NeuralHub's own End panel cannot be seen in chiaki-ng and holds the arrow, Enter and Backspace keys while it is open.")
+                        ToolTip.text: qsTr("Runs DLSS 5 neural rendering on each stream frame, before frame generation (Vulkan renderer, SDR and HDR).\nNVIDIA (RTX, driver 616.56+): needs NVIDIA's nvngx_dlssnr.dll next to chiaki.exe (not bundled); about 2-3 ms per frame at 1080p on an RTX 5090.\nAMD: needs NeuralHub's dxgi.dll and neuralhub.ini next to chiaki.exe; about 5-10 ms per frame at 1080p.\nThe model warms up for a few seconds when the stream starts.\nEnd switches it on and off while streaming (NeuralHub's own in-game panel is not shown in chiaki-ng; change its settings in neuralhub.ini).")
                     }
 
                     Label {
