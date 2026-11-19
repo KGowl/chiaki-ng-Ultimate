@@ -519,6 +519,11 @@ void NeuralRender::destroy()
     impl->shutdown();
 }
 
+void NeuralRender::resetHistory()
+{
+    impl->reset_pending = true;
+}
+
 bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, const Options &options,
                            struct pl_frame *out_frame, uint64_t *out_signature)
 {
@@ -656,6 +661,7 @@ bool NeuralRender::failed() const { return true; }
 bool NeuralRender::canUpscale() const { return false; }
 float NeuralRender::gpuTimeMs() const { return 0.0f; }
 void NeuralRender::destroy() {}
+void NeuralRender::resetHistory() {}
 bool NeuralRender::process(const struct pl_frame *, uint64_t, const Options &, struct pl_frame *, uint64_t *)
 {
     return false;

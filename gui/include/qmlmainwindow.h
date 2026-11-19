@@ -187,6 +187,8 @@ signals:
     void hasVideoChanged();
     void droppedFramesChanged();
     void videoEnhancementStatusChanged();
+    // The End key switched DLSS neural rendering on or off for this run.
+    void neuralRenderToggled(bool enabled);
     void fpsChanged();
     void keepVideoChanged();
     void videoModeChanged();
@@ -352,6 +354,10 @@ private:
     QAtomicInteger<int> nr_status_gpu_cms = 0;
     QAtomicInteger<int> nr_status_out_h = 0; // output height when neural rendering upscales, else 0
     QAtomicInteger<int> nr_status_hdr = 0;
+    // 1 while the End key has switched neural rendering off (this run only, the setting
+    // stays on); nr_user_off_seen is the render thread's last view of it.
+    QAtomicInteger<int> nr_user_off = 0;
+    bool nr_user_off_seen = false;
     // Stream frames per game picture (2 = 30 fps game in a 60 fps stream,
     // repeats dropped before frame generation); set by presentFrame.
     RepeatCadenceDetector repeat_detector;

@@ -1103,7 +1103,7 @@ DialogView {
                         currentIndex: Chiaki.settings.neuralRender ? 1 : 0
                         onActivated: index => Chiaki.settings.neuralRender = index === 1
                         ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Runs DLSS 5 neural rendering on each stream frame, before frame generation (Vulkan renderer, SDR and HDR).\nNVIDIA (RTX, driver 616.56+): needs NVIDIA's nvngx_dlssnr.dll next to chiaki.exe (not bundled); about 2-3 ms per frame at 1080p on an RTX 5090.\nAMD: needs NeuralHub's dxgi.dll and neuralhub.ini next to chiaki.exe; about 5-10 ms per frame at 1080p.\nThe model warms up for a few seconds when the stream starts.")
+                        ToolTip.text: qsTr("Runs DLSS 5 neural rendering on each stream frame, before frame generation (Vulkan renderer, SDR and HDR).\nNVIDIA (RTX, driver 616.56+): needs NVIDIA's nvngx_dlssnr.dll next to chiaki.exe (not bundled); about 2-3 ms per frame at 1080p on an RTX 5090.\nAMD: needs NeuralHub's dxgi.dll and neuralhub.ini next to chiaki.exe; about 5-10 ms per frame at 1080p.\nThe model warms up for a few seconds when the stream starts.\nEnd switches it on and off while streaming. With NeuralHub, add \"[Overlay]\" and \"ToggleKey=ScrollLock\" to neuralhub.ini: NeuralHub's own End panel cannot be seen in chiaki-ng and holds the arrow, Enter and Backspace keys while it is open.")
                     }
 
                     Label {
@@ -1126,7 +1126,7 @@ DialogView {
                         currentIndex: Chiaki.settings.neuralRenderUpscale ? 1 : 0
                         onActivated: index => Chiaki.settings.neuralRenderUpscale = index === 1
                         ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Upscales after neural rendering in 1.5x or 2x steps toward the window size (1080p on a 4K screen: 2x, DLSS Performance). RTX VSR is skipped while it upscales.\nNVIDIA: DLSS Super Resolution, needs nvngx_dlss.dll next to chiaki.exe (bundled).\nAMD: NeuralHub's upscaler (FSR 4 by the driver).")
+                        ToolTip.text: qsTr("Upscales after neural rendering in 1.5x or 2x steps toward the window size (1080p on a 4K screen: 2x, DLSS Performance). RTX VSR is skipped while it upscales.\nNVIDIA: DLSS Super Resolution, needs nvngx_dlss.dll next to chiaki.exe (bundled).\nAMD: NeuralHub's upscaler, FSR 4 by the driver by default; \"[Upscaling]\" \"Provider=DLSS-SR\" in neuralhub.ini runs NeuralHub's DLSS Super Resolution port instead (sharper, about 3 ms more on an RX 9070 XT).")
                     }
 
                     Label {
@@ -1145,11 +1145,11 @@ DialogView {
                         Layout.preferredWidth: 400
                         visible: Chiaki.settings.neuralRenderSupported
                         enabled: Chiaki.settings.neuralRender
-                        model: [qsTr("CC (as NeuralHub's default)"), qsTr("HT (lighter)")]
+                        model: [qsTr("CC (as NeuralHub's default)"), qsTr("HT (lighter on NVIDIA)")]
                         currentIndex: Chiaki.settings.neuralRenderModel
                         onActivated: index => Chiaki.settings.neuralRenderModel = index
                         ToolTip.visible: hovered
-                        ToolTip.text: qsTr("The DLSS 5 model of nvngx_dlssnr.dll on NVIDIA. CC (CC_SMALL_FP8): about 3 ms at 1080p on an RTX 5090, the model NeuralHub uses by default. HT: about 1.8 ms.\nOn AMD the model is chosen in neuralhub.ini.")
+                        ToolTip.text: qsTr("The DLSS 5 model of nvngx_dlssnr.dll on NVIDIA. CC (CC_SMALL_FP8): about 3 ms at 1080p on an RTX 5090, the model NeuralHub uses by default. HT: about 1.8 ms.\nOn AMD this setting is not used: the model is chosen in neuralhub.ini (\"[DLSS-NR]\" \"Model=CC\" or \"Model=HT\"), and there HT is the heavier one (about 8 ms against 5 ms at 1080p on an RX 9070 XT).")
                     }
 
                     Label {

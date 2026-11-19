@@ -5526,7 +5526,10 @@ renderer_backend_ready:
         }
         case 2: parts << tr("DLSS NR: idle"); break;
         case 3: parts << tr("DLSS NR: unavailable (see log)"); break;
-        default: break;
+        default:
+            if (nr_user_off.loadRelaxed() && this->settings && this->settings->GetNeuralRender())
+                parts << tr("DLSS NR: off (End)");
+            break;
         }
         const int vsr_quality = vsr_status_quality.loadRelaxed();
         if (RtxVsr::isValidQuality(vsr_quality) && rtx_vsr) {
@@ -7876,7 +7879,12 @@ void QmlMainWindow::render()
     bool nr_upscaled = false;
     int nr_out_h = 0;
     bool nr_hdr = false;
-    const bool nr_wanted = neural_render && has_settings && settings->GetNeuralRender() && stream_active;
+    const bool nr_user_off_now = nr_user_off.loadRelaxed() != 0;
+    const bool nr_wanted = neural_render && has_settings && settings->GetNeuralRender() && stream_active && !nr_user_off_now;
+    // Back on after the End key: start a fresh history instead of blending in old frames.
+    if (nr_wanted && nr_user_off_seen)
+        neural_render->resetHistory();
+    nr_user_off_seen = nr_user_off_now;
     if (!fg_override && nr_wanted && neural_render->ensureInitialized(placebo_vulkan)) {
         // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
         // the largest step DLSS Performance covers well), or the source size.
@@ -8172,6 +8180,16 @@ bool QmlMainWindow::handleShortcut(QKeyEvent *event)
             else
                 normalTime();
             return true;
+        case Qt::Key_End:
+            // DLSS 5 on/off while streaming, on the key NeuralHub uses in games.
+            if (session && settings && settings->GetNeuralRender()) {
+                const bool enabled = nr_user_off.fetchAndXorRelaxed(1) != 0;
+                qCInfo(chiakiGui) << "DLSS neural rendering switched" << (enabled ? "on" : "off") << "with the End key";
+                emit neuralRenderToggled(enabled);
+                scheduleUpdate(true, UpdateRequestReason::Unknown);
+                return true;
+            }
+            break;
         default:
             break;
         }

@@ -310,6 +310,40 @@ Item {
         }
     }
 
+    // Shown for a moment when the End key switches DLSS 5 neural rendering on or off.
+    Label {
+        id: neuralRenderToast
+        anchors {
+            horizontalCenter: parent.horizontalCenter
+            top: parent.top
+            topMargin: 40
+        }
+        padding: 12
+        font.pixelSize: 22
+        font.bold: true
+        color: "white"
+        background: Rectangle {
+            color: "#c0000000"
+            radius: 8
+        }
+        opacity: neuralRenderToastTimer.running ? 1.0 : 0.0
+        visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: 250 } }
+
+        Timer {
+            id: neuralRenderToastTimer
+            interval: 1500
+        }
+
+        Connections {
+            target: Chiaki.window
+            function onNeuralRenderToggled(enabled) {
+                neuralRenderToast.text = enabled ? qsTr("DLSS 5: on") : qsTr("DLSS 5: off");
+                neuralRenderToastTimer.restart();
+            }
+        }
+    }
+
     Component {
         id: streamStatsContent
         Item {

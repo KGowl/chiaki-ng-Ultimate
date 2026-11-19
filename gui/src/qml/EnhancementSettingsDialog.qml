@@ -106,6 +106,8 @@ DialogView {
                 model: [qsTr("Off"), qsTr("DLSS 5 Neural Rendering via D3D12 (NVIDIA: nvngx_dlssnr.dll, AMD: NeuralHub's stub)")]
                 currentIndex: Chiaki.settings.neuralRender ? 1 : 0
                 onActivated: index => Chiaki.settings.neuralRender = index === 1
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("End switches DLSS 5 on and off while streaming.")
             }
 
             Label {
@@ -145,7 +147,7 @@ DialogView {
                 Layout.preferredWidth: 600
                 visible: Chiaki.settings.neuralRenderSupported
                 enabled: Chiaki.settings.neuralRender
-                model: [qsTr("CC (as NeuralHub's default)"), qsTr("HT (lighter, about 2 ms at 1080p)")]
+                model: [qsTr("CC (as NeuralHub's default)"), qsTr("HT (lighter on NVIDIA, about 2 ms at 1080p)")]
                 currentIndex: Chiaki.settings.neuralRenderModel
                 onActivated: index => Chiaki.settings.neuralRenderModel = index
             }

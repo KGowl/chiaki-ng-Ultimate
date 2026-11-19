@@ -49,6 +49,10 @@ public:
     // pl_vulkan device is destroyed.
     void destroy();
 
+    // The next processed frame starts a new temporal history (after neural rendering was
+    // paused, so the model does not blend in frames from before the pause).
+    void resetHistory();
+
     struct Options
     {
         // Output size; 0 (or not larger than the frame) keeps the frame's own size.
