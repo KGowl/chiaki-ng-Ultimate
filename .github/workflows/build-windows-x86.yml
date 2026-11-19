@@ -240,10 +240,18 @@ jobs:
         run: |
           cmake --build build --config Release --clean-first --target chiaki
 
+      # Console test of the frame generation backends (gui/tools/fgdx12test.cpp); a failure here
+      # must not stop the application package.
+      - name: Build the frame generation test tool
+        continue-on-error: true
+        run: |
+          cmake --build build --config Release --target chiaki-fgdx12test
+
       - name: Prepare Qt deployment package
         run: |
           mkdir chiaki-ng-Win
           cp build\gui\chiaki.exe chiaki-ng-Win
+          if (Test-Path build\gui\chiaki-fgdx12test.exe) { cp build\gui\chiaki-fgdx12test.exe chiaki-ng-Win }
           cp build\third-party\cpp-steam-tools\cpp-steam-tools.dll chiaki-ng-Win
           cp scripts\qtwebengine_import.qml gui\src\qml\
           # Ship every runtime DLL vcpkg built; names change between vcpkg versions (e.g. lcms2).
