@@ -8,7 +8,7 @@ The `d3d12-bridge` branch adds **DLSS 5 neural rendering** and **DLSS Frame Gene
 
 Everything else (setup, registration, controllers, Steam Deck usage) works as in upstream chiaki-ng – see its [documentation site](https://streetpea.github.io/chiaki-ng/).
 
-## Latest release: [1.10.0-dlss5.5](https://github.com/windystrife/chiaki-ng-d3d12/releases/tag/1.10.0-dlss5.5) (20 November 2026)
+## Latest release: [1.10.0-dlss5.6](https://github.com/windystrife/chiaki-ng-d3d12/releases/tag/1.10.0-dlss5.6) (20 November 2026)
 
 DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Radeon** (Windows):
 
@@ -20,16 +20,17 @@ DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Rade
 
 <sub>GTA VI © Rockstar Games. Screenshots from real PS5 Remote Play streams, for illustration.</sub>
 
+- **New in 5.6: DLSS Frame Generation next to DLSS 5 on NVIDIA** goes straight to the pipelined D3D12 path (NGX refuses Vulkan DLSS FG once DLSS 5 has its D3D12 side up), and **one setup kit for NVIDIA and AMD** that also finds and copies your own `nvngx_dlssnr.dll`.
 - **4x frame generation keeps up with DLSS 5**: the next stream frame's DLSS work runs while the generated frames are shown. RX 9070 XT, GTA VI at 30 fps, DLSS 5 to 2160p, 4x on a 150 Hz screen: **118 fps** (1.10.0-dlss5.4: about 90).
 - **RTX settings panel** while streaming, on every GPU: DLSS 5 on/off, upscaling, sharpness, frame generation Off / 2x / 3x / 4x and the stats overlay; on NVIDIA also the DLSS 5 model, 1–3 passes and their controls.
 - **Stats overlay** names the GPU and says when the display holds frame generation back (e.g. 4x needs 120 Hz for a 30 fps stream).
 
 | You have | Get | Then |
 |---|---|---|
-| AMD Radeon | [`chiaki-dlss5-amd-setup-full.zip`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.5/chiaki-dlss5-amd-setup-full.zip) | Install NeuralHub 0.9.0 yourself and import the DLSS DLLs, unzip the kit, run `cai-dat.cmd` |
-| NVIDIA RTX | [`chiaki-ng-1.10.0-dlss5.5-win_x64-setup.exe`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.5/chiaki-ng-1.10.0-dlss5.5-win_x64-setup.exe) or the portable zip | Put NVIDIA's `nvngx_dlssnr.dll` (DLSS NR 310.9.16, not bundled) next to `chiaki.exe` |
+| AMD Radeon | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-dlss5-setup-full.zip) | Install NeuralHub 0.9.0 yourself and import the DLSS DLLs, unzip the kit, run `cai-dat.cmd` |
+| NVIDIA RTX | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-dlss5-setup-full.zip), or [`setup.exe`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-ng-1.10.0-dlss5.6-win_x64-setup.exe) / the portable zip | Have your own `nvngx_dlssnr.dll` (DLSS NR 310.9.16, not bundled) on the PC, unzip the kit and run `cai-dat.cmd`: it finds the file and copies it next to `chiaki.exe` (by hand: copy it there yourself) |
 
-Setup guides: [English (PDF)](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.5/chiaki-ng-dlss5-guide-en.pdf), [Tiếng Việt (PDF)](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.5/chiaki-ng-dlss5-huong-dan.pdf). Full notes on the [release page](https://github.com/windystrife/chiaki-ng-d3d12/releases/tag/1.10.0-dlss5.5).
+Setup guides: [English (PDF)](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-ng-dlss5-guide-en.pdf), [Tiếng Việt (PDF)](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-ng-dlss5-huong-dan.pdf). Full notes on the [release page](https://github.com/windystrife/chiaki-ng-d3d12/releases/tag/1.10.0-dlss5.6).
 
 ## Downloads
 
@@ -41,12 +42,12 @@ Releases and pre-releases are published on the [Releases](../../releases) page (
 | `chiaki-ng-*-win_x64-portable.zip` | Windows x64 portable |
 | `chiaki-ng-*-linux_x86_64.AppImage` | Linux x86_64 (`chmod +x`, then run) |
 
-DLSS 5 builds from the `d3d12-bridge` branch use tags like `1.10.0-dlss5.5` and also ship:
+DLSS 5 builds from the `d3d12-bridge` branch use tags like `1.10.0-dlss5.6` and also ship:
 
 | File | Contents |
 |---|---|
-| `chiaki-dlss5-amd-setup-full.zip` | AMD setup kit with the portable build inside (no GitHub access or internet needed) |
-| `chiaki-dlss5-amd-setup.zip` | AMD setup kit that downloads the portable build from GitHub |
+| `chiaki-dlss5-setup-full.zip` | Setup kit for NVIDIA and AMD with the portable build inside (no GitHub access or internet needed); 5.5 had the AMD-only `chiaki-dlss5-amd-setup-full.zip` |
+| `chiaki-dlss5-setup.zip` | The same setup kit, downloading the portable build from GitHub |
 | `chiaki-ng-dlss5-guide-en.pdf`, `chiaki-ng-dlss5-huong-dan.pdf` | Setup guide for AMD and NVIDIA (English, Vietnamese) |
 
 Test builds of every commit are available as artifacts of the *Build chiaki-ng Windows x86_64 (VC)* and *Build chiaki-ng Appimage x86_64* workflows in the Actions tab.
@@ -80,16 +81,16 @@ Notes:
 | Feature | GPU | Where |
 |---|---|---|
 | **DLSS 5 neural rendering** – NVIDIA's neural rendering model on each stream frame, at the stream size or upscaled 1.5x / 2x toward the window by DLSS Super Resolution (1080p → 4K); SDR and HDR | NVIDIA RTX (`nvngx_dlssnr.dll`, not bundled); AMD Radeon through NeuralHub (not bundled) | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
-| **DLSS Frame Generation via D3D12** – DLSS FG through the same bridge, 2x–4x; the next stream frame's DLSS work runs on D3D12 while the frames generated from the last one are presented | AMD through NeuralHub; NVIDIA when Vulkan DLSS FG is unavailable | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
+| **DLSS Frame Generation via D3D12** – DLSS FG through the same bridge, 2x–4x; the next stream frame's DLSS work runs on D3D12 while the frames generated from the last one are presented | AMD through NeuralHub; NVIDIA next to DLSS 5 (NGX refuses Vulkan DLSS FG once its D3D12 side is up) or when Vulkan DLSS FG fails | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
 | **RTX settings panel** – in-stream panel with *RTX* and *Eye Candy* tabs (DLSS 5, upscaling, sharpness, frame generation multiplier, stats overlay, RTX VSR, clean-up, border fill); a button at the top right when the mouse moves, End on NVIDIA | all | while streaming |
 | **DLSS 5 controls (NVIDIA)** – model CC / HT, 1–3 passes, each with its own preset and controls, applied at once | NVIDIA RTX | RTX settings panel (End) |
 
 Notes:
 
 - How it works: the frames are rendered on libplacebo's Vulkan device and shared with a D3D12 device (shared buffers, and a D3D12 fence imported as a Vulkan timeline semaphore), where NGX runs DLSS 5, DLSS Super Resolution and DLSS FG. Vulkan only queues a copy back once the D3D12 side is done, so the presented frames never wait for it. `CHIAKI_FG_PIPELINE=0` turns that off for comparisons.
-- **NVIDIA**: put NVIDIA's `nvngx_dlssnr.dll` (DLSS NR 310.9.16) next to `chiaki.exe`. It is not in the public DLSS SDK and is not bundled.
-- **AMD**: install NeuralHub 0.9.0 yourself and import the DLSS DLLs in it, then run the AMD setup kit (`cai-dat.cmd`), which copies NeuralHub's loader from your own install next to `chiaki.exe` and writes a tested `neuralhub.ini`. NeuralHub's licence does not allow redistribution, so it is not bundled.
-- Measured on GTA VI (PS5, 1080p stream): RX 9070 XT, DLSS 5 + DLSS SR to 2160p about 7–9 ms, 4x of a 30 fps stream shows 118 fps on a 150 Hz screen; RTX 5090, DLSS 5 to 2160p 2.8 ms.
+- **NVIDIA**: put NVIDIA's `nvngx_dlssnr.dll` (DLSS NR 310.9.16) next to `chiaki.exe`, or run the setup kit (`cai-dat.cmd`), which finds your copy on the PC (next to the kit, NeuralHub's store, Downloads, the desktop, older chiaki-ng folders) and copies it there. It is not in the public DLSS SDK and is not bundled; the kit never downloads it.
+- **AMD**: install NeuralHub 0.9.0 yourself and import the DLSS DLLs in it, then run the setup kit (`cai-dat.cmd`), which copies NeuralHub's loader from your own install next to `chiaki.exe` and writes a tested `neuralhub.ini`. NeuralHub's licence does not allow redistribution, so it is not bundled.
+- Measured on GTA VI (PS5, 1080p stream): RX 9070 XT, DLSS 5 + DLSS SR to 2160p about 7–9 ms, 4x of a 30 fps stream shows 118 fps on a 150 Hz screen; RTX 5090, DLSS 5 to 2160p 2.8 ms, and with DLSS FG through D3D12 next to it (5.6) 2x of a 30 fps stream shows 61 fps on a 60 Hz screen.
 - 4x needs a display refresh of at least 4x the stream's fps; the stats overlay says when the display holds it back (e.g. `DLSS FG D3D12 2x (4x needs 240 Hz, display 150 Hz)`). The guides cover setup, settings, limits and troubleshooting.
 
 ### In-stream controls and stats
