@@ -40,6 +40,9 @@ public:
 
     static bool compiledIn();
     static bool backendCompiledIn(Backend backend);
+    // NGX's D3D12 side is up in this process (DLSS 5 or DLSS FG through the D3D12 bridge). NGX
+    // then refuses DLSS Frame Generation through Vulkan, so Backend::Dlss has to run as Dlss12.
+    static bool d3d12NgxUp();
     static const char *backendName(Backend backend);
 
     explicit FrameGen(pl_log log);

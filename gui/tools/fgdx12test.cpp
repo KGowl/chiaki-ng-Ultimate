@@ -26,6 +26,7 @@
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
+#include <nvsdk_ngx_vk.h>
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -90,7 +91,17 @@ struct Rig
         log_params.log_cb = placeboLog;
         log_params.log_level = PL_LOG_WARN;
         log = pl_log_create(PL_API_VER, &log_params);
+        // NGX's Vulkan extensions, optional as in chiaki-ng (RtxVsr::appendRequiredExtensions):
+        // without them DLSS Frame Generation through Vulkan (--backend 1) fails with PlatformError.
+        unsigned int ngx_inst_count = 0, ngx_dev_count = 0;
+        const char **ngx_inst = nullptr, **ngx_dev = nullptr;
+        if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_RequiredExtensions(&ngx_inst_count, &ngx_inst, &ngx_dev_count, &ngx_dev))) {
+            ngx_inst_count = ngx_dev_count = 0;
+            ngx_inst = ngx_dev = nullptr;
+        }
         struct pl_vk_inst_params inst_params = {};
+        inst_params.opt_extensions = ngx_inst;
+        inst_params.num_opt_extensions = static_cast<int>(ngx_inst_count);
         inst = pl_vk_inst_create(log, &inst_params);
         if (!inst)
             return false;
@@ -99,6 +110,8 @@ struct Rig
             .get_proc_addr = inst->get_proc_addr,
             .allow_software = false,
             PL_VULKAN_DEFAULTS
+            .opt_extensions = ngx_dev,
+            .num_opt_extensions = static_cast<int>(ngx_dev_count),
         };
         vk = pl_vulkan_create(log, &vulkan_params);
         if (!vk)

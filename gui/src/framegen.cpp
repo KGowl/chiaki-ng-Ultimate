@@ -1228,6 +1228,15 @@ bool FrameGen::backendCompiledIn(Backend backend)
     }
 }
 
+bool FrameGen::d3d12NgxUp()
+{
+#if defined(CHIAKI_HAVE_DX12FG)
+    return Dx12Fg::ngxUpInProcess();
+#else
+    return false;
+#endif
+}
+
 const char *FrameGen::backendName(Backend backend)
 {
     switch (backend) {
@@ -2163,6 +2172,7 @@ struct FrameGen::Impl {};
 
 bool FrameGen::compiledIn() { return false; }
 bool FrameGen::backendCompiledIn(Backend) { return false; }
+bool FrameGen::d3d12NgxUp() { return false; }
 const char *FrameGen::backendName(Backend) { return "None"; }
 FrameGen::FrameGen(pl_log) {}
 FrameGen::~FrameGen() = default;

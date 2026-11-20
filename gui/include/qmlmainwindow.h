@@ -416,8 +416,9 @@ private:
     QString fg_crash_guard_notice;
     // Why frame generation is skipped, logged once per stream (0 = not logged).
     int fg_skip_logged = 0;
-    // "DLSS Frame Generation" served through the D3D12 bridge instead of Vulkan NGX (logged once).
-    bool fg_dlss12_route_logged = false;
+    // "DLSS Frame Generation" served through the D3D12 bridge instead of Vulkan NGX: why, logged
+    // once per reason (0 = not logged, 1 = not NVIDIA, 2 = beside DLSS 5, 3 = Vulkan NGX failed).
+    int fg_dlss12_route_logged = 0;
     QAtomicInteger<int> enhancement_log_reset = 0;
     bool fg_refresh_limited = false;
     QString video_enhancement_status;
