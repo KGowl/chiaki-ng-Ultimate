@@ -8088,7 +8088,10 @@ void QmlMainWindow::render()
         fg_refresh_limited = multiplier < 2;
         // When the display holds back the multiplier asked for, the status says what it would take.
         // Counted per source picture like the status's own number: 4x of a 30 fps stream needs 120 Hz.
-        const int fg_requested = settings->GetFrameGenMultiplier() * cadence;
+        // Never more than the backend can make (4 until it has started), so a half-rate source with 4x
+        // at 150 Hz, already at the backend's 4 per picture, gets no note.
+        const int fg_max_known = frame_gen && frame_gen->maxMultiplier() > 1 ? frame_gen->maxMultiplier() : 4;
+        const int fg_requested = qMin(settings->GetFrameGenMultiplier() * cadence, fg_max_known);
         const bool fg_capped = refresh_cap < fg_requested && source_interval_s > 0.0;
         fg_status_requested.storeRelaxed(fg_capped ? fg_requested : 0);
         fg_status_needed_hz.storeRelaxed(fg_capped ? static_cast<int>(std::lround(fg_requested / source_interval_s)) : 0);
