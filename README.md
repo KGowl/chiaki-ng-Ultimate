@@ -8,7 +8,7 @@ The `d3d12-bridge` branch adds **DLSS 5 neural rendering** and **DLSS Frame Gene
 
 Everything else (setup, registration, controllers, Steam Deck usage) works as in upstream chiaki-ng – see its [documentation site](https://streetpea.github.io/chiaki-ng/).
 
-## Latest release: [1.10.0-dlss5.6](https://github.com/windystrife/chiaki-ng-d3d12/releases/tag/1.10.0-dlss5.6) (20 November 2026)
+## Latest release: [1.10.0-dlss5.6](https://github.com/windystrife/chiaki-ng-Ultimate/releases/tag/1.10.0-dlss5.6) (20 November 2026)
 
 DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Radeon** (Windows):
 
@@ -27,10 +27,10 @@ DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Rade
 
 | You have | Get | Then |
 |---|---|---|
-| AMD Radeon | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-dlss5-setup-full.zip) | Unzip the kit and run `setup.cmd`: it installs NeuralHub, imports the DLSS DLLs into it and sets up chiaki-ng |
-| NVIDIA RTX | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-dlss5-setup-full.zip), or [`setup.exe`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-ng-1.10.0-dlss5.6-win_x64-setup.exe) / the portable zip | Unzip the kit and run `setup.cmd`: it finds `nvngx_dlssnr.dll` (DLSS NR 310.9.16, not bundled) on the PC or downloads it, and copies it next to `chiaki.exe` (by hand: copy it there yourself) |
+| AMD Radeon | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-dlss5-setup-full.zip) | Unzip the kit and run `setup.cmd`: it installs NeuralHub, imports the DLSS DLLs into it and sets up chiaki-ng |
+| NVIDIA RTX | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-dlss5-setup-full.zip), or [`setup.exe`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-ng-1.10.0-dlss5.6-win_x64-setup.exe) / the portable zip | Unzip the kit and run `setup.cmd`: it finds `nvngx_dlssnr.dll` (DLSS NR 310.9.16, not bundled) on the PC or downloads it, and copies it next to `chiaki.exe` (by hand: copy it there yourself) |
 
-Setup guides: [English (PDF)](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-ng-dlss5-guide-en.pdf), [Tiếng Việt (PDF)](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.6/chiaki-ng-dlss5-huong-dan.pdf). Full notes on the [release page](https://github.com/windystrife/chiaki-ng-d3d12/releases/tag/1.10.0-dlss5.6).
+Setup guides: [English (PDF)](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-ng-dlss5-guide-en.pdf), [Tiếng Việt (PDF)](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-ng-dlss5-huong-dan.pdf). Full notes on the [release page](https://github.com/windystrife/chiaki-ng-Ultimate/releases/tag/1.10.0-dlss5.6).
 
 ## Downloads
 
