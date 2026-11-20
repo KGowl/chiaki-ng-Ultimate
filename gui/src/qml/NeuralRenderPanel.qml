@@ -5,34 +5,54 @@ import QtQuick.Controls.Material
 
 import org.streetpea.chiaking
 
-// chiaki-ng's DLSS 5 panel over the video on NVIDIA (End opens and closes it; on AMD End is
-// NeuralHub's own panel). Every change applies from the next frame: the controls go with each
-// evaluation of NVIDIA's feature 18, the model and the number of passes re-create it (a short
-// pause). Keys: Up/Down row, Left/Right change, PgUp/PgDn pass, Backspace default, End/Esc close;
-// the mouse works too. While it is open the keys stay away from the console.
+// chiaki-ng's "RTX settings" panel over the video, laid out like chiaki-ngx's: two tabs
+// (RTX settings, Eye Candy), a Close button, and one row per setting with a drop-down, a check
+// box or a slider. Opens with the RTX settings button at the top right of the stream (shown
+// while the mouse moves) on every GPU, and with End on NVIDIA (on AMD End is NeuralHub's own
+// panel, which holds DLSS 5's model and controls there). Every change applies from the next
+// frame: the DLSS 5 controls go with each evaluation of NVIDIA's feature 18, the model and the
+// number of passes re-create it (a short pause).
+// Keys: Up/Down row, Left/Right change, Tab switch tab, PgUp/PgDn pass, Backspace default,
+// End/Esc close. While it is open the keys and the mouse stay away from the console.
 Rectangle {
     id: panel
 
     signal closeRequested()
 
+    readonly property bool nvidia: Chiaki.window.nvidiaCard
     readonly property int passes: Chiaki.settings.neuralRenderPasses
     readonly property bool perPass: Chiaki.settings.neuralRenderPerPass && passes > 1
     // The pass whose controls the rows show (pass 1's are every pass's unless each has its own).
     property int editPass: 0
     readonly property int tuningPass: perPass ? Math.min(editPass, passes - 1) : 0
     property var tuning: Chiaki.settings.neuralRenderTuning(tuningPass)
+    property int tab: 0
     property int currentRow: 0
-    readonly property var rows: [rowEnable, rowModel, rowUpscale, rowPasses, rowPerPass, rowPass, rowPreset,
-        rowIntensity, rowStructure, rowTone, rowMask, rowSkin]
+    readonly property var rtxRows: [rowEnable, rowModel, rowPasses, rowPerPass, rowPass, rowPreset,
+        rowIntensity, rowStructure, rowTone, rowMask, rowSkin, rowUpscale, rowSharpness, rowStats, rowFrameGen]
+    readonly property var candyRows: [rowVsr, rowCleanup, rowStatsStyle, rowStatsPosition, rowBorder]
+    readonly property var rows: tab === 0 ? rtxRows : candyRows
     readonly property var presetNames: [qsTr("Default"), qsTr("Natural"), qsTr("Cinematic")]
+    // NGX VSR.QualityLevel per entry; Artifact Reduction / Streaming need nvngx_vsr.dll 1.8.2+.
+    readonly property var vsrModes: Chiaki.settings.rtxVsrExtendedModes ? [0, 1, 2, 3, 4, 8, 9, 10, 11, 21, 23] : [0, 1, 2, 3, 4]
+    readonly property var vsrNames: {
+        const all = [qsTr("Off"), qsTr("Upscale Low"), qsTr("Upscale Medium"), qsTr("Upscale High"), qsTr("Upscale Ultra"),
+            qsTr("Artifact Reduction Low"), qsTr("Artifact Reduction Medium"), qsTr("Artifact Reduction High"),
+            qsTr("Artifact Reduction Ultra"), qsTr("Streaming Medium"), qsTr("Streaming Ultra")];
+        return all.slice(0, vsrModes.length);
+    }
+    // The frame generation backend the Frame generation row turns on again (NVIDIA DLSS FG; on
+    // AMD it runs through the D3D12 bridge).
+    property int lastFrameGenBackend: 1
 
-    width: 600
-    implicitHeight: content.implicitHeight + 28
+    width: 620
+    implicitHeight: content.implicitHeight + 24
     radius: 10
-    color: "#e0121418"
-    border.color: "#50ffffff"
+    color: "#d8121418"
+    border.color: "#40ffffff"
     border.width: 1
     focus: visible
+    Material.theme: Material.Dark
 
     function refresh() {
         tuning = Chiaki.settings.neuralRenderTuning(tuningPass);
@@ -42,9 +62,10 @@ Rectangle {
         if (visible) {
             refresh();
             if (!navigable(rows[currentRow]))
-                currentRow = 0;
+                currentRow = firstRow();
         }
     }
+    onTabChanged: currentRow = firstRow()
 
     Connections {
         target: Chiaki.settings
@@ -60,6 +81,13 @@ Rectangle {
     }
     function navigable(row) {
         return row && row.visible && row.enabled;
+    }
+    function firstRow() {
+        for (let i = 0; i < rows.length; i++) {
+            if (navigable(rows[i]))
+                return i;
+        }
+        return 0;
     }
     function move(dir) {
         let i = currentRow;
@@ -83,6 +111,35 @@ Rectangle {
     function fmt(v) {
         return Number(v).toFixed(2);
     }
+    function nrEnabled() {
+        return Chiaki.settings.neuralRender && !Chiaki.window.neuralRenderPaused;
+    }
+    function setNrEnabled(on) {
+        if (on && !Chiaki.settings.neuralRender)
+            Chiaki.settings.neuralRender = true;
+        Chiaki.window.neuralRenderPaused = !on;
+    }
+    // Frame generation row: 0 Off, 1 2x, 2 3x, 3 4x.
+    function frameGenIndex() {
+        if (Chiaki.settings.frameGenBackend === 0)
+            return 0;
+        return Math.max(1, Math.min(3, Chiaki.settings.frameGenMultiplier - 1));
+    }
+    function setFrameGenIndex(i) {
+        i = Math.max(0, Math.min(3, i));
+        if (i === 0) {
+            if (Chiaki.settings.frameGenBackend !== 0)
+                lastFrameGenBackend = Chiaki.settings.frameGenBackend;
+            Chiaki.settings.frameGenBackend = 0;
+            return;
+        }
+        Chiaki.settings.frameGenMultiplier = i + 1;
+        if (Chiaki.settings.frameGenBackend === 0)
+            Chiaki.settings.frameGenBackend = lastFrameGenBackend;
+    }
+    function setStatsShown(on) {
+        Chiaki.settings.showStreamStats = on;
+    }
 
     Keys.onPressed: (event) => {
         const row = rows[currentRow];
@@ -98,6 +155,8 @@ Rectangle {
             break;
         case Qt.Key_Backspace:
         case Qt.Key_Delete: if (navigable(row)) row.reset(); break;
+        case Qt.Key_Tab:
+        case Qt.Key_Backtab: tab = tab === 0 ? 1 : 0; break;
         case Qt.Key_PageUp: stepPass(-1); break;
         case Qt.Key_PageDown: stepPass(1); break;
         case Qt.Key_Escape: panel.closeRequested(); break;
@@ -106,30 +165,40 @@ Rectangle {
         event.accepted = true;
     }
 
-    // One row: label, then a choice (< value >), a slider or a check box, and a reset button.
+    // One row: the label, then a drop-down, a slider (with its default button and value) or a
+    // check box with its text.
     component PanelRow: Item {
         id: row
         property string label
-        property string valueText
-        property int kind: 0 // 0 choice, 1 slider, 2 check
+        property int kind: 0 // 0 drop-down, 1 slider, 2 check box
+        // drop-down
+        property var model: []
+        property int index: 0
+        // slider
         property real from: 0
         property real to: 1
+        property real stepSize: 0.05
         property real value: 0
+        property string valueText
+        // check box
+        property bool checked: false
+        property string checkText
         property bool resettable: kind === 1
         property bool selected: false
         signal activated()
         signal step(int dir)
         signal reset()
         signal setTo(real v)
+        signal pick(int i)
 
         Layout.fillWidth: true
-        implicitHeight: 38
+        implicitHeight: 36
         opacity: enabled ? 1.0 : 0.45
 
         Rectangle {
             anchors.fill: parent
             radius: 6
-            color: row.selected ? "#33ffffff" : "transparent"
+            color: row.selected ? "#28ffffff" : "transparent"
             border.color: row.selected ? Material.accent : "transparent"
             border.width: 1
         }
@@ -146,76 +215,96 @@ Rectangle {
             Label {
                 text: row.label
                 color: "white"
-                font.pixelSize: 15
-                Layout.preferredWidth: 190
+                font.pixelSize: 14
+                Layout.preferredWidth: 200
                 elide: Text.ElideRight
             }
-            // choice
-            ToolButton {
+            ComboBox {
+                id: combo
                 visible: row.kind === 0
-                text: "‹"
-                font.pixelSize: 20
+                model: row.model
+                currentIndex: row.index
                 focusPolicy: Qt.NoFocus
-                onClicked: { row.activated(); row.step(-1); }
+                font.pixelSize: 14
+                Layout.preferredWidth: 250
+                Layout.preferredHeight: 34
+                Material.roundedScale: Material.SmallScale
+                onActivated: (i) => {
+                    row.activated();
+                    row.pick(i);
+                    currentIndex = Qt.binding(() => row.index);
+                }
             }
-            Label {
-                visible: row.kind === 0
-                text: row.valueText
-                color: Material.accent
-                font.pixelSize: 15
-                font.bold: true
-                horizontalAlignment: Text.AlignHCenter
-                Layout.fillWidth: true
-                elide: Text.ElideRight
-            }
-            ToolButton {
-                visible: row.kind === 0
-                text: "›"
-                font.pixelSize: 20
-                focusPolicy: Qt.NoFocus
-                onClicked: { row.activated(); row.step(1); }
-            }
-            // slider
             Slider {
                 visible: row.kind === 1
                 from: row.from
                 to: row.to
-                stepSize: 0.05
+                stepSize: row.stepSize
                 snapMode: Slider.SnapAlways
                 value: row.value
                 focusPolicy: Qt.NoFocus
                 Layout.fillWidth: true
                 onMoved: { row.activated(); row.setTo(value); }
             }
-            // check box
-            CheckBox {
-                visible: row.kind === 2
-                checked: row.value > 0.5
-                focusPolicy: Qt.NoFocus
-                onClicked: { row.activated(); row.setTo(checked ? 1 : 0); }
-            }
-            Item {
-                visible: row.kind === 2
-                Layout.fillWidth: true
-            }
-            Label {
-                visible: row.kind === 1
-                text: row.valueText
-                color: Material.accent
-                font.pixelSize: 15
-                horizontalAlignment: Text.AlignRight
-                Layout.preferredWidth: 44
-            }
             ToolButton {
+                visible: row.kind === 1
                 text: "↺"
-                font.pixelSize: 16
+                font.pixelSize: 15
                 focusPolicy: Qt.NoFocus
-                opacity: row.resettable ? 1 : 0
+                opacity: row.resettable ? 1 : 0.35
                 enabled: row.resettable
                 onClicked: { row.activated(); row.reset(); }
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Default (Backspace)")
             }
+            Label {
+                visible: row.kind === 1
+                text: row.valueText
+                color: "white"
+                font.pixelSize: 14
+                horizontalAlignment: Text.AlignRight
+                Layout.preferredWidth: 46
+            }
+            CheckBox {
+                visible: row.kind === 2
+                checked: row.checked
+                text: row.checkText
+                font.pixelSize: 14
+                focusPolicy: Qt.NoFocus
+                onClicked: { row.activated(); row.setTo(checked ? 1 : 0); }
+            }
+            Item {
+                visible: row.kind !== 1
+                Layout.fillWidth: true
+            }
+        }
+    }
+
+    // A tab of the header (an inline component: it sees no id of this file, the instance binds
+    // `current` and handles the click).
+    component TabLabel: ToolButton {
+        id: tabButton
+        property bool current: false
+        focusPolicy: Qt.NoFocus
+        font.pixelSize: 15
+        contentItem: Label {
+            text: tabButton.text
+            font: tabButton.font
+            color: tabButton.current ? Material.accent : "white"
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        Rectangle {
+            anchors {
+                left: parent.left
+                right: parent.right
+                bottom: parent.bottom
+                leftMargin: 8
+                rightMargin: 8
+            }
+            height: 2
+            color: Material.accent
+            visible: tabButton.current
         }
     }
 
@@ -226,104 +315,160 @@ Rectangle {
             left: parent.left
             right: parent.right
             top: parent.top
-            margins: 14
+            margins: 12
         }
-        spacing: 2
+        spacing: 1
 
-        Label {
-            text: qsTr("DLSS 5 neural rendering")
-            color: "white"
-            font.pixelSize: 19
-            font.bold: true
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 4
+            TabLabel {
+                objectName: "tabRtx"
+                text: qsTr("RTX settings")
+                current: panel.tab === 0
+                onClicked: panel.tab = 0
+            }
+            TabLabel {
+                objectName: "tabCandy"
+                text: qsTr("Eye Candy")
+                current: panel.tab === 1
+                onClicked: panel.tab = 1
+            }
+            Item { Layout.fillWidth: true }
+            Button {
+                objectName: "closeButton"
+                text: qsTr("Close")
+                flat: true
+                focusPolicy: Qt.NoFocus
+                font.pixelSize: 14
+                Material.roundedScale: Material.FullScale
+                background: Rectangle {
+                    implicitWidth: 72
+                    implicitHeight: 32
+                    radius: 16
+                    color: parent.hovered ? "#50ffffff" : "#30ffffff"
+                }
+                onClicked: panel.closeRequested()
+            }
         }
         Label {
             Layout.fillWidth: true
-            text: Chiaki.window.videoEnhancementStatus.length ? Chiaki.window.videoEnhancementStatus : qsTr("idle")
+            Layout.leftMargin: 12
+            text: {
+                const gpu = Chiaki.window.gpuName;
+                const status = Chiaki.window.videoEnhancementStatus.length ? Chiaki.window.videoEnhancementStatus : qsTr("idle");
+                return gpu.length ? gpu + "  ·  " + status : status;
+            }
             color: "#ffe082"
-            font.pixelSize: 13
+            font.pixelSize: 12
             elide: Text.ElideRight
         }
         Label {
             Layout.fillWidth: true
-            visible: !Chiaki.window.neuralRenderTunable
-            text: qsTr("The passes and controls below need NVIDIA's DLSS 5 (nvngx_dlssnr.dll next to chiaki-ng) to be running.")
-            color: "#ffab91"
-            font.pixelSize: 13
+            Layout.leftMargin: 12
+            visible: panel.tab === 0 && !panel.nvidia
+            text: qsTr("AMD: DLSS 5's model, passes and controls are in NeuralHub's panel (End).")
+            color: "#b0ffffff"
+            font.pixelSize: 12
             wrapMode: Text.Wrap
         }
-        Item { implicitHeight: 6 }
+        Label {
+            Layout.fillWidth: true
+            Layout.leftMargin: 12
+            visible: panel.tab === 0 && panel.nvidia && panel.nrEnabled() && !Chiaki.window.neuralRenderTunable
+            text: qsTr("The passes and controls below need NVIDIA's DLSS 5 (nvngx_dlssnr.dll next to chiaki-ng) to be running.")
+            color: "#ffab91"
+            font.pixelSize: 12
+            wrapMode: Text.Wrap
+        }
+        Item { implicitHeight: 4 }
 
+        // ---- RTX settings
         PanelRow {
             id: rowEnable
-            selected: panel.currentRow === 0
+            visible: panel.tab === 0
+            selected: panel.tab === 0 && panel.currentRow === 0
             onActivated: panel.select(rowEnable)
-            label: qsTr("Neural rendering")
-            valueText: Chiaki.window.neuralRenderPaused ? qsTr("Off") : qsTr("On")
-            onStep: Chiaki.window.neuralRenderPaused = !Chiaki.window.neuralRenderPaused
+            label: qsTr("Neural Rendering")
+            kind: 2
+            checkText: qsTr("Enable (DLSS 5)")
+            checked: panel.nrEnabled()
+            onStep: panel.setNrEnabled(!panel.nrEnabled())
+            onSetTo: (v) => panel.setNrEnabled(v > 0.5)
         }
         PanelRow {
             id: rowModel
-            selected: panel.currentRow === 1
+            visible: panel.tab === 0 && panel.nvidia
+            selected: panel.tab === 0 && panel.currentRow === 1
             onActivated: panel.select(rowModel)
-            label: qsTr("Model")
-            valueText: Chiaki.settings.neuralRenderModel === 1 ? qsTr("HT (lighter)") : qsTr("CC")
+            label: qsTr("NR model")
+            model: [qsTr("CC"), qsTr("HT (lighter)")]
+            index: Chiaki.settings.neuralRenderModel === 1 ? 1 : 0
             resettable: Chiaki.settings.neuralRenderModel !== 0
             onStep: Chiaki.settings.neuralRenderModel = Chiaki.settings.neuralRenderModel === 1 ? 0 : 1
+            onPick: (i) => Chiaki.settings.neuralRenderModel = i
             onReset: Chiaki.settings.neuralRenderModel = 0
         }
         PanelRow {
-            id: rowUpscale
-            selected: panel.currentRow === 2
-            onActivated: panel.select(rowUpscale)
-            label: qsTr("Upscale to the window")
-            valueText: Chiaki.settings.neuralRenderUpscale ? qsTr("On") : qsTr("Off")
-            onStep: Chiaki.settings.neuralRenderUpscale = !Chiaki.settings.neuralRenderUpscale
-        }
-        PanelRow {
             id: rowPasses
-            selected: panel.currentRow === 3
+            visible: panel.tab === 0 && panel.nvidia
+            selected: panel.tab === 0 && panel.currentRow === 2
             onActivated: panel.select(rowPasses)
-            label: qsTr("Passes")
-            valueText: panel.passes === 1 ? qsTr("1 pass") : qsTr("%1 passes").arg(panel.passes)
+            label: qsTr("NR passes")
+            model: [qsTr("1 pass"), qsTr("2 passes"), qsTr("3 passes")]
+            index: panel.passes - 1
             resettable: panel.passes !== 1
             onStep: (dir) => Chiaki.settings.neuralRenderPasses = Math.max(1, Math.min(3, panel.passes + dir))
+            onPick: (i) => Chiaki.settings.neuralRenderPasses = i + 1
             onReset: Chiaki.settings.neuralRenderPasses = 1
         }
         PanelRow {
             id: rowPerPass
-            selected: panel.currentRow === 4
+            visible: panel.tab === 0 && panel.nvidia && panel.passes > 1
+            selected: panel.tab === 0 && panel.currentRow === 3
             onActivated: panel.select(rowPerPass)
-            visible: panel.passes > 1
-            label: qsTr("Customize each pass")
+            label: qsTr("Pass settings")
             kind: 2
-            value: Chiaki.settings.neuralRenderPerPass ? 1 : 0
+            checkText: qsTr("Customize each pass")
+            checked: Chiaki.settings.neuralRenderPerPass
             onStep: Chiaki.settings.neuralRenderPerPass = !Chiaki.settings.neuralRenderPerPass
             onSetTo: (v) => Chiaki.settings.neuralRenderPerPass = v > 0.5
         }
         PanelRow {
             id: rowPass
-            selected: panel.currentRow === 5
+            visible: panel.tab === 0 && panel.nvidia && panel.perPass
+            selected: panel.tab === 0 && panel.currentRow === 4
             onActivated: panel.select(rowPass)
-            visible: panel.perPass
             label: qsTr("Configure pass")
-            valueText: qsTr("Pass %1 of %2").arg(panel.tuningPass + 1).arg(panel.passes)
+            model: {
+                const names = [];
+                for (let i = 0; i < panel.passes; i++)
+                    names.push(qsTr("Pass %1").arg(i + 1));
+                return names;
+            }
+            index: panel.tuningPass
             onStep: (dir) => panel.stepPass(dir)
+            onPick: (i) => panel.editPass = i
         }
         PanelRow {
             id: rowPreset
-            selected: panel.currentRow === 6
+            visible: panel.tab === 0 && panel.nvidia
+            selected: panel.tab === 0 && panel.currentRow === 5
             onActivated: panel.select(rowPreset)
-            label: qsTr("Preset")
-            valueText: panel.presetNames[panel.tuning.style] || ""
+            label: qsTr("NR preset")
+            model: panel.presetNames
+            index: panel.tuning.style || 0
             resettable: panel.tuning.style !== 0
             onStep: (dir) => panel.setValue("style", (panel.tuning.style + dir + 3) % 3)
+            onPick: (i) => panel.setValue("style", i)
             onReset: panel.setValue("style", panel.defaultOf("style"))
         }
         PanelRow {
             id: rowIntensity
-            selected: panel.currentRow === 7
+            visible: panel.tab === 0 && panel.nvidia
+            selected: panel.tab === 0 && panel.currentRow === 6
             onActivated: panel.select(rowIntensity)
-            label: qsTr("Intensity")
+            label: qsTr("NR Intensity")
             kind: 1
             from: 0
             to: 1
@@ -335,9 +480,10 @@ Rectangle {
         }
         PanelRow {
             id: rowStructure
-            selected: panel.currentRow === 8
+            visible: panel.tab === 0 && panel.nvidia
+            selected: panel.tab === 0 && panel.currentRow === 7
             onActivated: panel.select(rowStructure)
-            label: qsTr("Local structure")
+            label: qsTr("NR Local Structure")
             kind: 1
             from: 0
             to: 2
@@ -349,9 +495,10 @@ Rectangle {
         }
         PanelRow {
             id: rowTone
-            selected: panel.currentRow === 9
+            visible: panel.tab === 0 && panel.nvidia
+            selected: panel.tab === 0 && panel.currentRow === 8
             onActivated: panel.select(rowTone)
-            label: qsTr("Local tone")
+            label: qsTr("NR Local Tone")
             kind: 1
             from: 0
             to: 2
@@ -363,20 +510,23 @@ Rectangle {
         }
         PanelRow {
             id: rowMask
-            selected: panel.currentRow === 10
+            visible: panel.tab === 0 && panel.nvidia
+            selected: panel.tab === 0 && panel.currentRow === 9
             onActivated: panel.select(rowMask)
-            label: qsTr("Automatic mask")
+            label: qsTr("NR Automatic Mask")
             kind: 2
-            value: panel.tuning.autoMask ? 1 : 0
+            checkText: qsTr("Enable")
+            checked: !!panel.tuning.autoMask
             onStep: panel.setValue("autoMask", !panel.tuning.autoMask)
             onSetTo: (v) => panel.setValue("autoMask", v > 0.5)
         }
         PanelRow {
             id: rowSkin
-            selected: panel.currentRow === 11
+            visible: panel.tab === 0 && panel.nvidia
+            selected: panel.tab === 0 && panel.currentRow === 10
             onActivated: panel.select(rowSkin)
-            enabled: panel.tuning.autoMask
-            label: qsTr("Skin structure")
+            enabled: !!panel.tuning.autoMask
+            label: qsTr("NR Skin Structure")
             kind: 1
             from: 0
             to: 2.5
@@ -386,14 +536,125 @@ Rectangle {
             onSetTo: (v) => panel.setValue("skinStructure", v)
             onReset: panel.setValue("skinStructure", panel.defaultOf("skinStructure"))
         }
+        PanelRow {
+            id: rowUpscale
+            visible: panel.tab === 0
+            selected: panel.tab === 0 && panel.currentRow === 11
+            onActivated: panel.select(rowUpscale)
+            label: qsTr("DLSS upscaling")
+            kind: 2
+            checkText: qsTr("Upscale to the window (1080p → 4K)")
+            checked: Chiaki.settings.neuralRenderUpscale
+            onStep: Chiaki.settings.neuralRenderUpscale = !Chiaki.settings.neuralRenderUpscale
+            onSetTo: (v) => Chiaki.settings.neuralRenderUpscale = v > 0.5
+        }
+        PanelRow {
+            id: rowSharpness
+            visible: panel.tab === 0
+            selected: panel.tab === 0 && panel.currentRow === 12
+            onActivated: panel.select(rowSharpness)
+            label: qsTr("Sharpness")
+            kind: 1
+            from: 0
+            to: 100
+            stepSize: 5
+            value: Chiaki.settings.rcasStrength
+            valueText: Math.round(value) + "%"
+            resettable: Chiaki.settings.rcasStrength !== 0
+            onStep: (dir) => Chiaki.settings.rcasStrength = Math.max(0, Math.min(100, Chiaki.settings.rcasStrength + 5 * dir))
+            onSetTo: (v) => Chiaki.settings.rcasStrength = Math.round(v)
+            onReset: Chiaki.settings.rcasStrength = 0
+        }
+        PanelRow {
+            id: rowStats
+            visible: panel.tab === 0
+            selected: panel.tab === 0 && panel.currentRow === 13
+            onActivated: panel.select(rowStats)
+            label: qsTr("Gameplay statistics")
+            kind: 2
+            checkText: qsTr("Show stats overlay")
+            checked: Chiaki.settings.showStreamStats
+            onStep: panel.setStatsShown(!Chiaki.settings.showStreamStats)
+            onSetTo: (v) => panel.setStatsShown(v > 0.5)
+        }
+        PanelRow {
+            id: rowFrameGen
+            visible: panel.tab === 0 && Chiaki.settings.frameGenSupported
+            selected: panel.tab === 0 && panel.currentRow === 14
+            onActivated: panel.select(rowFrameGen)
+            label: qsTr("Frame generation")
+            model: [qsTr("Off"), qsTr("2x"), qsTr("3x"), qsTr("4x")]
+            index: panel.frameGenIndex()
+            onStep: (dir) => panel.setFrameGenIndex(panel.frameGenIndex() + dir)
+            onPick: (i) => panel.setFrameGenIndex(i)
+        }
+
+        // ---- Eye Candy
+        PanelRow {
+            id: rowVsr
+            visible: panel.tab === 1 && Chiaki.settings.rtxVsrSupported
+            selected: panel.tab === 1 && panel.currentRow === 0
+            onActivated: panel.select(rowVsr)
+            label: qsTr("RTX Video Super Resolution")
+            model: panel.vsrNames
+            index: Math.max(0, panel.vsrModes.indexOf(Chiaki.settings.rtxVsrQuality))
+            onStep: (dir) => Chiaki.settings.rtxVsrQuality = panel.vsrModes[Math.max(0, Math.min(panel.vsrModes.length - 1, index + dir))]
+            onPick: (i) => Chiaki.settings.rtxVsrQuality = panel.vsrModes[i]
+        }
+        PanelRow {
+            id: rowCleanup
+            visible: panel.tab === 1 && Chiaki.settings.frameGenSupported
+            selected: panel.tab === 1 && panel.currentRow === 1
+            onActivated: panel.select(rowCleanup)
+            label: qsTr("Generated frame clean-up")
+            model: [qsTr("Off"), qsTr("Protect HUD and text"), qsTr("HUD, text + keep detail")]
+            index: Chiaki.settings.frameGenCleanup
+            onStep: (dir) => Chiaki.settings.frameGenCleanup = Math.max(0, Math.min(2, Chiaki.settings.frameGenCleanup + dir))
+            onPick: (i) => Chiaki.settings.frameGenCleanup = i
+        }
+        PanelRow {
+            id: rowStatsStyle
+            visible: panel.tab === 1
+            selected: panel.tab === 1 && panel.currentRow === 2
+            onActivated: panel.select(rowStatsStyle)
+            label: qsTr("Stats overlay style")
+            model: [qsTr("Mini"), qsTr("Compact"), qsTr("Default"), qsTr("Full")]
+            index: Chiaki.settings.streamStatsStyle
+            onStep: (dir) => Chiaki.settings.streamStatsStyle = Math.max(0, Math.min(3, Chiaki.settings.streamStatsStyle + dir))
+            onPick: (i) => Chiaki.settings.streamStatsStyle = i
+        }
+        PanelRow {
+            id: rowStatsPosition
+            visible: panel.tab === 1
+            selected: panel.tab === 1 && panel.currentRow === 3
+            onActivated: panel.select(rowStatsPosition)
+            label: qsTr("Stats overlay position")
+            model: [qsTr("Top left"), qsTr("Top center"), qsTr("Top right"),
+                qsTr("Middle left"), qsTr("Middle center"), qsTr("Middle right"),
+                qsTr("Bottom left"), qsTr("Bottom center"), qsTr("Bottom right")]
+            index: Chiaki.settings.streamStatsPosition
+            onStep: (dir) => Chiaki.settings.streamStatsPosition = Math.max(0, Math.min(8, Chiaki.settings.streamStatsPosition + dir))
+            onPick: (i) => Chiaki.settings.streamStatsPosition = i
+        }
+        PanelRow {
+            id: rowBorder
+            visible: panel.tab === 1 && Chiaki.settings.ambientBorderSupported
+            selected: panel.tab === 1 && panel.currentRow === 4
+            onActivated: panel.select(rowBorder)
+            label: qsTr("Border fill")
+            model: [qsTr("Black"), qsTr("Ambient (blurred picture)")]
+            index: Chiaki.settings.ambientBorder ? 1 : 0
+            onStep: Chiaki.settings.ambientBorder = !Chiaki.settings.ambientBorder
+            onPick: (i) => Chiaki.settings.ambientBorder = i === 1
+        }
 
         Item { implicitHeight: 4 }
         Label {
             objectName: "panelFooter"
             Layout.fillWidth: true
-            text: panel.perPass
-                  ? qsTr("↑↓ select   ←→ change   PgUp/PgDn pass   Backspace default   End close")
-                  : qsTr("↑↓ select   ←→ change   Backspace default   End close")
+            text: (panel.perPass && panel.tab === 0
+                   ? qsTr("↑↓ select   ←→ change   Tab tab   PgUp/PgDn pass   Backspace default   %1 close")
+                   : qsTr("↑↓ select   ←→ change   Tab tab   Backspace default   %1 close")).arg(panel.nvidia ? "End" : "Esc")
             color: "#b0ffffff"
             font.pixelSize: 12
             horizontalAlignment: Text.AlignHCenter

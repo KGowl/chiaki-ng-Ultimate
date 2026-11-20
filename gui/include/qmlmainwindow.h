@@ -70,6 +70,9 @@ class QmlMainWindow : public QWindow
     Q_PROPERTY(bool neuralRenderPaused READ neuralRenderPaused WRITE setNeuralRenderPaused NOTIFY neuralRenderToggled)
     // Whether the DLSS 5 controls reach the model (NVIDIA's feature 18 is running).
     Q_PROPERTY(bool neuralRenderTunable READ neuralRenderTunable NOTIFY neuralRenderTunableChanged)
+    // The GPU that renders the stream (the RTX settings panel shows the NVIDIA-only rows on NVIDIA).
+    Q_PROPERTY(bool nvidiaCard READ nvidiaCard NOTIFY gpuInfoChanged)
+    Q_PROPERTY(QString gpuName READ gpuName NOTIFY gpuInfoChanged)
     Q_PROPERTY(double streamFps READ streamFps NOTIFY fpsChanged)
     Q_PROPERTY(double displayFps READ displayFps NOTIFY fpsChanged)
     Q_PROPERTY(bool keepVideo READ keepVideo WRITE setKeepVideo NOTIFY keepVideoChanged)
@@ -172,6 +175,9 @@ public:
     Q_INVOKABLE void releaseInput();
     Q_INVOKABLE void requestOverlayUpdate();
     Q_INVOKABLE void setOverlayInteractionActive(bool active);
+    // Where the RTX settings button is (window coordinates; empty while it is hidden): a left
+    // click there opens the panel instead of going to the console, and the cursor shows.
+    Q_INVOKABLE void setPanelButtonRect(const QRectF &rect);
     Q_INVOKABLE void setStatsOverlayActive(bool active);
     // Stream stats overlay style (0 Mini, 1 Compact, 2 Default, 3 Full) and
     // position (0-8: top/middle/bottom x left/centre/right).
@@ -200,8 +206,11 @@ signals:
     void videoEnhancementStatusChanged();
     // DLSS neural rendering was switched on or off for this run.
     void neuralRenderToggled(bool enabled);
-    // End on NVIDIA: open or close the DLSS 5 panel.
+    // End on NVIDIA, or a click on the RTX settings button: open or close the panel.
     void neuralRenderPanelRequested();
+    // The mouse moved over the stream (shows the RTX settings button for a moment).
+    void streamPointerMoved();
+    void gpuInfoChanged();
     void neuralRenderTunableChanged();
     void fpsChanged();
     void keepVideoChanged();
@@ -326,6 +335,8 @@ private:
     bool amd_card = false;
     bool nvidia_card = false;
     QString gpu_name;
+    QRectF panel_button_rect;
+    bool panel_button_pressed = false;
     bool direct_stream = false;
     std::atomic<qint64> queue_pts_origin_cached_us = -1;
     uint64_t next_frame_target_us = 0;

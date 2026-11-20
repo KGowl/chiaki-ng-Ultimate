@@ -336,14 +336,14 @@ Item {
     NeuralRenderPanel {
         id: neuralRenderPanel
         anchors {
-            left: parent.left
-            leftMargin: 24
-            verticalCenter: parent.verticalCenter
+            horizontalCenter: parent.horizontalCenter
+            top: parent.top
+            topMargin: 16
         }
         height: implicitHeight
         // Shrinks to fit a short window (all rows stay visible).
-        transformOrigin: Item.Left
-        scale: Math.min(1, (view.height - 48) / Math.max(1, implicitHeight))
+        transformOrigin: Item.Top
+        scale: Math.min(1, (view.height - 32) / Math.max(1, implicitHeight))
         visible: false
         onCloseRequested: view.closeNeuralRenderPanel()
     }
@@ -351,6 +351,56 @@ Item {
     Connections {
         target: Chiaki.window
         function onNeuralRenderPanelRequested() { view.toggleNeuralRenderPanel() }
+        function onStreamPointerMoved() {
+            view.pointerActive = true;
+            pointerTimer.restart();
+        }
+    }
+
+    // RTX settings button at the top right: shown for 3 s after the mouse moves over the stream
+    // and while the panel is open; a click opens or closes the panel. Over the stream the
+    // window gets the click (the mouse goes to the console otherwise), see setPanelButtonRect.
+    property bool pointerActive: false
+    Timer {
+        id: pointerTimer
+        interval: 3000
+        onTriggered: view.pointerActive = false
+    }
+    Button {
+        id: panelButton
+        objectName: "rtxSettingsButton"
+        anchors {
+            right: parent.right
+            top: parent.top
+            margins: 12
+        }
+        visible: (view.pointerActive || neuralRenderPanel.visible) && !sessionLoading && !sessionError && !menuController.open
+        text: qsTr("RTX settings")
+        icon.source: "qrc:/icons/settings-20px.svg"
+        icon.color: Material.accent
+        flat: true
+        focusPolicy: Qt.NoFocus
+        font.pixelSize: 15
+        Material.foreground: Material.accent
+        background: Rectangle {
+            radius: 6
+            color: panelButton.hovered ? "#60000000" : "#30000000"
+        }
+        onClicked: view.toggleNeuralRenderPanel()
+        function publish() {
+            if (!visible) {
+                Chiaki.window.setPanelButtonRect(Qt.rect(0, 0, 0, 0));
+                return;
+            }
+            const p = mapToItem(null, 0, 0);
+            Chiaki.window.setPanelButtonRect(Qt.rect(p.x, p.y, width, height));
+        }
+        onVisibleChanged: publish()
+        onWidthChanged: publish()
+        onHeightChanged: publish()
+        onXChanged: publish()
+        onYChanged: publish()
+        Component.onDestruction: Chiaki.window.setPanelButtonRect(Qt.rect(0, 0, 0, 0))
     }
 
     // Shown for a moment when DLSS 5 neural rendering is switched on or off (not under the panel).

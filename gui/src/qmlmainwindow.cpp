@@ -5054,6 +5054,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
         amd_card = property("_chiaki_detected_amd").toBool();
         nvidia_card = property("_chiaki_detected_nvidia").toBool();
         gpu_name = property("_chiaki_gpu_name").toString();
+        QMetaObject::invokeMethod(this, &QmlMainWindow::gpuInfoChanged, Qt::QueuedConnection);
 
         struct pl_opengl_params gl_params = {
             .get_proc_addr_ex = [](void *proc_ctx, const char *procname) -> pl_voidfunc_t {
@@ -5234,6 +5235,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
             nvidia_card = true;
             qCInfo(chiakiGui) << "Using nvidia graphics card";
         }
+        QMetaObject::invokeMethod(this, &QmlMainWindow::gpuInfoChanged, Qt::QueuedConnection);
         }
         }
 vulkan_setup_done:
@@ -8308,6 +8310,22 @@ void QmlMainWindow::setNeuralRenderPaused(bool paused)
     scheduleUpdate(true, UpdateRequestReason::Unknown);
 }
 
+void QmlMainWindow::setPanelButtonRect(const QRectF &rect)
+{
+    const bool was_shown = !panel_button_rect.isEmpty();
+    panel_button_rect = rect;
+    const bool shown = !rect.isEmpty();
+    if (!shown)
+        panel_button_pressed = false;
+    if (shown == was_shown || grab_input)
+        return;
+    // The cursor shows while the button does (it is hidden over the stream otherwise).
+    if (shown)
+        setCursor(Qt::ArrowCursor);
+    else if (has_video && settings->GetHideCursor())
+        setCursor(Qt::BlankCursor);
+}
+
 bool QmlMainWindow::neuralRenderTunable() const
 {
     return nr_tunable.loadRelaxed() != 0;
@@ -8322,6 +8340,21 @@ bool QmlMainWindow::event(QEvent *event)
         if (static_cast<QMouseEvent*>(event)->source() != Qt::MouseEventNotSynthesized)
             return true;
         if (session && !grab_input) {
+            // The RTX settings button over the stream: a left click on it opens the panel; the
+            // press and its release stay away from the console.
+            auto *me = static_cast<QMouseEvent*>(event);
+            const bool on_button = !panel_button_rect.isEmpty() && panel_button_rect.contains(me->position());
+            if (event->type() == QEvent::MouseMove) {
+                emit streamPointerMoved();
+            } else if (event->type() == QEvent::MouseButtonPress && me->button() == Qt::LeftButton && on_button) {
+                panel_button_pressed = true;
+                return true;
+            } else if (event->type() == QEvent::MouseButtonRelease && me->button() == Qt::LeftButton && panel_button_pressed) {
+                panel_button_pressed = false;
+                if (on_button)
+                    emit neuralRenderPanelRequested();
+                return true;
+            }
             if (event->type() == QEvent::MouseMove)
                 session->HandleMouseMoveEvent(static_cast<QMouseEvent*>(event), width(), height());
             else if (event->type() == QEvent::MouseButtonPress)

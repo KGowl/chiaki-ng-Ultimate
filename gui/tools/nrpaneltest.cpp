@@ -28,6 +28,21 @@ class StandInSettings : public QObject
     Q_PROPERTY(bool neuralRenderPerPass READ perPass WRITE setPerPass NOTIFY neuralRenderChanged)
     Q_PROPERTY(int neuralRenderModel READ model WRITE setModel NOTIFY neuralRenderChanged)
     Q_PROPERTY(bool neuralRenderUpscale READ upscale WRITE setUpscale NOTIFY neuralRenderChanged)
+    // The panel's other rows (RTX settings tab and Eye Candy tab).
+    Q_PROPERTY(bool neuralRender MEMBER neural_render NOTIFY changed)
+    Q_PROPERTY(int rcasStrength MEMBER rcas NOTIFY changed)
+    Q_PROPERTY(bool showStreamStats MEMBER show_stats NOTIFY changed)
+    Q_PROPERTY(int streamStatsStyle MEMBER stats_style NOTIFY changed)
+    Q_PROPERTY(int streamStatsPosition MEMBER stats_position NOTIFY changed)
+    Q_PROPERTY(bool frameGenSupported MEMBER fg_supported CONSTANT)
+    Q_PROPERTY(int frameGenBackend MEMBER fg_backend NOTIFY changed)
+    Q_PROPERTY(int frameGenMultiplier MEMBER fg_multiplier NOTIFY changed)
+    Q_PROPERTY(int frameGenCleanup MEMBER fg_cleanup NOTIFY changed)
+    Q_PROPERTY(bool rtxVsrSupported MEMBER vsr_supported CONSTANT)
+    Q_PROPERTY(bool rtxVsrExtendedModes MEMBER vsr_extended CONSTANT)
+    Q_PROPERTY(int rtxVsrQuality MEMBER vsr_quality NOTIFY changed)
+    Q_PROPERTY(bool ambientBorderSupported MEMBER border_supported CONSTANT)
+    Q_PROPERTY(bool ambientBorder MEMBER ambient_border NOTIFY changed)
 
 public:
     StandInSettings()
@@ -76,10 +91,25 @@ public:
     bool per_pass = false;
     int model_ = 0;
     bool upscale_ = true;
+    bool neural_render = true;
+    int rcas = 0;
+    bool show_stats = false;
+    int stats_style = 2;
+    int stats_position = 5;
+    bool fg_supported = true;
+    int fg_backend = 0;
+    int fg_multiplier = 2;
+    int fg_cleanup = 0;
+    bool vsr_supported = true;
+    bool vsr_extended = true;
+    int vsr_quality = 0;
+    bool border_supported = true;
+    bool ambient_border = false;
 
 signals:
     void neuralRenderChanged();
     void neuralRenderTuningChanged();
+    void changed();
 };
 
 class StandInWindow : public QObject
@@ -88,8 +118,12 @@ class StandInWindow : public QObject
     Q_PROPERTY(QString videoEnhancementStatus READ status CONSTANT)
     Q_PROPERTY(bool neuralRenderPaused READ paused WRITE setPaused NOTIFY neuralRenderToggled)
     Q_PROPERTY(bool neuralRenderTunable READ tunable CONSTANT)
+    Q_PROPERTY(bool nvidiaCard READ nvidia CONSTANT)
+    Q_PROPERTY(QString gpuName READ gpu CONSTANT)
 
 public:
+    bool nvidia() const { return true; }
+    QString gpu() const { return QStringLiteral("NVIDIA GeForce RTX 5090"); }
     QString status() const { return QStringLiteral("DLSS NR → 2160p 4.0 ms"); }
     bool paused() const { return paused_; }
     void setPaused(bool p) { paused_ = p; emit neuralRenderToggled(!p); }
@@ -186,22 +220,40 @@ int main(int argc, char **argv)
     auto near = [](double a, double b) { return std::fabs(a - b) < 1e-4; };
     settle();
 
+    auto &S = backend.settings_;
+    auto upTo = [&](int target) {
+        for (int i = 0; i < 20 && row() != target; i++)
+            key(Qt::Key_Up);
+    };
+    auto click = [&](QQuickItem *item) {
+        if (!item)
+            return;
+        const QPointF c = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+        QMouseEvent press(QEvent::MouseButtonPress, c, view.mapToGlobal(c.toPoint()), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QMouseEvent release(QEvent::MouseButtonRelease, c, view.mapToGlobal(c.toPoint()), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(&view, &press);
+        QCoreApplication::sendEvent(&view, &release);
+        settle();
+    };
+
+    // RTX settings tab, rows: 0 neural rendering, 1 model, 2 passes, 3 customize each pass,
+    // 4 configure pass, 5 preset, 6 intensity, 7 local structure, 8 local tone, 9 automatic
+    // mask, 10 skin structure, 11 DLSS upscaling, 12 sharpness, 13 stats overlay, 14 frame generation.
     check(panel->hasActiveFocus(), "panel has the keyboard focus");
-    check(row() == 0, "starts on the first row (neural rendering on/off)");
+    check(panel->property("tab").toInt() == 0 && row() == 0, "starts on the RTX settings tab, first row (neural rendering)");
     key(Qt::Key_Right);
-    check(backend.window_.paused_, "Right on row 1: neural rendering off for this run");
+    check(backend.window_.paused_, "Right on Neural Rendering: off for this run");
     key(Qt::Key_Return);
-    check(!backend.window_.paused_, "Return on row 1: on again");
+    check(!backend.window_.paused_, "Return: on again");
     key(Qt::Key_Down);
     key(Qt::Key_Right);
-    check(backend.settings_.model_ == 1, "Model row: CC -> HT");
+    check(S.model_ == 1, "NR model: CC -> HT");
     key(Qt::Key_Backspace);
-    check(backend.settings_.model_ == 0, "Backspace: model back to CC");
-    key(Qt::Key_Down); // upscale
-    key(Qt::Key_Down); // passes
-    check(row() == 3, "Down reaches Passes");
+    check(S.model_ == 0, "Backspace: model back to CC");
     key(Qt::Key_Down);
-    check(row() == 6, "with 1 pass the per-pass rows are skipped (Down goes to Preset)");
+    check(row() == 2, "Down reaches NR passes");
+    key(Qt::Key_Down);
+    check(row() == 5, "with 1 pass the per-pass rows are skipped (Down goes to NR preset)");
     key(Qt::Key_Right);
     check(tuning(0, "style").toInt() == 1, "Preset: Default -> Natural (pass 1)");
     key(Qt::Key_Right);
@@ -223,28 +275,51 @@ int main(int argc, char **argv)
     key(Qt::Key_Right, 30);
     check(near(tuning(0, "localTone").toDouble(), 2.0), "Local tone stops at 2.00");
     key(Qt::Key_Down);
-    check(row() == 11 - 1, "Down reaches Automatic mask");
+    check(row() == 9, "Down reaches Automatic mask");
     key(Qt::Key_Down);
-    check(row() == 0, "Skin structure is skipped while the mask is off (wraps to the top)");
-    key(Qt::Key_Up);
+    check(row() == 11, "Skin structure is skipped while the mask is off (Down goes to DLSS upscaling)");
+    key(Qt::Key_Right);
+    check(!S.upscale_, "DLSS upscaling off");
+    key(Qt::Key_Return);
+    check(S.upscale_, "DLSS upscaling on again");
+    key(Qt::Key_Down);
+    key(Qt::Key_Right, 3);
+    check(S.rcas == 15, "Sharpness Right x3: 15%");
+    key(Qt::Key_Backspace);
+    check(S.rcas == 0, "Backspace: sharpness back to 0%");
+    key(Qt::Key_Down);
+    key(Qt::Key_Return);
+    check(S.show_stats, "Show stats overlay on");
+    key(Qt::Key_Down);
+    check(row() == 14, "Down reaches Frame generation");
+    key(Qt::Key_Right);
+    check(S.fg_backend == 1 && S.fg_multiplier == 2, "Frame generation Off -> 2x (DLSS FG)");
+    key(Qt::Key_Right, 2);
+    check(S.fg_multiplier == 4 && S.fg_backend == 1, "Frame generation 4x");
+    key(Qt::Key_Right);
+    check(S.fg_multiplier == 4, "Frame generation stops at 4x");
+    key(Qt::Key_Left, 3);
+    check(S.fg_backend == 0, "Frame generation Off");
+    key(Qt::Key_Down);
+    check(row() == 0, "Down wraps to the top");
+    upTo(9);
     key(Qt::Key_Return);
     check(tuning(0, "autoMask").toBool(), "Return: automatic mask on");
     key(Qt::Key_Down);
-    check(row() == 11, "Skin structure reachable with the mask on");
+    check(row() == 10, "Skin structure reachable with the mask on");
     key(Qt::Key_Right, 2);
     check(near(tuning(0, "skinStructure").toDouble(), 1.1), "Skin structure Right x2: 1.10");
     // Two passes, each with its own controls.
-    for (int i = 0; i < 12 && row() != 3; i++)
-        key(Qt::Key_Up);
+    upTo(2);
     key(Qt::Key_Right);
-    check(backend.settings_.passes_ == 2, "Passes: 1 -> 2");
+    check(S.passes_ == 2, "NR passes: 1 -> 2");
     key(Qt::Key_Down);
-    check(row() == 4, "Customize each pass appears with 2 passes");
+    check(row() == 3, "Customize each pass appears with 2 passes");
     key(Qt::Key_Return);
-    check(backend.settings_.per_pass, "Customize each pass on");
+    check(S.per_pass, "Customize each pass on");
     check(near(tuning(1, "localStructure").toDouble(), 1.45), "pass 2 starts from pass 1's controls");
     key(Qt::Key_Down);
-    check(row() == 5, "Configure pass row appears");
+    check(row() == 4, "Configure pass row appears");
     key(Qt::Key_Right);
     check(panel->property("tuningPass").toInt() == 1, "Configure pass: pass 2");
     key(Qt::Key_Down, 2); // preset, intensity
@@ -260,24 +335,52 @@ int main(int argc, char **argv)
     auto *content = panel->findChild<QQuickItem *>("panelContent");
     auto *footer = panel->findChild<QQuickItem *>("panelFooter");
     check(content && footer, "panel content and footer found");
-    if (content)
-        content->ensurePolished();
-    settle();
-    view.resize(static_cast<int>(panel->width()), static_cast<int>(std::ceil(panel->height())));
-    settle();
+    auto fit = [&] {
+        if (content)
+            content->ensurePolished();
+        settle();
+        view.resize(static_cast<int>(panel->width()), static_cast<int>(std::ceil(panel->height())));
+        settle();
+    };
+    fit();
     const double footer_bottom = footer ? footer->mapToItem(panel, QPointF(0, footer->height())).y() : 1e9;
     check(footer_bottom <= panel->height() && panel->height() > 560,
-          qPrintable(QString("all 12 rows and the key help inside the panel (footer bottom %1 of %2 px)")
+          qPrintable(QString("all 15 rows and the key help inside the panel (footer bottom %1 of %2 px)")
                          .arg(footer_bottom, 0, 'f', 0).arg(panel->height(), 0, 'f', 0)));
     const QImage img = view.grabWindow();
     check(!img.isNull() && img.height() + 1 >= panel->height() * view.devicePixelRatio(),
           qPrintable(QString("screenshot %1x%2 covers the whole panel").arg(img.width()).arg(img.height())));
     check(!img.isNull() && img.save(shot), qPrintable("screenshot " + shot));
+    // Eye Candy tab: 0 RTX VSR, 1 generated frame clean-up, 2 stats style, 3 stats position, 4 border.
+    key(Qt::Key_Tab);
+    check(panel->property("tab").toInt() == 1 && row() == 0, "Tab: Eye Candy, first row (RTX Video Super Resolution)");
+    key(Qt::Key_Right);
+    check(S.vsr_quality == 1, "RTX VSR: Off -> Upscale Low");
+    key(Qt::Key_Down);
+    key(Qt::Key_Right);
+    check(S.fg_cleanup == 1, "Generated frame clean-up: Protect HUD and text");
+    key(Qt::Key_Down);
+    key(Qt::Key_Right);
+    check(S.stats_style == 3, "Stats overlay style: Default -> Full");
+    key(Qt::Key_Down);
+    key(Qt::Key_Left);
+    check(S.stats_position == 4, "Stats overlay position: Middle right -> Middle center");
+    key(Qt::Key_Down);
+    key(Qt::Key_Return);
+    check(S.ambient_border, "Border fill: Ambient");
+    fit();
+    QString candy = shot;
+    candy.replace(".png", "_candy.png");
+    const QImage img2 = view.grabWindow();
+    check(!img2.isNull() && img2.save(candy), qPrintable("screenshot " + candy));
+    click(panel->findChild<QQuickItem *>("tabRtx"));
+    check(panel->property("tab").toInt() == 0, "click on the RTX settings tab");
+    click(panel->findChild<QQuickItem *>("closeButton"));
+    check(closes.count == 1, "click on Close sends closeRequested");
     key(Qt::Key_Escape);
-    check(closes.count == 1, "Esc sends closeRequested");
+    check(closes.count == 2, "Esc sends closeRequested");
     std::printf("-- %d failed\n", g_failed);
     std::printf(g_failed ? "VERDICT: panel checks FAILED\n" : "VERDICT: panel checks passed\n");
     return g_failed ? 1 : 0;
 }
-
 #include "nrpaneltest.moc"
