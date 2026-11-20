@@ -21,6 +21,13 @@
 #include <cmath>
 #include <cstdio>
 
+// QtGui's entry for test mouse input (what QTest::mouseClick uses): the event goes through
+// QGuiApplication's window-system path like a real click, so the pointing device's state and the
+// controls' press / release handling see it as they would in the stream window.
+Q_GUI_EXPORT void qt_handleMouseEvent(QWindow *window, const QPointF &local, const QPointF &global,
+                                      Qt::MouseButtons state, Qt::MouseButton button,
+                                      QEvent::Type type, Qt::KeyboardModifiers mods, int timestamp);
+
 class StandInSettings : public QObject
 {
     Q_OBJECT
@@ -225,14 +232,19 @@ int main(int argc, char **argv)
         for (int i = 0; i < 20 && row() != target; i++)
             key(Qt::Key_Up);
     };
+    int mouse_time = 1000;
     auto click = [&](QQuickItem *item) {
-        if (!item)
+        if (!item) {
+            std::printf("note: the item to click was not found\n");
             return;
+        }
         const QPointF c = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
-        QMouseEvent press(QEvent::MouseButtonPress, c, view.mapToGlobal(c.toPoint()), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-        QMouseEvent release(QEvent::MouseButtonRelease, c, view.mapToGlobal(c.toPoint()), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-        QCoreApplication::sendEvent(&view, &press);
-        QCoreApplication::sendEvent(&view, &release);
+        const QPointF g = view.mapToGlobal(c);
+        std::printf("click %s at %.0f,%.0f (window %dx%d, %s)\n", qPrintable(item->objectName()), c.x(), c.y(),
+                    view.width(), view.height(), view.isExposed() ? "exposed" : "not exposed");
+        qt_handleMouseEvent(&view, c, g, Qt::NoButton, Qt::NoButton, QEvent::MouseMove, Qt::NoModifier, mouse_time += 50);
+        qt_handleMouseEvent(&view, c, g, Qt::LeftButton, Qt::LeftButton, QEvent::MouseButtonPress, Qt::NoModifier, mouse_time += 50);
+        qt_handleMouseEvent(&view, c, g, Qt::NoButton, Qt::LeftButton, QEvent::MouseButtonRelease, Qt::NoModifier, mouse_time += 50);
         settle();
     };
 
@@ -375,10 +387,14 @@ int main(int argc, char **argv)
     check(!img2.isNull() && img2.save(candy), qPrintable("screenshot " + candy));
     click(panel->findChild<QQuickItem *>("tabRtx"));
     check(panel->property("tab").toInt() == 0, "click on the RTX settings tab");
+    click(panel->findChild<QQuickItem *>("tabCandy"));
+    check(panel->property("tab").toInt() == 1, "click on the Eye Candy tab");
+    int closes_before = closes.count;
     click(panel->findChild<QQuickItem *>("closeButton"));
-    check(closes.count == 1, "click on Close sends closeRequested");
+    check(closes.count == closes_before + 1, "click on Close sends closeRequested");
+    closes_before = closes.count;
     key(Qt::Key_Escape);
-    check(closes.count == 2, "Esc sends closeRequested");
+    check(closes.count == closes_before + 1, "Esc sends closeRequested");
     std::printf("-- %d failed\n", g_failed);
     std::printf(g_failed ? "VERDICT: panel checks FAILED\n" : "VERDICT: panel checks passed\n");
     return g_failed ? 1 : 0;

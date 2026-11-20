@@ -167,7 +167,7 @@ if(CHIAKI_ENABLE_NGX)
 	# Console test of the DLSS 5 panel (tools/nrpaneltest.cpp, the application's QML resources and
 	# a stand-in for its backend). Not built by default: --target chiaki-nrpaneltest.
 	add_executable(chiaki-nrpaneltest EXCLUDE_FROM_ALL tools/nrpaneltest.cpp src/qml/qml.qrc)
-	target_link_libraries(chiaki-nrpaneltest Qt::Core Qt::Gui Qt::Qml Qt::Quick)
+	target_link_libraries(chiaki-nrpaneltest Qt::Core Qt::Gui Qt::GuiPrivate Qt::Qml Qt::Quick)
 	message(STATUS "NVIDIA NGX enabled: RTX Video Super Resolution, DLSS Frame Generation, DLSS neural rendering through D3D12 (${CHIAKI_NGX_LIB})")
 endif()
 
