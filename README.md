@@ -8,9 +8,24 @@ The `d3d12-bridge` branch adds **DLSS 5 neural rendering** and **DLSS Frame Gene
 
 Everything else (setup, registration, controllers, Steam Deck usage) works as in upstream chiaki-ng – see its [documentation site](https://streetpea.github.io/chiaki-ng/).
 
+## Latest release: [1.10.0-dlss5.5](https://github.com/windystrife/chiaki-ng-d3d12/releases/tag/1.10.0-dlss5.5) (20 November 2026)
+
+DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Radeon** (Windows):
+
+- **4x frame generation keeps up with DLSS 5**: the next stream frame's DLSS work runs while the generated frames are shown. RX 9070 XT, GTA VI at 30 fps, DLSS 5 to 2160p, 4x on a 150 Hz screen: **118 fps** (1.10.0-dlss5.4: about 90).
+- **RTX settings panel** while streaming, on every GPU: DLSS 5 on/off, upscaling, sharpness, frame generation Off / 2x / 3x / 4x and the stats overlay; on NVIDIA also the DLSS 5 model, 1–3 passes and their controls.
+- **Stats overlay** names the GPU and says when the display holds frame generation back (e.g. 4x needs 120 Hz for a 30 fps stream).
+
+| You have | Get | Then |
+|---|---|---|
+| AMD Radeon | [`chiaki-dlss5-amd-setup-full.zip`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.5/chiaki-dlss5-amd-setup-full.zip) | Install NeuralHub 0.9.0 yourself and import the DLSS DLLs, unzip the kit, run `cai-dat.cmd` |
+| NVIDIA RTX | [`chiaki-ng-1.10.0-dlss5.5-win_x64-setup.exe`](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.5/chiaki-ng-1.10.0-dlss5.5-win_x64-setup.exe) or the portable zip | Put NVIDIA's `nvngx_dlssnr.dll` (DLSS NR 310.9.16, not bundled) next to `chiaki.exe` |
+
+Setup guides: [English (PDF)](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.5/chiaki-ng-dlss5-guide-en.pdf), [Tiếng Việt (PDF)](https://github.com/windystrife/chiaki-ng-d3d12/releases/download/1.10.0-dlss5.5/chiaki-ng-dlss5-huong-dan.pdf). Full notes on the [release page](https://github.com/windystrife/chiaki-ng-d3d12/releases/tag/1.10.0-dlss5.5).
+
 ## Downloads
 
-Pre-releases are published on the [Releases](../../releases) page (tags like `1.10.0-rtx.4`):
+Releases and pre-releases are published on the [Releases](../../releases) page (tags like `1.10.0-rtx.4`):
 
 | File | Platform |
 |---|---|
