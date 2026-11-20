@@ -7066,10 +7066,8 @@ void QmlMainWindow::render()
             QMutexLocker locker(&direct_frame_mutex);
             incoming_waiting = direct_pending_frame != nullptr;
         }
-        // RTX VSR (switched on since the last stream frame) has no D3D12 half to pipeline.
-        const bool vsr_wanted_now = rtx_vsr && has_settings && nvidia_card && settings->GetRtxVsrQuality() > 0;
-        if (incoming_waiting && fg_pipe_stage == FgPipeStage::Idle && fg_pipe_allowed && !vsr_wanted_now &&
-            fgPipeEnabled()) {
+        // (RTX VSR, which has no D3D12 half, is checked where the frame's work starts.)
+        if (incoming_waiting && fg_pipe_stage == FgPipeStage::Idle && fg_pipe_allowed && fgPipeEnabled()) {
             // Start the new stream frame's DLSS work now and keep presenting the frames
             // generated from the last one while the D3D12 side runs.
             fg_pipe_take = true;
@@ -8027,9 +8025,16 @@ void QmlMainWindow::render()
             nr_status_out_h.storeRelaxed(0);
             nr_status_hdr.storeRelaxed(0);
         }
-        // Fewer than 2 frames, or a failure: the frame stays Taken and goes down the normal
-        // path once the last stream frame's frames are out.
-        if (multiplier >= 2 && frame_gen->backend() == FrameGen::Backend::Dlss12) {
+        // RTX VSR runs on frames DLSS 5 did not upscale and has no D3D12 half to pipeline.
+        const NeuralRender::Options pipe_nr_options = nr_on ? nr_options_for(&direct_frame) : NeuralRender::Options();
+        const bool nr_will_upscale = nr_on && pipe_nr_options.out_width > 0 && neural_render->canUpscale();
+        const bool vsr_would_run = rtx_vsr && nvidia_card && settings->GetRtxVsrQuality() > 0 && !rtx_vsr->failed() &&
+                                   !nr_will_upscale;
+        // Fewer than 2 frames, RTX VSR, or a failure: the frame stays Taken and goes down the
+        // normal path once the last stream frame's frames are out.
+        if (vsr_would_run) {
+            fg_pipe_allowed = false;
+        } else if (multiplier >= 2 && frame_gen->backend() == FrameGen::Backend::Dlss12) {
             fg_pipe_multiplier = multiplier;
             fg_pipe_cadence = cadence;
             fg_pipe_out_w = static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop))));
@@ -8044,7 +8049,7 @@ void QmlMainWindow::render()
 #ifdef Q_OS_WIN
                 neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
 #endif
-                fg_pipe_nr_options = nr_options_for(&direct_frame);
+                fg_pipe_nr_options = pipe_nr_options;
                 if (neural_render->begin(&direct_frame, direct_frame_serial, fg_pipe_nr_options))
                     fg_pipe_stage = FgPipeStage::NeuralRender;
             } else {
