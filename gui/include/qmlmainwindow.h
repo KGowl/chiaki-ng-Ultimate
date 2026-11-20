@@ -374,6 +374,11 @@ private:
     QAtomicInteger<int> fg_status_backend = 0;
     QAtomicInteger<int> fg_status_multiplier = 0;
     QAtomicInteger<int> fg_status_reason = 0;
+    // The multiplier asked for when the display refresh rate holds it back (0 otherwise), the
+    // refresh rate it would need, and the display's.
+    QAtomicInteger<int> fg_status_requested = 0;
+    QAtomicInteger<int> fg_status_needed_hz = 0;
+    QAtomicInteger<int> fg_status_refresh_hz = 0;
     // DLSS neural rendering: 0 off, 1 active, 2 idle (HDR, warming up, ...), 3 unavailable;
     // its D3D12 GPU time in hundredths of a millisecond.
     QAtomicInteger<int> nr_status_state = 0;

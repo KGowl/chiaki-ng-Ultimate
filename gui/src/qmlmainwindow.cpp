@@ -5358,6 +5358,7 @@ renderer_backend_ready:
         fg_status_backend.storeRelaxed(0);
         fg_status_multiplier.storeRelaxed(0);
         fg_status_reason.storeRelaxed(0);
+        fg_status_requested.storeRelaxed(0);
         startup_video_visible_generation.fetchAndAddRelaxed(1);
         grab_input = 0;
         if (session)
@@ -5572,17 +5573,22 @@ renderer_backend_ready:
                 : fg_backend_status == static_cast<int>(FrameGen::Backend::Dlss12) ? QStringLiteral("DLSS FG D3D12")
                 : QStringLiteral("FSR FG");
             const int multiplier = fg_status_multiplier.loadRelaxed();
+            const int requested = fg_status_requested.loadRelaxed();
+            const QString refresh_note = requested > multiplier && requested > 1
+                ? tr(" (%1x needs %2 Hz, display %3 Hz)").arg(requested).arg(fg_status_needed_hz.loadRelaxed()).arg(fg_status_refresh_hz.loadRelaxed())
+                : QString();
             if (multiplier > 1) {
                 part += QStringLiteral(" %1x").arg(multiplier);
                 if (fg_source_cadence.loadRelaxed() == 2)
                     part += tr(" (half-rate source)");
                 if (frame_gen->gpuTimeMs() > 0.0f)
                     part += QStringLiteral(" %1 ms").arg(frame_gen->gpuTimeMs(), 0, 'f', 1);
+                part += refresh_note;
             } else {
                 switch (fg_status_reason.loadRelaxed()) {
                 case 1: part += tr(": needs Direct Mapping"); break;
                 case 2: part += tr(": unavailable (see log)"); break;
-                case 3: part += tr(": display refresh rate too low"); break;
+                case 3: part += tr(": display refresh rate too low") + refresh_note; break;
                 default: part += tr(": idle"); break;
                 }
             }
@@ -8080,6 +8086,13 @@ void QmlMainWindow::render()
             : 2;
         int multiplier = qMin(settings->GetFrameGenMultiplier() * cadence, refresh_cap);
         fg_refresh_limited = multiplier < 2;
+        // When the display holds back the multiplier asked for, the status says what it would take.
+        // Counted per source picture like the status's own number: 4x of a 30 fps stream needs 120 Hz.
+        const int fg_requested = settings->GetFrameGenMultiplier() * cadence;
+        const bool fg_capped = refresh_cap < fg_requested && source_interval_s > 0.0;
+        fg_status_requested.storeRelaxed(fg_capped ? fg_requested : 0);
+        fg_status_needed_hz.storeRelaxed(fg_capped ? static_cast<int>(std::lround(fg_requested / source_interval_s)) : 0);
+        fg_status_refresh_hz.storeRelaxed(static_cast<int>(std::lround(refresh_rate)));
         if (fg_refresh_limited && fg_skip_logged != 3) {
             fg_skip_logged = 3;
             qCInfo(chiakiGui).nospace() << "Frame generation skipped: the display runs at " << refresh_rate
