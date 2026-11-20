@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -29,6 +30,10 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
+
+// Instances with NGX's D3D12 side up (Dx12Fg::ngxUpInProcess). A crashed instance is never
+// destroyed and stays counted, as its NGX state does.
+std::atomic<int> g_ngx_d3d12_up{0};
 
 constexpr size_t kSlots = 4;
 constexpr UINT kHiddenWindowSize = 1280;
@@ -835,6 +840,7 @@ bool Dx12Fg::Impl::initNgx()
         return false;
     }
     ngx_up = true;
+    g_ngx_d3d12_up.fetch_add(1);
     NVSDK_NGX_Parameter *caps = nullptr;
     stage = "NVSDK_NGX_D3D12_GetCapabilityParameters";
     r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
@@ -2105,6 +2111,9 @@ Dx12Fg::~Dx12Fg()
         NVSDK_NGX_D3D12_DestroyParameters(d.nr_sr_params);
     if (d.ngx_up && d.device)
         NVSDK_NGX_D3D12_Shutdown1(d.device.Get());
+    if (d.ngx_up)
+        g_ngx_d3d12_up.fetch_sub(1);
+    d.ngx_up = false;
     d.swapchain.Reset();
     if (d.hwnd)
         DestroyWindow(d.hwnd);
@@ -2577,6 +2586,11 @@ void Dx12Fg::markCrashed()
 bool Dx12Fg::crashed() const
 {
     return impl->crashed;
+}
+
+bool Dx12Fg::ngxUpInProcess()
+{
+    return g_ngx_d3d12_up.load() > 0;
 }
 
 std::shared_ptr<Dx12Fg> Dx12Fg::shared(const VulkanDevice &vk, LogFn log, void *user)

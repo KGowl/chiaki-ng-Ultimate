@@ -183,6 +183,10 @@ public:
     // (one D3D12 device and one NGX runtime for both). Created and initialised on first
     // use; nullptr when init() fails. The log callback of the first caller is used.
     static std::shared_ptr<Dx12Fg> shared(const VulkanDevice &vk, LogFn log, void *user);
+    // True while an instance in this process has NGX's D3D12 side initialised. Once it is up,
+    // NGX refuses to create DLSS Frame Generation through Vulkan (InvalidParameter), so DLSS FG
+    // has to run through this bridge too.
+    static bool ngxUpInProcess();
     // After a crash inside the runtime its state is unknown: the user that saw it calls
     // markCrashed() and leaks its reference (the instance is never destroyed), and
     // shared() returns nullptr for that Vulkan device from then on.

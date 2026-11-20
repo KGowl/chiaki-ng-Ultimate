@@ -7952,6 +7952,18 @@ void QmlMainWindow::render()
     // Back on after the End key: start a fresh history instead of blending in old frames.
     if (nr_wanted && nr_user_off_seen)
         neural_render->resetHistory();
+    // NGX refuses DLSS FG through Vulkan once its D3D12 side is up: before DLSS 5 brings that
+    // side up, let a running Vulkan DLSS FG go. Frame generation below then runs DLSS FG through
+    // the D3D12 bridge.
+    if (nr_wanted && frame_gen && frame_gen->backend() == FrameGen::Backend::Dlss && !FrameGen::d3d12NgxUp()) {
+        fg_pending_frames.clear();
+        fgPipeCancel();
+        fg_pipe_allowed = false;
+        fg_active_multiplier = 1;
+        fg_active_cadence = 1;
+        frame_gen->destroy();
+        qCInfo(chiakiGui) << "DLSS 5 starts: DLSS Frame Generation moves from Vulkan to the D3D12 bridge";
+    }
     nr_user_off_seen = nr_user_off_now;
     // The DLSS 5 controls (NVIDIA), read again whenever the settings change.
     if (has_settings) {
@@ -8181,18 +8193,22 @@ void QmlMainWindow::render()
             qCInfo(chiakiGui) << "Frame generation requires Direct Mapping and stays disabled";
     }
     // "DLSS Frame Generation" runs through Vulkan NGX, which needs an NVIDIA GPU. On other GPUs
-    // (AMD with NeuralHub), or when Vulkan NGX fails, the same DLSS FG runs through the D3D12 bridge.
+    // (AMD with NeuralHub), when Vulkan NGX fails, and next to DLSS 5 (NGX refuses DLSS FG through
+    // Vulkan once its D3D12 side is up), the same DLSS FG runs through the D3D12 bridge.
     int fg_run_backend = fg_backend;
     if (fg_backend == static_cast<int>(FrameGen::Backend::Dlss) && frame_gen &&
-        FrameGen::backendCompiledIn(FrameGen::Backend::Dlss12) &&
-        (!nvidia_card || frame_gen->backendFailed(FrameGen::Backend::Dlss))) {
-        fg_run_backend = static_cast<int>(FrameGen::Backend::Dlss12);
-        if (!fg_dlss12_route_logged) {
-            fg_dlss12_route_logged = true;
-            qCInfo(chiakiGui).nospace() << "DLSS Frame Generation: "
-                << (nvidia_card ? "Vulkan NGX is unavailable" : "not an NVIDIA GPU")
-                << ", running it through D3D12 (" << FrameGen::backendName(FrameGen::Backend::Dlss12)
-                << ", NeuralHub on AMD)";
+        FrameGen::backendCompiledIn(FrameGen::Backend::Dlss12)) {
+        const bool beside_nr = nvidia_card && (nr_wanted || FrameGen::d3d12NgxUp());
+        const int reason = !nvidia_card ? 1 : beside_nr ? 2 : frame_gen->backendFailed(FrameGen::Backend::Dlss) ? 3 : 0;
+        if (reason) {
+            fg_run_backend = static_cast<int>(FrameGen::Backend::Dlss12);
+            if (fg_dlss12_route_logged != reason) {
+                fg_dlss12_route_logged = reason;
+                qCInfo(chiakiGui).nospace() << "DLSS Frame Generation: "
+                    << (reason == 1 ? "not an NVIDIA GPU" : reason == 2 ? "DLSS 5 runs through D3D12" : "Vulkan NGX is unavailable")
+                    << ", running it through D3D12 (" << FrameGen::backendName(FrameGen::Backend::Dlss12)
+                    << (reason == 1 ? ", NeuralHub on AMD)" : ")");
+            }
         }
     }
     bool fg_applied = fg_override;
