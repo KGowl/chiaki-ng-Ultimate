@@ -341,6 +341,9 @@ Item {
             verticalCenter: parent.verticalCenter
         }
         height: implicitHeight
+        // Shrinks to fit a short window (all rows stay visible).
+        transformOrigin: Item.Left
+        scale: Math.min(1, (view.height - 48) / Math.max(1, implicitHeight))
         visible: false
         onCloseRequested: view.closeNeuralRenderPanel()
     }

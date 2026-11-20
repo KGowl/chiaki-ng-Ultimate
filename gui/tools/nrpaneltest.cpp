@@ -254,6 +254,9 @@ int main(int argc, char **argv)
     key(Qt::Key_PageUp);
     check(panel->property("tuningPass").toInt() == 0, "PgUp: back to pass 1");
     check(near(panel->property("tuning").toMap().value("intensity").toDouble(), 1.0), "rows show pass 1's values again");
+    // The view does not follow the rows that appeared since it opened: size it to the panel.
+    check(panel->implicitHeight() > 400, qPrintable(QString("panel height %1 px with all rows").arg(panel->implicitHeight())));
+    view.resize(static_cast<int>(panel->width()), static_cast<int>(panel->implicitHeight()));
     settle();
     const QImage img = view.grabWindow();
     check(!img.isNull() && img.save(shot), qPrintable("screenshot " + shot));
