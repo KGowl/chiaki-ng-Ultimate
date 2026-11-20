@@ -1,5 +1,6 @@
 #include "qmlmainwindow.h"
 #include "rtxvsr.h"
+#include "neuralrender.h"
 #include "framegen.h"
 #include "qmlbackend.h"
 #include "qmlsvgprovider.h"
@@ -180,6 +181,8 @@ public:
             return row;
         };
 
+        // First row: the GPU that renders the stream (DLSS on AMD runs through NeuralHub, so it is worth seeing).
+        gpuRow = makeRow(tr("GPU"), QColor(QStringLiteral("#eceff1")), gpuValue);
         bitrateRow = makeRow(tr("Mbps"), QColor(QStringLiteral("#00a7ff")), bitrateValue);
         fpsRow = makeRow(tr("fps stream / display"), QColor(QStringLiteral("#ffe082")), fpsValue, &fpsTitle);
         queueRow = makeRow(tr("queue depth avg"), QColor(QStringLiteral("#90caf9")), queueDepthValue);
@@ -330,6 +333,10 @@ public:
         }
 
         const bool full = style == Full;
+        const QString gpu = owner ? owner->gpuName() : QString();
+        gpuValue->setText(gpu);
+        gpuRow->setVisible(!gpu.isEmpty());
+
         bitrateRow->setVisible(hasSession);
         bitrateValue->setText(hasSession ? QString::number(bitrate, 'f', 1) : QString());
 
@@ -388,7 +395,7 @@ private:
     {
         const bool line = style == Mini || style == Compact;
         lineLabel->setVisible(line);
-        for (QWidget *row : { bitrateRow, fpsRow, queueRow, pendingRow, packetLossRow, droppedFramesRow, lostFramesRow, enhancementRow })
+        for (QWidget *row : { gpuRow, bitrateRow, fpsRow, queueRow, pendingRow, packetLossRow, droppedFramesRow, lostFramesRow, enhancementRow })
             row->setVisible(!line);
         QFont titleFont;
         QFont valueFont;
@@ -429,6 +436,8 @@ private:
     QList<QLabel *> titles;
     QList<QLabel *> values;
     QLabel *fpsTitle = nullptr;
+    QWidget *gpuRow = nullptr;
+    QLabel *gpuValue = nullptr;
     QWidget *bitrateRow = nullptr;
     QWidget *fpsRow = nullptr;
     QLabel *fpsValue = nullptr;
@@ -2261,6 +2270,9 @@ static void detectOpenGLGpuVendor(QmlMainWindow *window)
     if (!vendor_raw)
         return;
 
+    if (const GLubyte *renderer_raw = ctx->extraFunctions()->glGetString(GL_RENDERER))
+        window->setProperty("_chiaki_gpu_name", QString::fromUtf8(reinterpret_cast<const char *>(renderer_raw)).trimmed());
+
     QByteArray vendor = QByteArray(reinterpret_cast<const char *>(vendor_raw)).toLower();
     if (vendor.contains("amd") || vendor.contains("ati"))
     {
@@ -2837,6 +2849,8 @@ QmlMainWindow::~QmlMainWindow()
     QFile::remove(frameGenCrashGuardPath());
     delete rtx_vsr;
     rtx_vsr = nullptr;
+    delete neural_render;
+    neural_render = nullptr;
     pl_renderer_destroy(&placebo_renderer);
     // User shader hooks hold a reference to the GPU (their descriptors destroy
     // buffers/textures via p->gpu), so they must be released before the GPU is.
@@ -5039,6 +5053,8 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
         detectOpenGLGpuVendor(this);
         amd_card = property("_chiaki_detected_amd").toBool();
         nvidia_card = property("_chiaki_detected_nvidia").toBool();
+        gpu_name = property("_chiaki_gpu_name").toString();
+        QMetaObject::invokeMethod(this, &QmlMainWindow::gpuInfoChanged, Qt::QueuedConnection);
 
         struct pl_opengl_params gl_params = {
             .get_proc_addr_ex = [](void *proc_ctx, const char *procname) -> pl_voidfunc_t {
@@ -5208,6 +5224,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
         vk_funcs.vkGetPhysicalDeviceProperties2(placebo_vulkan->phys_device, &device_props);
         vk_device_props = device_props.properties;
         vk_device_driver_props = driver_props;
+        gpu_name = QString::fromUtf8(vk_device_props.deviceName).trimmed();
         if(vk_device_props.vendorID == 0x1002)
         {
             amd_card = true;
@@ -5218,6 +5235,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
             nvidia_card = true;
             qCInfo(chiakiGui) << "Using nvidia graphics card";
         }
+        QMetaObject::invokeMethod(this, &QmlMainWindow::gpuInfoChanged, Qt::QueuedConnection);
         }
         }
 vulkan_setup_done:
@@ -5256,6 +5274,8 @@ renderer_backend_ready:
     );
     if (render_backend == RenderBackend::Vulkan && RtxVsr::compiledIn())
         rtx_vsr = new RtxVsr(placebo_log);
+    if (render_backend == RenderBackend::Vulkan && NeuralRender::compiledIn())
+        neural_render = new NeuralRender(placebo_log);
     if (render_backend == RenderBackend::Vulkan && FrameGen::compiledIn())
         frame_gen = new FrameGen(placebo_log);
     if (QFile::exists(frameGenCrashGuardPath())) {
@@ -5338,6 +5358,7 @@ renderer_backend_ready:
         fg_status_backend.storeRelaxed(0);
         fg_status_multiplier.storeRelaxed(0);
         fg_status_reason.storeRelaxed(0);
+        fg_status_requested.storeRelaxed(0);
         startup_video_visible_generation.fetchAndAddRelaxed(1);
         grab_input = 0;
         if (session)
@@ -5505,6 +5526,27 @@ renderer_backend_ready:
         fps_sample_us = fps_now_us;
 
         QStringList parts;
+        switch (nr_status_state.loadRelaxed()) {
+        case 1: {
+            QString part = QStringLiteral("DLSS NR");
+            const int out_h = nr_status_out_h.loadRelaxed();
+            if (out_h > 0)
+                part += QStringLiteral(" → %1p").arg(out_h);
+            if (nr_status_hdr.loadRelaxed())
+                part += QStringLiteral(" HDR");
+            const int cms = nr_status_gpu_cms.loadRelaxed();
+            if (cms > 0)
+                part += QStringLiteral(" %1 ms").arg(cms / 100.0, 0, 'f', 1);
+            parts << part;
+            break;
+        }
+        case 2: parts << tr("DLSS NR: idle"); break;
+        case 3: parts << tr("DLSS NR: unavailable (see log)"); break;
+        default:
+            if (nr_user_off.loadRelaxed() && this->settings && this->settings->GetNeuralRender())
+                parts << tr("DLSS NR: off (End)");
+            break;
+        }
         const int vsr_quality = vsr_status_quality.loadRelaxed();
         if (RtxVsr::isValidQuality(vsr_quality) && rtx_vsr) {
             QString part = QStringLiteral("RTX VSR %1").arg(QLatin1String(RtxVsr::qualityName(vsr_quality)));
@@ -5528,19 +5570,25 @@ renderer_backend_ready:
                 : fg_backend_status == static_cast<int>(FrameGen::Backend::Flow)
                     ? (this->settings && this->settings->GetFrameGenFlowHighQuality() ? QStringLiteral("Flow FG HQ") : QStringLiteral("Flow FG"))
                 : fg_backend_status == static_cast<int>(FrameGen::Backend::Vfg) ? QStringLiteral("NVIDIA VFG")
+                : fg_backend_status == static_cast<int>(FrameGen::Backend::Dlss12) ? QStringLiteral("DLSS FG D3D12")
                 : QStringLiteral("FSR FG");
             const int multiplier = fg_status_multiplier.loadRelaxed();
+            const int requested = fg_status_requested.loadRelaxed();
+            const QString refresh_note = requested > multiplier && requested > 1
+                ? tr(" (%1x needs %2 Hz, display %3 Hz)").arg(requested).arg(fg_status_needed_hz.loadRelaxed()).arg(fg_status_refresh_hz.loadRelaxed())
+                : QString();
             if (multiplier > 1) {
                 part += QStringLiteral(" %1x").arg(multiplier);
                 if (fg_source_cadence.loadRelaxed() == 2)
                     part += tr(" (half-rate source)");
                 if (frame_gen->gpuTimeMs() > 0.0f)
                     part += QStringLiteral(" %1 ms").arg(frame_gen->gpuTimeMs(), 0, 'f', 1);
+                part += refresh_note;
             } else {
                 switch (fg_status_reason.loadRelaxed()) {
                 case 1: part += tr(": needs Direct Mapping"); break;
                 case 2: part += tr(": unavailable (see log)"); break;
-                case 3: part += tr(": display refresh rate too low"); break;
+                case 3: part += tr(": display refresh rate too low") + refresh_note; break;
                 default: part += tr(": idle"); break;
                 }
             }
@@ -7001,32 +7049,57 @@ void QmlMainWindow::render()
     struct pl_frame fg_override_frame = {};
     bool fg_override = false;
     bool direct_frame_fresh = false;
+    // Pipelined frame generation (fg_pipe_stage): `fg_pipe_take` maps the waiting stream frame
+    // now and starts its work further down, `fg_pipe_present` presents the first frame made
+    // from a pipelined stream frame, `fg_pipe_reprocess` sends a taken frame whose pipeline
+    // did not get through down the normal path.
+    bool fg_pipe_take = false;
+    bool fg_pipe_present = false;
+    bool fg_pipe_reprocess = false;
+    if (fg_pipe_stage != FgPipeStage::Idle && (!bypass_frame_queue || !stream_active))
+        fgPipeCancel();
+    if (fg_pipe_stage != FgPipeStage::Idle)
+        fgPipeAdvance(fg_pending_frames.empty());
     if (bypass_frame_queue && !fg_pending_frames.empty()) {
         bool incoming_waiting = false;
         {
             QMutexLocker locker(&direct_frame_mutex);
             incoming_waiting = direct_pending_frame != nullptr;
         }
-        if (incoming_waiting) {
+        // (RTX VSR, which has no D3D12 half, is checked where the frame's work starts.)
+        if (incoming_waiting && fg_pipe_stage == FgPipeStage::Idle && fg_pipe_allowed && fgPipeEnabled()) {
+            // Start the new stream frame's DLSS work now and keep presenting the frames
+            // generated from the last one while the D3D12 side runs.
+            fg_pipe_take = true;
+            fg_override_frame = fg_pending_frames.front();
+            fg_pending_frames.erase(fg_pending_frames.begin());
+        } else if (incoming_waiting && fg_pipe_stage == FgPipeStage::Idle) {
             // A new stream frame is already waiting: drop the remaining
             // generated frames but still show the real one.
             fg_override_frame = fg_pending_frames.back();
             fg_pending_frames.clear();
         } else {
+            // (With a pipelined stream frame in flight its frames follow these.)
             fg_override_frame = fg_pending_frames.front();
             fg_pending_frames.erase(fg_pending_frames.begin());
         }
         fg_override = true;
+    } else if (bypass_frame_queue && fg_pipe_stage == FgPipeStage::Ready && !fg_pipe_outputs.empty()) {
+        // Every frame of the last stream frame is out: the pipelined one's frames follow.
+        fg_pending_frames = std::move(fg_pipe_outputs);
+        fg_pipe_outputs.clear();
+        fg_pipe_stage = FgPipeStage::Idle;
+        fg_override_frame = fg_pending_frames.front();
+        fg_pending_frames.erase(fg_pending_frames.begin());
+        fg_pipe_present = true;
+        fg_override = true;
+    } else if (bypass_frame_queue && fg_pipe_stage != FgPipeStage::Idle) {
+        // Taken, but its pipeline failed: the normal path below handles it.
+        fgPipeCancel();
+        fg_pipe_reprocess = direct_frame.num_planes > 0;
     }
-    if (bypass_frame_queue && fg_override) {
-        direct_render_frame = fg_override_frame;
-        frame_mix = {};
-        frame_mix.num_frames = 1;
-        frame_mix.frames = direct_frames;
-        frame_mix.timestamps = direct_timestamps;
-        queue_status = PL_QUEUE_OK;
-        queue_depth_before_update = 0;
-    } else if (bypass_frame_queue) {
+    // Maps the waiting stream frame (if any) into direct_frame; true when it did.
+    auto take_incoming_frame = [&]() {
         AVFrame *incoming = nullptr;
         bool reset_direct_frame = false;
         {
@@ -7040,6 +7113,7 @@ void QmlMainWindow::render()
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
         }
+        bool mapped = false;
         if (incoming) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
@@ -7054,10 +7128,31 @@ void QmlMainWindow::render()
                     backend->disableZeroCopy();
             } else {
                 direct_frame_serial++;
-                direct_frame_fresh = true;
+                mapped = true;
             }
             av_frame_free(&incoming);
         }
+        return mapped;
+    };
+    if (fg_pipe_take) {
+        if (take_incoming_frame())
+            fg_pipe_stage = FgPipeStage::Taken;
+        else
+            fg_pipe_take = false;
+    }
+    if (bypass_frame_queue && fg_override) {
+        direct_render_frame = fg_override_frame;
+        frame_mix = {};
+        frame_mix.num_frames = 1;
+        frame_mix.frames = direct_frames;
+        frame_mix.timestamps = direct_timestamps;
+        queue_status = PL_QUEUE_OK;
+        queue_depth_before_update = 0;
+    } else if (bypass_frame_queue) {
+        if (fg_pipe_reprocess)
+            direct_frame_fresh = true;
+        else
+            direct_frame_fresh = take_incoming_frame();
         direct_render_frame = direct_frame;
         frame_mix = {};
         frame_mix.num_frames = direct_frame.num_planes > 0 ? 1 : 0;
@@ -7839,6 +7934,187 @@ void QmlMainWindow::render()
         }
     }
 
+    // DLSS neural rendering (DLSS 5 through the NGX D3D12 bridge; NeuralHub on AMD):
+    // replace each source frame with a neural rendered RGB frame, at its own size or
+    // upscaled 1.5x / 2x toward the window, before RTX VSR and frame generation, which
+    // then work on it. Any failure keeps the decoded frame.
+    constexpr int kNeuralMaxMixFrames = 8;
+    std::array<struct pl_frame, kNeuralMaxMixFrames> nr_frames;
+    std::array<const struct pl_frame *, kNeuralMaxMixFrames> nr_frame_ptrs;
+    std::array<uint64_t, kNeuralMaxMixFrames> nr_signatures;
+    uint64_t direct_signature = direct_frame_serial;
+    bool nr_applied = false;
+    bool nr_upscaled = false;
+    int nr_out_h = 0;
+    bool nr_hdr = false;
+    const bool nr_user_off_now = nr_user_off.loadRelaxed() != 0;
+    const bool nr_wanted = neural_render && has_settings && settings->GetNeuralRender() && stream_active && !nr_user_off_now;
+    // Back on after the End key: start a fresh history instead of blending in old frames.
+    if (nr_wanted && nr_user_off_seen)
+        neural_render->resetHistory();
+    nr_user_off_seen = nr_user_off_now;
+    // The DLSS 5 controls (NVIDIA), read again whenever the settings change.
+    if (has_settings) {
+        const uint32_t tuning_rev = settings->GetNeuralRenderTuningRevision();
+        if (tuning_rev != nr_tuning_rev) {
+            nr_tuning_rev = tuning_rev;
+            nr_passes = settings->GetNeuralRenderPasses();
+            for (int p = 0; p < NeuralRenderTuning::kMaxPasses; p++)
+                nr_tuning[static_cast<size_t>(p)] = settings->GetNeuralRenderEffectiveTuning(p);
+        }
+    }
+    // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
+    // the largest step DLSS Performance covers well), or the source size.
+    auto nr_options_for = [&](const struct pl_frame *src) {
+        NeuralRender::Options options;
+        options.model = settings->GetNeuralRenderModel();
+        options.passes = nr_passes;
+        options.tuning = nr_tuning;
+        if (!settings->GetNeuralRenderUpscale() || !src)
+            return options;
+        const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
+        const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
+        if (src_w < 1.0f || src_h < 1.0f)
+            return options;
+        const float ratio = qMin(dst_w / src_w, dst_h / src_h);
+        const float scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
+        if (scale > 1.0f) {
+            // Even sizes keep the chroma-free RGB textures and the upscaler's ratios exact.
+            options.out_width = static_cast<int>(lroundf(src_w * scale / 2.0f)) * 2;
+            options.out_height = static_cast<int>(lroundf(src_h * scale / 2.0f)) * 2;
+        }
+        return options;
+    };
+    auto note_result = [&](const struct pl_frame *src, const struct pl_frame &out) {
+        nr_upscaled = fabsf(pl_rect_w(out.crop)) > fabsf(pl_rect_w(src->crop)) + 0.5f;
+        nr_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(out.crop))));
+        nr_hdr = pl_color_space_is_hdr(&out.color);
+    };
+    // How many frames frame generation makes per source picture: the multiplier asked for,
+    // held back by the display. Also sets the status note on what the display holds back.
+    auto plan_fg_multiplier = [&](int cadence, double source_interval_s, double refresh_hz) {
+        // More output frames than the display can show only adds latency.
+        const int refresh_cap = source_interval_s > 0.0
+            ? static_cast<int>(std::floor(refresh_hz * source_interval_s + 0.15))
+            : 2;
+        const int multiplier = qMin(settings->GetFrameGenMultiplier() * cadence, refresh_cap);
+        // When the display holds back the multiplier asked for, the status says what it would take.
+        // Counted per source picture like the status's own number: 4x of a 30 fps stream needs 120 Hz.
+        // Never more than the backend can make (4 until it has started), so a half-rate source with 4x
+        // at 150 Hz, already at the backend's 4 per picture, gets no note.
+        const int fg_max_known = frame_gen && frame_gen->maxMultiplier() > 1 ? frame_gen->maxMultiplier() : 4;
+        const int fg_requested = qMin(settings->GetFrameGenMultiplier() * cadence, fg_max_known);
+        const bool fg_capped = refresh_cap < fg_requested && source_interval_s > 0.0;
+        fg_status_requested.storeRelaxed(fg_capped ? fg_requested : 0);
+        fg_status_needed_hz.storeRelaxed(fg_capped ? static_cast<int>(std::lround(fg_requested / source_interval_s)) : 0);
+        fg_status_refresh_hz.storeRelaxed(static_cast<int>(std::lround(refresh_hz)));
+        return multiplier;
+    };
+    // Pipelined frame generation: start the stream frame taken above (fg_pipe_stage). Its
+    // DLSS 5 (or, without it, its DLSS FG) is queued on D3D12 now; the rest follows in
+    // fgPipeAdvance() while this render presents a frame generated from the last one.
+    if (fg_pipe_take && fg_pipe_stage == FgPipeStage::Taken && frame_gen && has_settings) {
+        const int cadence = fg_source_cadence.loadRelaxed();
+        const double source_interval_s = stream_interval_s * cadence;
+        const int multiplier = qMin(plan_fg_multiplier(cadence, source_interval_s, refresh_rate),
+                                    frame_gen->maxMultiplier());
+        const bool nr_on = nr_wanted && neural_render->ensureInitialized(placebo_vulkan);
+        if (!nr_on) {
+            nr_status_state.storeRelaxed(!nr_wanted ? 0 : neural_render && neural_render->failed() ? 3 : 2);
+            nr_status_gpu_cms.storeRelaxed(0);
+            nr_status_out_h.storeRelaxed(0);
+            nr_status_hdr.storeRelaxed(0);
+        }
+        // RTX VSR runs on frames DLSS 5 did not upscale and has no D3D12 half to pipeline.
+        const NeuralRender::Options pipe_nr_options = nr_on ? nr_options_for(&direct_frame) : NeuralRender::Options();
+        const bool nr_will_upscale = nr_on && pipe_nr_options.out_width > 0 && neural_render->canUpscale();
+        const bool vsr_would_run = rtx_vsr && nvidia_card && settings->GetRtxVsrQuality() > 0 && !rtx_vsr->failed() &&
+                                   !nr_will_upscale;
+        // Fewer than 2 frames, RTX VSR, or a failure: the frame stays Taken and goes down the
+        // normal path once the last stream frame's frames are out.
+        if (vsr_would_run) {
+            fg_pipe_allowed = false;
+        } else if (multiplier >= 2 && frame_gen->backend() == FrameGen::Backend::Dlss12) {
+            fg_pipe_multiplier = multiplier;
+            fg_pipe_cadence = cadence;
+            fg_pipe_out_w = static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop))));
+            fg_pipe_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(target_frame.crop))));
+            fg_pipe_interval_ms = static_cast<float>(source_interval_s * 1000.0);
+            fg_pipe_nr = nr_on;
+            frame_gen->setFlowHighQuality(settings->GetFrameGenFlowHighQuality());
+            frame_gen->setDlssMotion(settings->GetFrameGenDlssMotion());
+            frame_gen->setCleanup(settings->GetFrameGenCleanup());
+            frame_gen->setVfgMode(settings->GetFrameGenVfgMode());
+            if (nr_on) {
+#ifdef Q_OS_WIN
+                neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
+#endif
+                fg_pipe_nr_options = pipe_nr_options;
+                if (neural_render->begin(&direct_frame, direct_frame_serial, fg_pipe_nr_options))
+                    fg_pipe_stage = FgPipeStage::NeuralRender;
+            } else {
+                fg_pipe_fg_src = direct_frame;
+                if (frame_gen->begin(&fg_pipe_fg_src, fg_pipe_out_w, fg_pipe_out_h, fg_pipe_multiplier,
+                                     fg_pipe_interval_ms))
+                    fg_pipe_stage = FgPipeStage::FrameGen;
+            }
+        }
+    }
+    if (!fg_override && nr_wanted && neural_render->ensureInitialized(placebo_vulkan)) {
+#ifdef Q_OS_WIN
+        // NeuralHub's in-game panel (End) is shown over the video in this window.
+        neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
+#endif
+        if (bypass_frame_queue) {
+            struct pl_frame rendered = {};
+            uint64_t rendered_signature = 0;
+            if (direct_render_frame.num_planes > 0 &&
+                neural_render->process(&direct_render_frame, direct_frame_serial, nr_options_for(&direct_render_frame),
+                                       &rendered, &rendered_signature)) {
+                note_result(&direct_render_frame, rendered);
+                direct_render_frame = rendered;
+                direct_signature = rendered_signature;
+                nr_applied = true;
+            }
+        } else if (frame_mix.num_frames > 0 && frame_mix.num_frames <= kNeuralMaxMixFrames) {
+            nr_applied = true;
+            const NeuralRender::Options options = nr_options_for(frame_mix.frames[0]);
+            for (int i = 0; i < frame_mix.num_frames && nr_applied; i++) {
+                nr_applied = neural_render->process(frame_mix.frames[i], frame_mix.signatures[i], options, &nr_frames[i],
+                                                    &nr_signatures[i]);
+                nr_frame_ptrs[i] = &nr_frames[i];
+            }
+            if (nr_applied) {
+                note_result(frame_mix.frames[0], nr_frames[0]);
+                frame_mix.frames = nr_frame_ptrs.data();
+                frame_mix.signatures = nr_signatures.data();
+            }
+        }
+    }
+    if (!nr_applied)
+        nr_upscaled = false;
+    if (neural_render) {
+        // NeuralHub's panel window only stays up while neural rendering runs (a failure hides
+        // it on its own; a render without a new frame keeps it). Pipelined, every render
+        // presents a generated frame and DLSS 5 runs in between: the panel stays up.
+        if (!nr_wanted || (fg_override && !(fg_pipe_nr && fg_pipe_allowed)))
+            neural_render->hidePanel();
+        nr_provider_panel.storeRelaxed(neural_render->hasProviderPanel() ? 1 : 0);
+        const int tunable = neural_render->tunable() ? 1 : 0;
+        if (nr_tunable.fetchAndStoreRelaxed(tunable) != tunable)
+            QMetaObject::invokeMethod(this, [this]() { emit neuralRenderTunableChanged(); }, Qt::QueuedConnection);
+    }
+    if (!fg_override) {
+        if (nr_applied != neural_render_active) {
+            neural_render_active = nr_applied;
+            qCInfo(chiakiGui) << "DLSS neural rendering" << (nr_applied ? "active" : "inactive");
+        }
+        nr_status_state.storeRelaxed(!nr_wanted ? 0 : nr_applied ? 1 : neural_render->failed() ? 3 : 2);
+        nr_status_gpu_cms.storeRelaxed(nr_applied ? static_cast<int>(neural_render->gpuTimeMs() * 100.0f) : 0);
+        nr_status_out_h.storeRelaxed(nr_applied && nr_upscaled ? nr_out_h : 0);
+        nr_status_hdr.storeRelaxed(nr_applied && nr_hdr ? 1 : 0);
+    }
+
     // RTX Video Super Resolution: replace each source frame with an NVIDIA
     // upscaled RGB frame at the output size, so libplacebo only color maps it
     // and scales it ~1:1. Any failure keeps the regular libplacebo path.
@@ -7849,14 +8125,16 @@ void QmlMainWindow::render()
     std::array<uint64_t, kRtxVsrMaxMixFrames> vsr_signatures;
     bool vsr_applied = false;
     const int rtx_vsr_quality = rtx_vsr && has_settings ? settings->GetRtxVsrQuality() : 0;
-    if (!fg_override && rtx_vsr_quality > 0 && nvidia_card && stream_active && rtx_vsr->ensureInitialized(placebo_vulkan)) {
+    // Not after neural rendering upscaled the frame (it already is near the window size).
+    if (!fg_override && !nr_upscaled && rtx_vsr_quality > 0 && nvidia_card && stream_active &&
+        rtx_vsr->ensureInitialized(placebo_vulkan)) {
         const int vsr_out_w = static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop))));
         const int vsr_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(target_frame.crop))));
         if (bypass_frame_queue) {
             struct pl_frame upscaled = {};
             uint64_t upscaled_signature = 0;
             if (direct_render_frame.num_planes > 0 &&
-                rtx_vsr->process(&direct_render_frame, direct_frame_serial, vsr_out_w, vsr_out_h,
+                rtx_vsr->process(&direct_render_frame, direct_signature, vsr_out_w, vsr_out_h,
                                  rtx_vsr_quality, &upscaled, &upscaled_signature)) {
                 direct_render_frame = upscaled;
                 vsr_applied = true;
@@ -7877,6 +8155,7 @@ void QmlMainWindow::render()
     }
     if (enhancement_log_reset.fetchAndStoreAcquire(0)) {
         rtx_vsr_active = false;
+        neural_render_active = false;
         fg_skip_logged = 0;
     }
 
@@ -7892,6 +8171,8 @@ void QmlMainWindow::render()
     if (fg_backend != fg_last_backend) {
         fg_last_backend = fg_backend;
         fg_pending_frames.clear();
+        fgPipeCancel();
+        fg_pipe_allowed = false;
         fg_active_multiplier = 1;
         fg_active_cadence = 1;
         if (frame_gen)
@@ -7899,18 +8180,29 @@ void QmlMainWindow::render()
         if (fg_backend && !bypass_frame_queue)
             qCInfo(chiakiGui) << "Frame generation requires Direct Mapping and stays disabled";
     }
+    // "DLSS Frame Generation" runs through Vulkan NGX, which needs an NVIDIA GPU. On other GPUs
+    // (AMD with NeuralHub), or when Vulkan NGX fails, the same DLSS FG runs through the D3D12 bridge.
+    int fg_run_backend = fg_backend;
+    if (fg_backend == static_cast<int>(FrameGen::Backend::Dlss) && frame_gen &&
+        FrameGen::backendCompiledIn(FrameGen::Backend::Dlss12) &&
+        (!nvidia_card || frame_gen->backendFailed(FrameGen::Backend::Dlss))) {
+        fg_run_backend = static_cast<int>(FrameGen::Backend::Dlss12);
+        if (!fg_dlss12_route_logged) {
+            fg_dlss12_route_logged = true;
+            qCInfo(chiakiGui).nospace() << "DLSS Frame Generation: "
+                << (nvidia_card ? "Vulkan NGX is unavailable" : "not an NVIDIA GPU")
+                << ", running it through D3D12 (" << FrameGen::backendName(FrameGen::Backend::Dlss12)
+                << ", NeuralHub on AMD)";
+        }
+    }
     bool fg_applied = fg_override;
-    if (!fg_override && direct_frame_fresh && fg_backend > 0 && stream_active && direct_render_frame.num_planes > 0) {
-        const auto backend_choice = static_cast<FrameGen::Backend>(fg_backend);
+    if (!fg_override && direct_frame_fresh && fg_run_backend > 0 && stream_active && direct_render_frame.num_planes > 0) {
+        const auto backend_choice = static_cast<FrameGen::Backend>(fg_run_backend);
         // With repeats dropped a picture lasts `cadence` stream frames; the
         // multiplier stays relative to the stream rate, so output fps is kept.
         const int cadence = fg_source_cadence.loadRelaxed();
         const double source_interval_s = stream_interval_s * cadence;
-        // More output frames than the display can show only adds latency.
-        const int refresh_cap = source_interval_s > 0.0
-            ? static_cast<int>(std::floor(refresh_rate * source_interval_s + 0.15))
-            : 2;
-        int multiplier = qMin(settings->GetFrameGenMultiplier() * cadence, refresh_cap);
+        int multiplier = plan_fg_multiplier(cadence, source_interval_s, refresh_rate);
         fg_refresh_limited = multiplier < 2;
         if (fg_refresh_limited && fg_skip_logged != 3) {
             fg_skip_logged = 3;
@@ -7956,22 +8248,49 @@ void QmlMainWindow::render()
                 fg_active_multiplier = multiplier;
                 fg_active_cadence = cadence;
                 fg_applied = true;
+                // RTX VSR has no split into a D3D12 half, so it keeps the frames unpipelined.
+                fg_pipe_allowed = backend_choice == FrameGen::Backend::Dlss12 && !vsr_applied;
             }
         }
     }
-    if (direct_frame_fresh && !fg_applied && fg_active_multiplier != 1) {
-        qCInfo(chiakiGui) << "Frame generation inactive";
-        fg_active_multiplier = 1;
-        fg_active_cadence = 1;
-        fg_pending_frames.clear();
+    if (direct_frame_fresh && !fg_applied) {
+        fg_pipe_allowed = false;
+        if (fg_active_multiplier != 1) {
+            qCInfo(chiakiGui) << "Frame generation inactive";
+            fg_active_multiplier = 1;
+            fg_active_cadence = 1;
+            fg_pending_frames.clear();
+        }
+    }
+    if (fg_pipe_present) {
+        // The first frame made from a pipelined stream frame: what the block above does for a
+        // stream frame processed in this render.
+        if (fg_active_multiplier != fg_pipe_multiplier || fg_active_cadence != fg_pipe_cadence)
+            qCInfo(chiakiGui).nospace() << "Frame generation active: "
+                << FrameGen::backendName(FrameGen::Backend::Dlss12) << " " << fg_pipe_multiplier << "x"
+                << (fg_pipe_cadence == 2 ? " of a half-rate source (repeats dropped)" : "") << ", pipelined";
+        if (!fg_pipe_logged) {
+            fg_pipe_logged = true;
+            qCInfo(chiakiGui) << "[framegen] Pipelined: the next stream frame's DLSS work runs on D3D12 while the"
+                                 " frames generated from the last one are presented";
+        }
+        fg_active_multiplier = fg_pipe_multiplier;
+        fg_active_cadence = fg_pipe_cadence;
+        if (!fg_pending_frames.empty() && fg_crash_guard_armed && ++fg_crash_guard_good_frames >= 120) {
+            QFile::remove(frameGenCrashGuardPath());
+            fg_crash_guard_armed = false;
+        }
+        fg_status_backend.storeRelaxed(stream_active ? fg_run_backend : 0);
+        fg_status_multiplier.storeRelaxed(fg_pipe_multiplier);
+        fg_status_reason.storeRelaxed(0);
     }
     if (direct_frame_fresh || !bypass_frame_queue) {
-        fg_status_backend.storeRelaxed(stream_active ? fg_backend : 0);
+        fg_status_backend.storeRelaxed(stream_active ? fg_run_backend : 0);
         fg_status_multiplier.storeRelaxed(fg_applied ? fg_active_multiplier : 0);
         int reason = 0;
         if (!bypass_frame_queue)
             reason = 1;
-        else if (fg_backend > 0 && frame_gen->backendFailed(static_cast<FrameGen::Backend>(fg_backend)))
+        else if (fg_run_backend > 0 && frame_gen->backendFailed(static_cast<FrameGen::Backend>(fg_run_backend)))
             reason = 2;
         else if (fg_backend > 0 && fg_refresh_limited)
             reason = 3;
@@ -7982,7 +8301,7 @@ void QmlMainWindow::render()
         }
     }
 
-    if ((vsr_applied && !RtxVsr::keepsResolution(rtx_vsr_quality)) || fg_applied) {
+    if ((vsr_applied && !RtxVsr::keepsResolution(rtx_vsr_quality)) || fg_applied || nr_upscaled) {
         // The frame already is at display size; skip the shader upscalers
         // but keep RCAS, which sharpens the final image.
         const bool rcas_active = num_active_hooks > 0 && active_hooks[num_active_hooks - 1] == rcas_hook;
@@ -8051,9 +8370,64 @@ void QmlMainWindow::render()
     if (!scheduled_pending)
         schedulePostRenderWork();
     schedulePostSwapchainRecreateRefresh();
-    // Frames left over from frame generation are presented by the next renders.
-    if (!fg_pending_frames.empty())
+    // Frames left over from frame generation (and a pipelined stream frame's) are presented
+    // by the next renders.
+    if (!fg_pending_frames.empty() || fg_pipe_stage != FgPipeStage::Idle)
         scheduleUpdate(false, UpdateRequestReason::PendingFrame);
+}
+
+bool QmlMainWindow::fgPipeEnabled()
+{
+    // CHIAKI_FG_PIPELINE=0 turns it off (for A/B tests).
+    static const bool enabled = qgetenv("CHIAKI_FG_PIPELINE") != "0";
+    return enabled;
+}
+
+void QmlMainWindow::fgPipeCancel()
+{
+    // A begun DLSS 5 / DLSS FG call nobody collects is dropped by their next call.
+    fg_pipe_stage = FgPipeStage::Idle;
+    fg_pipe_outputs.clear();
+    fg_pipe_fg_src = {};
+}
+
+void QmlMainWindow::fgPipeAdvance(bool drain)
+{
+    if (fg_pipe_stage == FgPipeStage::NeuralRender && (drain || !neural_render || neural_render->beginDone())) {
+        struct pl_frame rendered = {};
+        uint64_t rendered_signature = 0;
+        const bool nr_ok = neural_render && direct_frame.num_planes > 0 &&
+            neural_render->process(&direct_frame, direct_frame_serial, fg_pipe_nr_options, &rendered, &rendered_signature);
+        // What the normal path does with the result (status, log), see render().
+        if (nr_ok != neural_render_active) {
+            neural_render_active = nr_ok;
+            qCInfo(chiakiGui) << "DLSS neural rendering" << (nr_ok ? "active" : "inactive");
+        }
+        const bool upscaled = nr_ok && fabsf(pl_rect_w(rendered.crop)) > fabsf(pl_rect_w(direct_frame.crop)) + 0.5f;
+        nr_status_state.storeRelaxed(nr_ok ? 1 : neural_render && neural_render->failed() ? 3 : 2);
+        nr_status_gpu_cms.storeRelaxed(nr_ok ? static_cast<int>(neural_render->gpuTimeMs() * 100.0f) : 0);
+        nr_status_out_h.storeRelaxed(upscaled ? static_cast<int>(lroundf(fabsf(pl_rect_h(rendered.crop)))) : 0);
+        nr_status_hdr.storeRelaxed(nr_ok && pl_color_space_is_hdr(&rendered.color) ? 1 : 0);
+        if (!nr_ok) {
+            // The normal path retries it (and counts the failure) with the frame as it is.
+            fg_pipe_stage = FgPipeStage::Taken;
+            return;
+        }
+        fg_pipe_fg_src = rendered;
+        fg_pipe_stage = frame_gen && frame_gen->begin(&fg_pipe_fg_src, fg_pipe_out_w, fg_pipe_out_h,
+                                                      fg_pipe_multiplier, fg_pipe_interval_ms)
+            ? FgPipeStage::FrameGen
+            : FgPipeStage::Taken;
+    }
+    if (fg_pipe_stage == FgPipeStage::FrameGen && (drain || !frame_gen || frame_gen->beginDone())) {
+        std::vector<struct pl_frame> outputs;
+        if (frame_gen && frame_gen->finish(outputs) && !outputs.empty()) {
+            fg_pipe_outputs = std::move(outputs);
+            fg_pipe_stage = FgPipeStage::Ready;
+        } else {
+            fg_pipe_stage = FgPipeStage::Taken;
+        }
+    }
 }
 
 bool QmlMainWindow::handleShortcut(QKeyEvent *event)
@@ -8066,6 +8440,18 @@ bool QmlMainWindow::handleShortcut(QKeyEvent *event)
             else
                 normalTime();
             return true;
+        case Qt::Key_End:
+            // NeuralHub runs DLSS 5: End is its in-game panel's key, as in games (NeuralHub polls
+            // the key itself and the panel is shown over the video); it only stays away from the
+            // console here.
+            if (session && settings && settings->GetNeuralRender() && nr_provider_panel.loadRelaxed())
+                return true;
+            // NVIDIA: chiaki-ng's own DLSS 5 panel over the video (on/off, passes, controls).
+            if (session && settings && settings->GetNeuralRender()) {
+                emit neuralRenderPanelRequested();
+                return true;
+            }
+            break;
         default:
             break;
         }
@@ -8110,6 +8496,47 @@ bool QmlMainWindow::nvidiaCard() const
     return nvidia_card;
 }
 
+QString QmlMainWindow::gpuName() const
+{
+    return gpu_name;
+}
+
+bool QmlMainWindow::neuralRenderPaused() const
+{
+    return nr_user_off.loadRelaxed() != 0;
+}
+
+void QmlMainWindow::setNeuralRenderPaused(bool paused)
+{
+    if ((nr_user_off.loadRelaxed() != 0) == paused)
+        return;
+    nr_user_off.storeRelaxed(paused ? 1 : 0);
+    qCInfo(chiakiGui) << "DLSS neural rendering switched" << (paused ? "off" : "on") << "for this run";
+    emit neuralRenderToggled(!paused);
+    scheduleUpdate(true, UpdateRequestReason::Unknown);
+}
+
+void QmlMainWindow::setPanelButtonRect(const QRectF &rect)
+{
+    const bool was_shown = !panel_button_rect.isEmpty();
+    panel_button_rect = rect;
+    const bool shown = !rect.isEmpty();
+    if (!shown)
+        panel_button_pressed = false;
+    if (shown == was_shown || grab_input)
+        return;
+    // The cursor shows while the button does (it is hidden over the stream otherwise).
+    if (shown)
+        setCursor(Qt::ArrowCursor);
+    else if (has_video && settings->GetHideCursor())
+        setCursor(Qt::BlankCursor);
+}
+
+bool QmlMainWindow::neuralRenderTunable() const
+{
+    return nr_tunable.loadRelaxed() != 0;
+}
+
 bool QmlMainWindow::event(QEvent *event)
 {
     switch (event->type()) {
@@ -8119,6 +8546,21 @@ bool QmlMainWindow::event(QEvent *event)
         if (static_cast<QMouseEvent*>(event)->source() != Qt::MouseEventNotSynthesized)
             return true;
         if (session && !grab_input) {
+            // The RTX settings button over the stream: a left click on it opens the panel; the
+            // press and its release stay away from the console.
+            auto *me = static_cast<QMouseEvent*>(event);
+            const bool on_button = !panel_button_rect.isEmpty() && panel_button_rect.contains(me->position());
+            if (event->type() == QEvent::MouseMove) {
+                emit streamPointerMoved();
+            } else if (event->type() == QEvent::MouseButtonPress && me->button() == Qt::LeftButton && on_button) {
+                panel_button_pressed = true;
+                return true;
+            } else if (event->type() == QEvent::MouseButtonRelease && me->button() == Qt::LeftButton && panel_button_pressed) {
+                panel_button_pressed = false;
+                if (on_button)
+                    emit neuralRenderPanelRequested();
+                return true;
+            }
             if (event->type() == QEvent::MouseMove)
                 session->HandleMouseMoveEvent(static_cast<QMouseEvent*>(event), width(), height());
             else if (event->type() == QEvent::MouseButtonPress)

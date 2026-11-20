@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
 
 #include <settings.h>
+#include <cmath>
 #include <SDL.h>
 #include <QFile>
 #include <QFileInfo>
@@ -2515,4 +2516,62 @@ QMap<Qt::Key, int> Settings::GetControllerMappingForDecoding()
 		result[it.value()] = it.key();
 	}
 	return result;
+}
+
+// ---- DLSS 5 neural rendering controls (NVIDIA feature 18) ----
+
+static QString NeuralRenderTuningKey(int pass, const char *name)
+{
+	return QStringLiteral("settings/neural_render_p%1_%2").arg(pass + 1).arg(QLatin1String(name));
+}
+
+NeuralRenderTuning Settings::ClampNeuralRenderTuning(NeuralRenderTuning t)
+{
+	auto clampf = [](float v, float lo, float hi, float fallback) { return std::isfinite(v) ? qBound(lo, v, hi) : fallback; };
+	t.style = qBound(0, t.style, 2);
+	t.intensity = clampf(t.intensity, 0.0f, 1.0f, 1.0f);
+	t.local_structure = clampf(t.local_structure, 0.0f, 2.0f, 1.0f);
+	t.local_tone = clampf(t.local_tone, 0.0f, 2.0f, 1.0f);
+	t.skin_structure = clampf(t.skin_structure, 0.0f, 2.5f, 1.0f);
+	return t;
+}
+
+NeuralRenderTuning Settings::GetNeuralRenderTuning(int pass) const
+{
+	pass = qBound(0, pass, NeuralRenderTuning::kMaxPasses - 1);
+	const NeuralRenderTuning d;
+	NeuralRenderTuning t;
+	t.style = settings.value(NeuralRenderTuningKey(pass, "style"), d.style).toInt();
+	t.intensity = settings.value(NeuralRenderTuningKey(pass, "intensity"), d.intensity).toFloat();
+	t.local_structure = settings.value(NeuralRenderTuningKey(pass, "local_structure"), d.local_structure).toFloat();
+	t.local_tone = settings.value(NeuralRenderTuningKey(pass, "local_tone"), d.local_tone).toFloat();
+	t.auto_mask = settings.value(NeuralRenderTuningKey(pass, "auto_mask"), d.auto_mask).toBool();
+	t.skin_structure = settings.value(NeuralRenderTuningKey(pass, "skin_structure"), d.skin_structure).toFloat();
+	return ClampNeuralRenderTuning(t);
+}
+
+void Settings::SetNeuralRenderTuning(int pass, const NeuralRenderTuning &tuning)
+{
+	if (pass < 0 || pass >= NeuralRenderTuning::kMaxPasses)
+		return;
+	const NeuralRenderTuning t = ClampNeuralRenderTuning(tuning);
+	settings.setValue(NeuralRenderTuningKey(pass, "style"), t.style);
+	settings.setValue(NeuralRenderTuningKey(pass, "intensity"), t.intensity);
+	settings.setValue(NeuralRenderTuningKey(pass, "local_structure"), t.local_structure);
+	settings.setValue(NeuralRenderTuningKey(pass, "local_tone"), t.local_tone);
+	settings.setValue(NeuralRenderTuningKey(pass, "auto_mask"), t.auto_mask);
+	settings.setValue(NeuralRenderTuningKey(pass, "skin_structure"), t.skin_structure);
+	neural_render_tuning_rev.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Settings::SetNeuralRenderPasses(int passes)
+{
+	settings.setValue("settings/neural_render_passes", qBound(1, passes, NeuralRenderTuning::kMaxPasses));
+	neural_render_tuning_rev.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Settings::SetNeuralRenderPerPass(bool enabled)
+{
+	settings.setValue("settings/neural_render_per_pass", enabled);
+	neural_render_tuning_rev.fetch_add(1, std::memory_order_relaxed);
 }

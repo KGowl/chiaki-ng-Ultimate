@@ -201,10 +201,11 @@ jobs:
         run: |
           git clone --depth 1 --filter=blob:none --no-checkout https://github.com/NVIDIA/DLSS.git ngx-sdk
           cd ngx-sdk
-          git sparse-checkout set --no-cone /include/ /lib/Windows_x86_64/x64/nvsdk_ngx_d.lib /lib/Windows_x86_64/rel/nvngx_dlssg.dll /LICENSE.txt
+          git sparse-checkout set --no-cone /include/ /lib/Windows_x86_64/x64/nvsdk_ngx_d.lib /lib/Windows_x86_64/rel/nvngx_dlssg.dll /lib/Windows_x86_64/rel/nvngx_dlss.dll /LICENSE.txt
           git checkout
           if (-not (Test-Path "lib\Windows_x86_64\x64\nvsdk_ngx_d.lib")) { throw "NGX library missing" }
           if (-not (Test-Path "lib\Windows_x86_64\rel\nvngx_dlssg.dll")) { throw "DLSS Frame Generation runtime missing" }
+          if (-not (Test-Path "lib\Windows_x86_64\rel\nvngx_dlss.dll")) { throw "DLSS Super Resolution runtime missing" }
 
       - name: Fetch AMD FidelityFX SDK (FSR 3.1 Frame Generation)
         run: |
@@ -240,10 +241,27 @@ jobs:
         run: |
           cmake --build build --config Release --clean-first --target chiaki
 
+      # Console test of the frame generation backends (gui/tools/fgdx12test.cpp); a failure here
+      # must not stop the application package.
+      - name: Build the frame generation test tool
+        continue-on-error: true
+        run: |
+          cmake --build build --config Release --target chiaki-fgdx12test
+
+      # Console test of the DLSS 5 panel (gui/tools/nrpaneltest.cpp), no stream needed.
+      - name: Build the DLSS 5 panel test tool
+        continue-on-error: true
+        run: |
+          cmake --build build --config Release --target chiaki-nrpaneltest
+
       - name: Prepare Qt deployment package
         run: |
           mkdir chiaki-ng-Win
           cp build\gui\chiaki.exe chiaki-ng-Win
+          if (Test-Path build\gui\chiaki-fgdx12test.exe) { cp build\gui\chiaki-fgdx12test.exe chiaki-ng-Win }
+          if (Test-Path build\gui\chiaki-nrpaneltest.exe) { cp build\gui\chiaki-nrpaneltest.exe chiaki-ng-Win }
+          # Pass-through for NVIDIA's DLSS Neural Rendering snippet (gui/src/nrgate.cpp)
+          cp build\gui\nvngx.dll_dlssnr.dll chiaki-ng-Win
           cp build\third-party\cpp-steam-tools\cpp-steam-tools.dll chiaki-ng-Win
           cp scripts\qtwebengine_import.qml gui\src\qml\
           # Ship every runtime DLL vcpkg built; names change between vcpkg versions (e.g. lcms2).
@@ -259,6 +277,8 @@ jobs:
           cp "${{ github.workspace }}\${{ env.dep_folder }}\bin\spirv-cross-c-shared.dll" chiaki-ng-Win
           # Frame generation runtimes (redistributable parts of the NVIDIA DLSS SDK and the AMD FidelityFX SDK)
           cp "${{ github.workspace }}\ngx-sdk\lib\Windows_x86_64\rel\nvngx_dlssg.dll" chiaki-ng-Win
+          # DLSS Super Resolution: upscaling after DLSS 5 neural rendering on NVIDIA
+          cp "${{ github.workspace }}\ngx-sdk\lib\Windows_x86_64\rel\nvngx_dlss.dll" chiaki-ng-Win
           cp "${{ github.workspace }}\ffx-sdk\PrebuiltSignedDLL\amd_fidelityfx_vk.dll" chiaki-ng-Win
           # Downloads the NVIDIA VFG / RTX VSR runtime on demand (not redistributed)
           cp scripts\install-nvidia-vfx.ps1 chiaki-ng-Win

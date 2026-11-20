@@ -6,8 +6,11 @@
 #include <chiaki/session.h>
 
 #include "host.h"
+#include "neuralrendertuning.h"
 
 #include <QSettings>
+#include <atomic>
+#include <cstdint>
 #include <QList>
 #include <QMap>
 #include <QRect>
@@ -211,6 +214,8 @@ class Settings : public QObject
 		size_t ps4s_registered;
 		QMap<int, ManualHost> manual_hosts;
 		int manual_hosts_id_next;
+		// Bumped by every change of the neural rendering passes or controls.
+		std::atomic<uint32_t> neural_render_tuning_rev{ 1 };
 
 		void LoadRegisteredHosts(QSettings *qsettings = nullptr);
 		void SaveRegisteredHosts(QSettings *qsettings = nullptr);
@@ -539,17 +544,44 @@ class Settings : public QObject
 		}
 		static int ValidRtxVsrQuality(int q) { return ((q >= 1 && q <= 4) || (q >= 8 && q <= 11) || q == 21 || q == 23) ? q : 0; }
 		// Frame generation backend: 0 = off, 1 = DLSS Frame Generation, 2 = FSR 3.1 Frame Generation,
-		// 3 = Flow (chiaki-ng's own, any GPU / OS), 4 = NVIDIA VFG (Windows)
-		int GetFrameGenBackend() const { return qBound(0, settings.value("settings/frame_gen_backend", 0).toInt(), 4); }
+		// 3 = Flow (chiaki-ng's own, any GPU / OS), 4 = NVIDIA VFG (Windows), 5 = DLSS Frame Generation
+		// through NGX D3D12 (FrameGen::Backend::Dlss12)
+		int GetFrameGenBackend() const { return qBound(0, settings.value("settings/frame_gen_backend", 0).toInt(), 5); }
 		void SetFrameGenBackend(int backend)
 		{
-			backend = qBound(0, backend, 4);
+			backend = qBound(0, backend, 5);
 			settings.setValue("settings/frame_gen_backend", backend);
 			if (backend)
 				settings.setValue("settings/frame_gen_last_backend", backend);
 		}
 		// Backend restored when frame generation is switched back on from the stream menu (0 = never chosen).
-		int GetFrameGenLastBackend() const { return qBound(0, settings.value("settings/frame_gen_last_backend", 0).toInt(), 4); }
+		int GetFrameGenLastBackend() const { return qBound(0, settings.value("settings/frame_gen_last_backend", 0).toInt(), 5); }
+		// DLSS neural rendering (DLSS 5) on the video through the NGX D3D12 bridge, see neuralrender.h.
+		bool GetNeuralRender() const { return settings.value("settings/neural_render", false).toBool(); }
+		void SetNeuralRender(bool enabled) { settings.setValue("settings/neural_render", enabled); }
+		// Upscale after neural rendering toward the window size (1.5x or 2x steps).
+		bool GetNeuralRenderUpscale() const { return settings.value("settings/neural_render_upscale", true).toBool(); }
+		void SetNeuralRenderUpscale(bool enabled) { settings.setValue("settings/neural_render_upscale", enabled); }
+		// NVIDIA feature 18 model: 0 = CC, 1 = HT.
+		int GetNeuralRenderModel() const { return settings.value("settings/neural_render_model", 0).toInt(); }
+		void SetNeuralRenderModel(int model) { settings.setValue("settings/neural_render_model", model); }
+		// NVIDIA feature 18 passes in a row (1-3), and whether each pass has its own controls
+		// (otherwise all of them use pass 1's).
+		int GetNeuralRenderPasses() const { return qBound(1, settings.value("settings/neural_render_passes", 1).toInt(), NeuralRenderTuning::kMaxPasses); }
+		void SetNeuralRenderPasses(int passes);
+		bool GetNeuralRenderPerPass() const { return settings.value("settings/neural_render_per_pass", false).toBool(); }
+		void SetNeuralRenderPerPass(bool enabled);
+		// Live controls of one pass (0-2) as stored; ClampNeuralRenderTuning keeps them in range.
+		NeuralRenderTuning GetNeuralRenderTuning(int pass) const;
+		void SetNeuralRenderTuning(int pass, const NeuralRenderTuning &tuning);
+		// The controls pass `pass` runs with (pass 1's unless each pass has its own).
+		NeuralRenderTuning GetNeuralRenderEffectiveTuning(int pass) const
+		{
+			return GetNeuralRenderTuning(GetNeuralRenderPerPass() ? pass : 0);
+		}
+		static NeuralRenderTuning ClampNeuralRenderTuning(NeuralRenderTuning tuning);
+		// Changes with every change of the passes or the controls (polled by the render thread).
+		uint32_t GetNeuralRenderTuningRevision() const { return neural_render_tuning_rev.load(std::memory_order_relaxed); }
 		// AMD RCAS sharpening of the final image: 0 = off, 1-100 = strength in percent
 		int GetRcasStrength() const { return qBound(0, settings.value("settings/rcas_strength", 0).toInt(), 100); }
 		void SetRcasStrength(int strength) { settings.setValue("settings/rcas_strength", qBound(0, strength, 100)); }

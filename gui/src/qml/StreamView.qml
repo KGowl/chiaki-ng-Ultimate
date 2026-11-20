@@ -68,6 +68,7 @@ Item {
 
     function updateOverlayInteractionActive() {
         Chiaki.window.setOverlayInteractionActive(
+            neuralRenderPanel.visible ||
             menuController.open ||
             menuController.closing ||
             sessionStopDialogActive ||
@@ -307,6 +308,138 @@ Item {
             id: networkIndicatorTimer
             running: Chiaki.session?.averagePacketLoss > (Chiaki.settings.wifiDroppedNotif * 0.01)
             interval: 400
+        }
+    }
+
+    // DLSS 5 panel (NVIDIA): End opens and closes it, Esc closes it. The keys stay in it
+    // while it is open.
+    function toggleNeuralRenderPanel() {
+        if (neuralRenderPanel.visible) {
+            closeNeuralRenderPanel();
+            return;
+        }
+        if (sessionLoading || sessionError)
+            return;
+        neuralRenderPanel.visible = true;
+        view.grabInput(neuralRenderPanel);
+        view.updateOverlayInteractionActive();
+    }
+
+    function closeNeuralRenderPanel() {
+        if (!neuralRenderPanel.visible)
+            return;
+        neuralRenderPanel.visible = false;
+        view.releaseInput();
+        view.updateOverlayInteractionActive();
+    }
+
+    NeuralRenderPanel {
+        id: neuralRenderPanel
+        anchors {
+            horizontalCenter: parent.horizontalCenter
+            top: parent.top
+            topMargin: 16
+        }
+        height: implicitHeight
+        // Shrinks to fit a short window (all rows stay visible).
+        transformOrigin: Item.Top
+        scale: Math.min(1, (view.height - 32) / Math.max(1, implicitHeight))
+        visible: false
+        onCloseRequested: view.closeNeuralRenderPanel()
+    }
+
+    Connections {
+        target: Chiaki.window
+        function onNeuralRenderPanelRequested() { view.toggleNeuralRenderPanel() }
+        function onStreamPointerMoved() {
+            view.pointerActive = true;
+            pointerTimer.restart();
+        }
+    }
+
+    // RTX settings button at the top right: shown for 3 s after the mouse moves over the stream
+    // and while the panel is open; a click opens or closes the panel. Over the stream the
+    // window gets the click (the mouse goes to the console otherwise), see setPanelButtonRect.
+    property bool pointerActive: false
+    Timer {
+        id: pointerTimer
+        interval: 3000
+        onTriggered: view.pointerActive = false
+    }
+    Button {
+        id: panelButton
+        objectName: "rtxSettingsButton"
+        anchors {
+            right: parent.right
+            top: parent.top
+            margins: 12
+        }
+        visible: (view.pointerActive || neuralRenderPanel.visible) && !sessionLoading && !sessionError && !menuController.open
+        text: qsTr("RTX settings")
+        icon.source: "qrc:/icons/settings-20px.svg"
+        icon.color: Material.accent
+        flat: true
+        focusPolicy: Qt.NoFocus
+        font.pixelSize: 15
+        Material.foreground: Material.accent
+        // The panel's own dark glass, so the button reads on bright scenes too.
+        background: Rectangle {
+            implicitHeight: 36
+            radius: 8
+            color: panelButton.hovered ? "#e6121418" : "#b3121418"
+            border.color: "#40ffffff"
+            border.width: 1
+        }
+        onClicked: view.toggleNeuralRenderPanel()
+        function publish() {
+            if (!visible) {
+                Chiaki.window.setPanelButtonRect(Qt.rect(0, 0, 0, 0));
+                return;
+            }
+            const p = mapToItem(null, 0, 0);
+            Chiaki.window.setPanelButtonRect(Qt.rect(p.x, p.y, width, height));
+        }
+        onVisibleChanged: publish()
+        onWidthChanged: publish()
+        onHeightChanged: publish()
+        onXChanged: publish()
+        onYChanged: publish()
+        Component.onDestruction: Chiaki.window.setPanelButtonRect(Qt.rect(0, 0, 0, 0))
+    }
+
+    // Shown for a moment when DLSS 5 neural rendering is switched on or off (not under the panel).
+    Label {
+        id: neuralRenderToast
+        anchors {
+            horizontalCenter: parent.horizontalCenter
+            top: parent.top
+            topMargin: 40
+        }
+        padding: 12
+        font.pixelSize: 22
+        font.bold: true
+        color: "white"
+        background: Rectangle {
+            color: "#c0000000"
+            radius: 8
+        }
+        opacity: neuralRenderToastTimer.running ? 1.0 : 0.0
+        visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: 250 } }
+
+        Timer {
+            id: neuralRenderToastTimer
+            interval: 1500
+        }
+
+        Connections {
+            target: Chiaki.window
+            function onNeuralRenderToggled(enabled) {
+                if (neuralRenderPanel.visible)
+                    return;
+                neuralRenderToast.text = enabled ? qsTr("DLSS 5: on") : qsTr("DLSS 5: off");
+                neuralRenderToastTimer.restart();
+            }
         }
     }
 

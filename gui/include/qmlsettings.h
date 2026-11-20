@@ -106,6 +106,12 @@ class QmlSettings : public QObject
 	Q_PROPERTY(bool rtxVsrSupported READ rtxVsrSupported CONSTANT)
 	Q_PROPERTY(bool rtxVsrExtendedModes READ rtxVsrExtendedModes CONSTANT)
 	Q_PROPERTY(QString rtxVsrDllVersion READ rtxVsrDllVersion CONSTANT)
+	Q_PROPERTY(bool neuralRender READ neuralRender WRITE setNeuralRender NOTIFY neuralRenderChanged)
+	Q_PROPERTY(bool neuralRenderSupported READ neuralRenderSupported CONSTANT)
+	Q_PROPERTY(bool neuralRenderUpscale READ neuralRenderUpscale WRITE setNeuralRenderUpscale NOTIFY neuralRenderChanged)
+	Q_PROPERTY(int neuralRenderModel READ neuralRenderModel WRITE setNeuralRenderModel NOTIFY neuralRenderChanged)
+	Q_PROPERTY(int neuralRenderPasses READ neuralRenderPasses WRITE setNeuralRenderPasses NOTIFY neuralRenderChanged)
+	Q_PROPERTY(bool neuralRenderPerPass READ neuralRenderPerPass WRITE setNeuralRenderPerPass NOTIFY neuralRenderChanged)
 	Q_PROPERTY(int frameGenBackend READ frameGenBackend WRITE setFrameGenBackend NOTIFY frameGenBackendChanged)
 	Q_PROPERTY(int frameGenMultiplier READ frameGenMultiplier WRITE setFrameGenMultiplier NOTIFY frameGenMultiplierChanged)
 	Q_PROPERTY(bool frameGenSupported READ frameGenSupported CONSTANT)
@@ -380,6 +386,23 @@ public:
     bool rtxVsrSupported() const;
     bool rtxVsrExtendedModes() const;
     QString rtxVsrDllVersion() const;
+    bool neuralRender() const;
+    void setNeuralRender(bool enabled);
+    bool neuralRenderSupported() const;
+    bool neuralRenderUpscale() const;
+    void setNeuralRenderUpscale(bool enabled);
+    int neuralRenderModel() const;
+    void setNeuralRenderModel(int model);
+    int neuralRenderPasses() const;
+    void setNeuralRenderPasses(int passes);
+    bool neuralRenderPerPass() const;
+    void setNeuralRenderPerPass(bool enabled);
+    // DLSS 5 controls of one pass (0-2) for QML: style, intensity, localStructure, localTone,
+    // autoMask, skinStructure. Setting one emits neuralRenderTuningChanged.
+    Q_INVOKABLE QVariantMap neuralRenderTuning(int pass) const;
+    Q_INVOKABLE void setNeuralRenderTuningValue(int pass, const QString &key, const QVariant &value);
+    // The default of one control (the same names).
+    Q_INVOKABLE QVariant neuralRenderTuningDefault(const QString &key) const;
     int frameGenBackend() const;
     void setFrameGenBackend(int backend);
     int frameGenMultiplier() const;
@@ -776,6 +799,8 @@ signals:
     void placeboFrameMixerChanged();
     void directFrameMappingChanged();
     void rtxVsrQualityChanged();
+    void neuralRenderChanged();
+    void neuralRenderTuningChanged();
     void frameGenBackendChanged();
     void frameGenMultiplierChanged();
     void placeboDeinterlaceEnabledChanged();

@@ -96,6 +96,70 @@ DialogView {
 
             Label {
                 Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("DLSS Neural Rendering:")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.neuralRenderSupported
+                model: [qsTr("Off"), qsTr("DLSS 5 Neural Rendering via D3D12 (NVIDIA: nvngx_dlssnr.dll, AMD: NeuralHub's stub)")]
+                currentIndex: Chiaki.settings.neuralRender ? 1 : 0
+                onActivated: index => Chiaki.settings.neuralRender = index === 1
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("While streaming, End opens NeuralHub's in-game panel (AMD) or chiaki-ng's DLSS 5 panel (NVIDIA: on/off, passes, preset, intensity, local structure / tone, skin).")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("(Off)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("DLSS NR Upscaling:")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.neuralRenderSupported
+                enabled: Chiaki.settings.neuralRender
+                model: [qsTr("Off (stream resolution)"), qsTr("Up to 2x toward the window (1080p to 4K: DLSS Performance)")]
+                currentIndex: Chiaki.settings.neuralRenderUpscale ? 1 : 0
+                onActivated: index => Chiaki.settings.neuralRenderUpscale = index === 1
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("(Up to 2x)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("DLSS NR Model (NVIDIA):")
+            }
+
+            C.ComboBox {
+                Layout.preferredWidth: 600
+                visible: Chiaki.settings.neuralRenderSupported
+                enabled: Chiaki.settings.neuralRender
+                model: [qsTr("CC (as NeuralHub's default)"), qsTr("HT (lighter on NVIDIA, about 2 ms at 1080p)")]
+                currentIndex: Chiaki.settings.neuralRenderModel
+                onActivated: index => Chiaki.settings.neuralRenderModel = index
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
+                visible: Chiaki.settings.neuralRenderSupported
+                text: qsTr("(CC)")
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignRight
                 visible: Chiaki.settings.frameGenSupported
                 text: qsTr("Frame Generation:")
             }
@@ -109,7 +173,8 @@ DialogView {
                     Chiaki.settings.frameGenDlssSupported ? qsTr("NVIDIA DLSS Frame Generation") : qsTr("NVIDIA DLSS Frame Generation (not in this build)"),
                     Chiaki.settings.frameGenFsrSupported ? qsTr("AMD FSR 3.1 Frame Generation") : qsTr("AMD FSR 3.1 Frame Generation (not in this build)"),
                     qsTr("Flow Frame Generation (any GPU)"),
-                            Chiaki.settings.frameGenVfgSupported ? (Chiaki.settings.frameGenVfgRuntime.length ? qsTr("NVIDIA VFG (Video Effects SDK)") : qsTr("NVIDIA VFG (runtime not installed)")) : qsTr("NVIDIA VFG (Windows only)")]
+                            Chiaki.settings.frameGenVfgSupported ? (Chiaki.settings.frameGenVfgRuntime.length ? qsTr("NVIDIA VFG (Video Effects SDK)") : qsTr("NVIDIA VFG (runtime not installed)")) : qsTr("NVIDIA VFG (Windows only)"),
+                    Chiaki.settings.frameGenDlssSupported ? qsTr("DLSS Frame Generation via D3D12 (AMD: needs NeuralHub's stub)") : qsTr("DLSS Frame Generation via D3D12 (not in this build)")]
                 currentIndex: Chiaki.settings.frameGenBackend
                 onActivated: index => Chiaki.settings.frameGenBackend = index
                 ToolTip.visible: hovered
@@ -252,9 +317,9 @@ DialogView {
             C.ComboBox {
                 Layout.preferredWidth: 600
                 visible: Chiaki.settings.frameGenSupported
-                enabled: Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3 || Chiaki.settings.frameGenBackend === 4
-                model: [qsTr("2x"), qsTr("3x (DLSS on RTX 50 series, Flow, VFG)"), qsTr("4x (DLSS on RTX 50 series, Flow, VFG)")]
-                currentIndex: (Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3 || Chiaki.settings.frameGenBackend === 4) ? Chiaki.settings.frameGenMultiplier - 2 : 0
+                enabled: Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3 || Chiaki.settings.frameGenBackend === 4 || Chiaki.settings.frameGenBackend === 5
+                model: [qsTr("2x"), qsTr("3x (DLSS on RTX 50 series, Flow, VFG, DLSS D3D12)"), qsTr("4x (DLSS on RTX 50 series, Flow, VFG, DLSS D3D12)")]
+                currentIndex: (Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3 || Chiaki.settings.frameGenBackend === 4 || Chiaki.settings.frameGenBackend === 5) ? Chiaki.settings.frameGenMultiplier - 2 : 0
                 onActivated: index => Chiaki.settings.frameGenMultiplier = index + 2
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Output frames per stream frame. FSR always uses 2x; the display refresh rate also limits it.")

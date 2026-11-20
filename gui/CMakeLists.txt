@@ -58,6 +58,9 @@ set(SOURCE_FILES
 	src/ngxcore.cpp
 	include/rtxvsr.h
 	src/rtxvsr.cpp
+	include/neuralrender.h
+	include/neuralrendertuning.h
+	src/neuralrender.cpp
 	include/framegen.h
 	src/framegen.cpp
 	include/flowfg.h
@@ -138,9 +141,34 @@ if(CHIAKI_ENABLE_NGX)
 		message(FATAL_ERROR "NGX library not found: ${CHIAKI_NGX_LIB}")
 	endif()
 	target_include_directories(chiaki PRIVATE "${CHIAKI_NGX_SDK_DIR}/include")
-	target_link_libraries(chiaki "${CHIAKI_NGX_LIB}" advapi32 user32)
-	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_NGX)
-	message(STATUS "NVIDIA NGX enabled: RTX Video Super Resolution, DLSS Frame Generation (${CHIAKI_NGX_LIB})")
+	# setupapi, version, shell32 and ole32: needed by the D3D12 half of the NGX library (dx12fg.cpp).
+	target_link_libraries(chiaki "${CHIAKI_NGX_LIB}" advapi32 user32 setupapi version shell32 ole32)
+	# DLSS Frame Generation through NGX D3D12 (AMD GPUs with NeuralHub's NGX stub), see dx12fg.h.
+	target_sources(chiaki PRIVATE include/dx12fg.h src/dx12fg.cpp)
+	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG)
+	# nvngx.dll_dlssnr.dll next to chiaki.exe: NVIDIA's DLSS Neural Rendering snippet only serves
+	# callers inside a module named like nvngx.dll, so dx12fg calls it through this pass-through
+	# (src/nrgate.cpp, no NVIDIA code). The snippet itself (nvngx_dlssnr.dll) is not bundled.
+	add_library(chiaki-nrgate SHARED src/nrgate.cpp)
+	set_target_properties(chiaki-nrgate PROPERTIES OUTPUT_NAME "nvngx.dll_dlssnr" PREFIX "" SUFFIX ".dll")
+	add_dependencies(chiaki chiaki-nrgate)
+	# Console test of the frame generation backends and of neural rendering on synthetic frames
+	# (tools/fgdx12test.cpp). Not built by default: --target chiaki-fgdx12test.
+	add_executable(chiaki-fgdx12test EXCLUDE_FROM_ALL tools/fgdx12test.cpp
+		src/framegen.cpp src/flowfg.cpp src/fgfixup.cpp src/vfg.cpp src/vkguard.c src/ngxcore.cpp src/rtxvsr.cpp src/dx12fg.cpp
+		src/neuralrender.cpp)
+	# The same include directories as the application (Vulkan and libplacebo headers come from there).
+	target_include_directories(chiaki-fgdx12test PRIVATE include "${CHIAKI_NGX_SDK_DIR}/include"
+		$<TARGET_PROPERTY:chiaki,INCLUDE_DIRECTORIES>)
+	target_compile_definitions(chiaki-fgdx12test PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG)
+	target_link_libraries(chiaki-fgdx12test PkgConfig::LIBPLACEBO Qt::Core Qt::Gui "${CHIAKI_NGX_LIB}"
+		advapi32 user32 setupapi version shell32 ole32 avrt winmm)
+	add_dependencies(chiaki-fgdx12test chiaki-nrgate)
+	# Console test of the DLSS 5 panel (tools/nrpaneltest.cpp, the application's QML resources and
+	# a stand-in for its backend). Not built by default: --target chiaki-nrpaneltest.
+	add_executable(chiaki-nrpaneltest EXCLUDE_FROM_ALL tools/nrpaneltest.cpp src/qml/qml.qrc)
+	target_link_libraries(chiaki-nrpaneltest Qt::Core Qt::Gui Qt::GuiPrivate Qt::Qml Qt::Quick)
+	message(STATUS "NVIDIA NGX enabled: RTX Video Super Resolution, DLSS Frame Generation, DLSS neural rendering through D3D12 (${CHIAKI_NGX_LIB})")
 endif()
 
 if(CHIAKI_ENABLE_FFX)

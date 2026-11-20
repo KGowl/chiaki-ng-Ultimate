@@ -12,6 +12,14 @@ Everything else (setup, registration, controllers, Steam Deck usage) works as in
 
 DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Radeon** (Windows):
 
+![DLSS 5 off and on: GTA VI over PS5 Remote Play on an AMD Radeon RX 9070 XT, 1080p stream upscaled to 2160p](docs/images/dlss5/dlss5-off-on-rx9070xt.jpg)
+
+| DLSS 5 off (RTX VSR) / on, RTX 5090 | 4x frame generation, 5.4 vs 5.5, RX 9070 XT | RTX settings panel while streaming |
+|---|---|---|
+| ![DLSS 5 off with RTX VSR and on, RTX 5090](docs/images/dlss5/dlss5-off-on-rtx5090.jpg) | ![4x frame generation of a 30 fps stream: 90 fps in 1.10.0-dlss5.4, 118 fps in 1.10.0-dlss5.5](docs/images/dlss5/fg4x-5.4-vs-5.5-rx9070xt.jpg) | ![The RTX settings panel over the stream](docs/images/dlss5/rtx-settings-panel.jpg) |
+
+<sub>GTA VI © Rockstar Games. Screenshots from real PS5 Remote Play streams, for illustration.</sub>
+
 - **4x frame generation keeps up with DLSS 5**: the next stream frame's DLSS work runs while the generated frames are shown. RX 9070 XT, GTA VI at 30 fps, DLSS 5 to 2160p, 4x on a 150 Hz screen: **118 fps** (1.10.0-dlss5.4: about 90).
 - **RTX settings panel** while streaming, on every GPU: DLSS 5 on/off, upscaling, sharpness, frame generation Off / 2x / 3x / 4x and the stats overlay; on NVIDIA also the DLSS 5 model, 1–3 passes and their controls.
 - **Stats overlay** names the GPU and says when the display holds frame generation back (e.g. 4x needs 120 Hz for a 30 fps stream).

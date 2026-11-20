@@ -3,12 +3,14 @@
 #include "streamsession.h"
 #include "settings.h"
 #include "repeatcadence.h"
+#include "neuralrender.h"
 
 #include <QMutex>
 #include <QAtomicInteger>
 #include <QWindow>
 #include <QQuickWindow>
 #include <QLoggingCategory>
+#include <array>
 #include <deque>
 #include <vector>
 #include <atomic>
@@ -46,6 +48,7 @@ class QOffscreenSurface;
 class QOpenGLContext;
 class QOpenGLFramebufferObject;
 class RtxVsr;
+class NeuralRender;
 class FrameGen;
 class QWidget;
 class QLabel;
@@ -63,6 +66,14 @@ class QmlMainWindow : public QWindow
     Q_PROPERTY(bool hasVideo READ hasVideo NOTIFY hasVideoChanged)
     Q_PROPERTY(int droppedFrames READ droppedFrames NOTIFY droppedFramesChanged)
     Q_PROPERTY(QString videoEnhancementStatus READ videoEnhancementStatus NOTIFY videoEnhancementStatusChanged)
+    // DLSS 5 neural rendering switched off for this run (the setting stays on); the panel's
+    // first row and NVIDIA's End panel.
+    Q_PROPERTY(bool neuralRenderPaused READ neuralRenderPaused WRITE setNeuralRenderPaused NOTIFY neuralRenderToggled)
+    // Whether the DLSS 5 controls reach the model (NVIDIA's feature 18 is running).
+    Q_PROPERTY(bool neuralRenderTunable READ neuralRenderTunable NOTIFY neuralRenderTunableChanged)
+    // The GPU that renders the stream (the RTX settings panel shows the NVIDIA-only rows on NVIDIA).
+    Q_PROPERTY(bool nvidiaCard READ nvidiaCard NOTIFY gpuInfoChanged)
+    Q_PROPERTY(QString gpuName READ gpuName NOTIFY gpuInfoChanged)
     Q_PROPERTY(double streamFps READ streamFps NOTIFY fpsChanged)
     Q_PROPERTY(double displayFps READ displayFps NOTIFY fpsChanged)
     Q_PROPERTY(bool keepVideo READ keepVideo WRITE setKeepVideo NOTIFY keepVideoChanged)
@@ -141,6 +152,11 @@ public:
 
     bool amdCard() const;
     bool nvidiaCard() const;
+    // The GPU that renders the stream, as its driver names it (shown in the stats overlay).
+    QString gpuName() const;
+    bool neuralRenderPaused() const;
+    void setNeuralRenderPaused(bool paused);
+    bool neuralRenderTunable() const;
     bool wasMaximized() const { return was_maximized; };
     bool isWindowAdjustable() const { return is_window_adjustable; }
     void setWindowAdjustable(bool adjustable) { is_window_adjustable = adjustable; }
@@ -160,6 +176,9 @@ public:
     Q_INVOKABLE void releaseInput();
     Q_INVOKABLE void requestOverlayUpdate();
     Q_INVOKABLE void setOverlayInteractionActive(bool active);
+    // Where the RTX settings button is (window coordinates; empty while it is hidden): a left
+    // click there opens the panel instead of going to the console, and the cursor shows.
+    Q_INVOKABLE void setPanelButtonRect(const QRectF &rect);
     Q_INVOKABLE void setStatsOverlayActive(bool active);
     // Stream stats overlay style (0 Mini, 1 Compact, 2 Default, 3 Full) and
     // position (0-8: top/middle/bottom x left/centre/right).
@@ -186,6 +205,14 @@ signals:
     void hasVideoChanged();
     void droppedFramesChanged();
     void videoEnhancementStatusChanged();
+    // DLSS neural rendering was switched on or off for this run.
+    void neuralRenderToggled(bool enabled);
+    // End on NVIDIA, or a click on the RTX settings button: open or close the panel.
+    void neuralRenderPanelRequested();
+    // The mouse moved over the stream (shows the RTX settings button for a moment).
+    void streamPointerMoved();
+    void gpuInfoChanged();
+    void neuralRenderTunableChanged();
     void fpsChanged();
     void keepVideoChanged();
     void videoModeChanged();
@@ -249,6 +276,11 @@ private:
     void beginFrame();
     void endFrame();
     void render();
+    // Pipelined frame generation (fg_pipe_stage): queues the Vulkan side of every step whose
+    // D3D12 side is done (all of them when `drain`), moving the stage on.
+    void fgPipeAdvance(bool drain);
+    void fgPipeCancel();
+    static bool fgPipeEnabled();
     void handleVulkanDeviceLost(const QString &reason);
     void handleVulkanRendererFallback(const QString &title, const QString &message, const QString &fallback_reason);
     void applyPendingFrame();
@@ -308,6 +340,9 @@ private:
     bool was_maximized = false;
     bool amd_card = false;
     bool nvidia_card = false;
+    QString gpu_name;
+    QRectF panel_button_rect;
+    bool panel_button_pressed = false;
     bool direct_stream = false;
     std::atomic<qint64> queue_pts_origin_cached_us = -1;
     uint64_t next_frame_target_us = 0;
@@ -345,6 +380,29 @@ private:
     QAtomicInteger<int> fg_status_backend = 0;
     QAtomicInteger<int> fg_status_multiplier = 0;
     QAtomicInteger<int> fg_status_reason = 0;
+    // The multiplier asked for when the display refresh rate holds it back (0 otherwise), the
+    // refresh rate it would need, and the display's.
+    QAtomicInteger<int> fg_status_requested = 0;
+    QAtomicInteger<int> fg_status_needed_hz = 0;
+    QAtomicInteger<int> fg_status_refresh_hz = 0;
+    // DLSS neural rendering: 0 off, 1 active, 2 idle (HDR, warming up, ...), 3 unavailable;
+    // its D3D12 GPU time in hundredths of a millisecond.
+    QAtomicInteger<int> nr_status_state = 0;
+    QAtomicInteger<int> nr_status_gpu_cms = 0;
+    QAtomicInteger<int> nr_status_out_h = 0; // output height when neural rendering upscales, else 0
+    QAtomicInteger<int> nr_status_hdr = 0;
+    // 1 while the End key has switched neural rendering off (this run only, the setting
+    // stays on); nr_user_off_seen is the render thread's last view of it.
+    QAtomicInteger<int> nr_user_off = 0;
+    bool nr_user_off_seen = false;
+    // 1 while NeuralHub runs neural rendering: End is then its in-game panel's key.
+    QAtomicInteger<int> nr_provider_panel = 0;
+    // 1 while the DLSS 5 controls reach the model (NVIDIA's feature 18).
+    QAtomicInteger<int> nr_tunable = 0;
+    // Render thread: the DLSS 5 passes and controls as last read from the settings.
+    uint32_t nr_tuning_rev = 0;
+    int nr_passes = 1;
+    std::array<NeuralRenderTuning, NeuralRenderTuning::kMaxPasses> nr_tuning = {};
     // Stream frames per game picture (2 = 30 fps game in a 60 fps stream,
     // repeats dropped before frame generation); set by presentFrame.
     RepeatCadenceDetector repeat_detector;
@@ -358,6 +416,8 @@ private:
     QString fg_crash_guard_notice;
     // Why frame generation is skipped, logged once per stream (0 = not logged).
     int fg_skip_logged = 0;
+    // "DLSS Frame Generation" served through the D3D12 bridge instead of Vulkan NGX (logged once).
+    bool fg_dlss12_route_logged = false;
     QAtomicInteger<int> enhancement_log_reset = 0;
     bool fg_refresh_limited = false;
     QString video_enhancement_status;
@@ -387,12 +447,41 @@ private:
     pl_renderer placebo_renderer = {};
     RtxVsr *rtx_vsr = nullptr;
     bool rtx_vsr_active = false;
+    NeuralRender *neural_render = nullptr;
+    bool neural_render_active = false;
     FrameGen *frame_gen = nullptr;
     // Frames still to be presented for the last stream frame: generated ones first, the real one last.
     std::vector<struct pl_frame> fg_pending_frames;
     int fg_active_multiplier = 1;
     int fg_active_cadence = 1;
     int fg_last_backend = 0;
+    // Pipelined frame generation (DLSS FG through D3D12, render thread): when the next stream
+    // frame comes while frames generated from the last one are still to be presented, its
+    // DLSS 5 and DLSS FG work starts on the D3D12 queue and those frames keep being presented
+    // meanwhile instead of being dropped. The Vulkan work that waits for a D3D12 result is
+    // only queued once that result is done (or once nothing else is left to present), so it
+    // never holds up a present on libplacebo's queue.
+    enum class FgPipeStage {
+        Idle,
+        Taken,        // the frame is mapped in direct_frame, its work not started (or failed)
+        NeuralRender, // DLSS 5 begun on direct_frame
+        FrameGen,     // DLSS FG begun on fg_pipe_fg_src
+        Ready,        // its frames are in fg_pipe_outputs
+    };
+    FgPipeStage fg_pipe_stage = FgPipeStage::Idle;
+    NeuralRender::Options fg_pipe_nr_options;
+    struct pl_frame fg_pipe_fg_src = {};
+    std::vector<struct pl_frame> fg_pipe_outputs;
+    int fg_pipe_multiplier = 1;
+    int fg_pipe_cadence = 1;
+    int fg_pipe_out_w = 0;
+    int fg_pipe_out_h = 0;
+    float fg_pipe_interval_ms = 0.0f;
+    // The last stream frame went through DLSS FG via D3D12 (no RTX VSR): the next may be pipelined.
+    bool fg_pipe_allowed = false;
+    // The last pipelined stream frame went through DLSS 5 (NeuralHub's panel stays up).
+    bool fg_pipe_nr = false;
+    bool fg_pipe_logged = false;
     uint64_t direct_frame_serial = 0;
     pl_queue placebo_queue = {};
     std::array<pl_tex, 8> placebo_tex{};
