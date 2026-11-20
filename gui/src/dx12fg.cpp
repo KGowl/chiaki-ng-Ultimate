@@ -283,6 +283,70 @@ LRESULT CALLBACK hiddenWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// NeuralHub (the NGX provider on AMD) hooks the window procedure of each swapchain window it sees
+// presented on its device, one window at a time: it keeps a single saved procedure and never puts
+// the previous window's back. Two windows presenting in turn leave it calling itself at the next
+// message (a stack overflow in user32). chiaki's own window presents on the same device (AMD's
+// Vulkan driver presents through a DXGI swapchain, and D3D12 has one device per adapter), so
+// once the provider has hooked another window of this process, the hidden swapchain must never
+// be presented again.
+HMODULE moduleOf(LONG_PTR address)
+{
+    HMODULE module = nullptr;
+    if (!address
+        || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(address), &module))
+        return nullptr;
+    return module;
+}
+
+struct ProviderWindowScan
+{
+    HMODULE provider;
+    HWND own;
+    DWORD pid;
+    HWND found;
+};
+
+bool providerHooked(HWND window, const ProviderWindowScan &scan)
+{
+    return window != scan.own && moduleOf(GetWindowLongPtrW(window, GWLP_WNDPROC)) == scan.provider;
+}
+
+BOOL CALLBACK providerWindowChild(HWND window, LPARAM lp)
+{
+    auto *scan = reinterpret_cast<ProviderWindowScan *>(lp);
+    if (!providerHooked(window, *scan))
+        return TRUE;
+    scan->found = window;
+    return FALSE;
+}
+
+BOOL CALLBACK providerWindowTop(HWND window, LPARAM lp)
+{
+    auto *scan = reinterpret_cast<ProviderWindowScan *>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid != scan->pid)
+        return TRUE;
+    if (providerHooked(window, *scan))
+        scan->found = window;
+    else
+        EnumChildWindows(window, providerWindowChild, lp);
+    return scan->found ? FALSE : TRUE;
+}
+
+// A window of this process other than `own` whose procedure is NeuralHub's, or null.
+HWND providerHookedWindow(HWND own)
+{
+    const HMODULE provider = GetModuleHandleW(L"neuralhub_host.dll");
+    if (!provider)
+        return nullptr;
+    ProviderWindowScan scan = { provider, own, GetCurrentProcessId(), nullptr };
+    EnumWindows(providerWindowTop, reinterpret_cast<LPARAM>(&scan));
+    return scan.found;
+}
+
 // A stationary virtual camera: video carries no camera, but the projection matrices and
 // the camera basis still have to agree (same values as the Vulkan DLSS backend).
 void fillCamera(NVSDK_NGX_DLSSG_Opt_Eval_Params &opt, int w, int h)
@@ -492,7 +556,12 @@ struct Dx12Fg::Impl
     int panel_monitor_hdr = -1; // -1 not checked yet
     float panel_scrgb = 1.0f;   // HDR frames into scRGB: 203/80 on an HDR desktop, 1 on SDR
     ComPtr<ID3D12PipelineState> cs_scrgb;
-    bool panelRoute() const { return !gate_ready && nr_sized && swapchain; }
+    // Another window of the process presents on the provider's device (chiaki's own window,
+    // see providerHookedWindow): the hidden swapchain is never presented, the provider's runtime
+    // opens on that window's presents and NeuralHub draws its panel on it.
+    bool shared_present = false;
+    bool mayPresent();
+    bool panelRoute() const { return !gate_ready && nr_sized && swapchain && !shared_present; }
     void panelUpdate();
     void panelRecordCopy();
     void panelPresent();
@@ -684,6 +753,9 @@ bool Dx12Fg::Impl::createSwapchain()
     // provider installs its hooks on the swapchain calls a moment after the first
     // device is created, so a swapchain made too early goes unnoticed: this is called
     // again (with a new swapchain on the same window) when the runtime stays closed.
+    // Not when another window of the process presents on the provider's device already.
+    if (!mayPresent())
+        return true;
     swapchain.Reset();
     WNDCLASSW wc = {};
     wc.lpfnWndProc = hiddenWndProc;
@@ -1606,6 +1678,28 @@ bool Dx12Fg::Impl::panelResize(UINT w, UINT h, DXGI_FORMAT format)
     return true;
 }
 
+// Before every Present of the hidden swapchain: false (from then on) once NeuralHub has hooked
+// another window of this process. Called on the thread that presents; chiaki presents its own
+// window on the same render thread, so nothing presents between the check and the Present.
+bool Dx12Fg::Impl::mayPresent()
+{
+    if (shared_present)
+        return false;
+    const HWND other = providerHookedWindow(hwnd);
+    if (!other)
+        return true;
+    shared_present = true;
+    panelHide();
+    // Hooked by an earlier Present of ours: back to our own procedure. The provider holds the
+    // other window's procedure now and never touches ours again (we no longer present).
+    if (hwnd && moduleOf(GetWindowLongPtrW(hwnd, GWLP_WNDPROC)) == GetModuleHandleW(L"neuralhub_host.dll"))
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hiddenWndProc));
+    log(0, "window %p of this process presents on NeuralHub's device (chiaki's own window): the hidden swapchain is "
+           "not presented, NeuralHub's runtime opens on that window and draws its in-game panel (End) on it",
+        static_cast<void *>(other));
+    return false;
+}
+
 void Dx12Fg::Impl::panelHide()
 {
     panel_copy = false;
@@ -1767,7 +1861,7 @@ void Dx12Fg::Impl::panelRecordCopy()
 // presented, polls its keys and draws its panel; the window appears once it has a frame.
 void Dx12Fg::Impl::panelPresent()
 {
-    if (!panelRoute())
+    if (!panelRoute() || !mayPresent())
         return;
     const HRESULT hr = swapchain->Present(0, 0);
     if (FAILED(hr) && !panel_present_warned) {
