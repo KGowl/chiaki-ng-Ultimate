@@ -1,6 +1,6 @@
 ![chiaki-ng Logo](gui/res/chiaking-logo.svg)
 
-# chiaki-ng-enhanced
+# chiaki-ng-Ultimate
 
 A fork of [chiaki-ng](https://github.com/streetpea/chiaki-ng) (the open source PlayStation 4/5 Remote Play client) that adds video enhancement and smoother streaming on top of upstream: NVIDIA RTX Video Super Resolution, four frame generation backends (NVIDIA VFG, DLSS, FSR and its own **Flow** interpolation; FSR and Flow also run on Linux and Steam Deck), an ambient border for ultrawide displays and a set of Windows streaming tweaks and fixes.
 
