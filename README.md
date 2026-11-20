@@ -4,6 +4,8 @@
 
 A fork of [chiaki-ng](https://github.com/streetpea/chiaki-ng) (the open source PlayStation 4/5 Remote Play client) that adds video enhancement and smoother streaming on top of upstream: NVIDIA RTX Video Super Resolution, four frame generation backends (NVIDIA VFG, DLSS, FSR and its own **Flow** interpolation; FSR and Flow also run on Linux and Steam Deck), an ambient border for ultrawide displays and a set of Windows streaming tweaks and fixes.
 
+The `d3d12-bridge` branch adds **DLSS 5 neural rendering** and **DLSS Frame Generation through D3D12** on NVIDIA RTX and AMD Radeon GPUs (AMD through NeuralHub), see [DLSS 5 and DLSS FG through D3D12](#dlss-5-and-dlss-fg-through-d3d12-d3d12-bridge).
+
 Everything else (setup, registration, controllers, Steam Deck usage) works as in upstream chiaki-ng – see its [documentation site](https://streetpea.github.io/chiaki-ng/).
 
 ## Downloads
@@ -15,6 +17,14 @@ Pre-releases are published on the [Releases](../../releases) page (tags like `1.
 | `chiaki-ng-*-win_x64-setup.exe` | Windows x64 installer |
 | `chiaki-ng-*-win_x64-portable.zip` | Windows x64 portable |
 | `chiaki-ng-*-linux_x86_64.AppImage` | Linux x86_64 (`chmod +x`, then run) |
+
+DLSS 5 builds from the `d3d12-bridge` branch use tags like `1.10.0-dlss5.5` and also ship:
+
+| File | Contents |
+|---|---|
+| `chiaki-dlss5-amd-setup-full.zip` | AMD setup kit with the portable build inside (no GitHub access or internet needed) |
+| `chiaki-dlss5-amd-setup.zip` | AMD setup kit that downloads the portable build from GitHub |
+| `chiaki-ng-dlss5-guide-en.pdf`, `chiaki-ng-dlss5-huong-dan.pdf` | Setup guide for AMD and NVIDIA (English, Vietnamese) |
 
 Test builds of every commit are available as artifacts of the *Build chiaki-ng Windows x86_64 (VC)* and *Build chiaki-ng Appimage x86_64* workflows in the Actions tab.
 
@@ -41,6 +51,23 @@ Notes:
 - **NVIDIA VFG runtime**: not bundled. *NVIDIA Runtime → Download* (Settings → Video or Ctrl+O → Enhancement) or the installer's *Download the NVIDIA VFG … runtime* option fetches NVIDIA's official `nvidia-vfx` package (~420 MB, SHA-256 checked) and installs the VFG libraries and `nvngx_vsr.dll` 1.8.3, which also unlocks all RTX VSR modes. NVIDIA's license terms apply.
 - **30 fps games in a 60 fps stream**: the repeated pictures are detected and dropped while frame generation is on, so it interpolates between real pictures.
 - The DLSS (`nvngx_dlssg.dll`) and FidelityFX (`amd_fidelityfx_vk.dll`) runtimes ship with the Windows build; their licenses are in the `licenses` folder. On Linux, FSR 3.1 is built from the bundled FidelityFX SDK 1.1.4 sources (`third-party/ffx-sdk`).
+
+### DLSS 5 and DLSS FG through D3D12 (`d3d12-bridge`)
+
+| Feature | GPU | Where |
+|---|---|---|
+| **DLSS 5 neural rendering** – NVIDIA's neural rendering model on each stream frame, at the stream size or upscaled 1.5x / 2x toward the window by DLSS Super Resolution (1080p → 4K); SDR and HDR | NVIDIA RTX (`nvngx_dlssnr.dll`, not bundled); AMD Radeon through NeuralHub (not bundled) | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
+| **DLSS Frame Generation via D3D12** – DLSS FG through the same bridge, 2x–4x; the next stream frame's DLSS work runs on D3D12 while the frames generated from the last one are presented | AMD through NeuralHub; NVIDIA when Vulkan DLSS FG is unavailable | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
+| **RTX settings panel** – in-stream panel with *RTX* and *Eye Candy* tabs (DLSS 5, upscaling, sharpness, frame generation multiplier, stats overlay, RTX VSR, clean-up, border fill); a button at the top right when the mouse moves, End on NVIDIA | all | while streaming |
+| **DLSS 5 controls (NVIDIA)** – model CC / HT, 1–3 passes, each with its own preset and controls, applied at once | NVIDIA RTX | RTX settings panel (End) |
+
+Notes:
+
+- How it works: the frames are rendered on libplacebo's Vulkan device and shared with a D3D12 device (shared buffers, and a D3D12 fence imported as a Vulkan timeline semaphore), where NGX runs DLSS 5, DLSS Super Resolution and DLSS FG. Vulkan only queues a copy back once the D3D12 side is done, so the presented frames never wait for it. `CHIAKI_FG_PIPELINE=0` turns that off for comparisons.
+- **NVIDIA**: put NVIDIA's `nvngx_dlssnr.dll` (DLSS NR 310.9.16) next to `chiaki.exe`. It is not in the public DLSS SDK and is not bundled.
+- **AMD**: install NeuralHub 0.9.0 yourself and import the DLSS DLLs in it, then run the AMD setup kit (`cai-dat.cmd`), which copies NeuralHub's loader from your own install next to `chiaki.exe` and writes a tested `neuralhub.ini`. NeuralHub's licence does not allow redistribution, so it is not bundled.
+- Measured on GTA VI (PS5, 1080p stream): RX 9070 XT, DLSS 5 + DLSS SR to 2160p about 7–9 ms, 4x of a 30 fps stream shows 118 fps on a 150 Hz screen; RTX 5090, DLSS 5 to 2160p 2.8 ms.
+- 4x needs a display refresh of at least 4x the stream's fps; the stats overlay says when the display holds it back (e.g. `DLSS FG D3D12 2x (4x needs 240 Hz, display 150 Hz)`). The guides cover setup, settings, limits and troubleshooting.
 
 ### In-stream controls and stats
 
@@ -77,6 +104,7 @@ Flow frame generation and the ambient border need no extra SDK. On Linux, FSR 3.
 
 - [chiaki-ng](https://github.com/streetpea/chiaki-ng) by Street Pea and contributors, based on [Chiaki](https://git.sr.ht/~thestr4ng3r/chiaki) by Florian Märkl.
 - NVIDIA DLSS / NGX SDK, RTX Video SDK and Video Effects SDK, AMD FidelityFX SDK, [libplacebo](https://code.videolan.org/videolan/libplacebo).
+- NeuralHub (Danielblnc's Neural Rendering Supermod) serves DLSS 5 and DLSS FG on AMD; it is installed by the user and not part of this project.
 - Ideas from [Veyra-NRVideo](https://github.com/Likely7/Veyra-NRVideo) (VFG integration, scene-cut test) and [VeyAmux](https://github.com/8BiTw0LF/VeyAmux) (FSR on Linux, frame clean-up passes).
 
 ## Disclaimer
