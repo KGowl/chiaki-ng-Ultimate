@@ -49,9 +49,11 @@ Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -1735,7 +1737,7 @@ bool FrameGen::Impl::dx12Download(FrameSet &set, int count, uint64_t output_valu
         // Streamline presents the generated frames over the next frame interval (framesReady()
         // gives up after a bound); some may not come.
         while (!runner->framesReady())
-            Sleep(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         count = std::min(count, runner->takeFrames());
         if (count <= 0) {
             consecutive_failures = 0;

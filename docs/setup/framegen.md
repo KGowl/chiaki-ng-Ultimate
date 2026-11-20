@@ -5,7 +5,7 @@ chiaki-ng can generate extra frames between the frames sent by the console
 
 | Backend | Platforms | GPU | Multiplier |
 |---|---|---|---|
-| NVIDIA DLSS Frame Generation | Windows (VC build) | GeForce RTX 40 series or newer | 2x (3x / 4x on RTX 50 series) |
+| NVIDIA DLSS Frame Generation | Windows (VC build) | GeForce RTX 40 series or newer; RTX 20 / RTX 30 with MFG Unlocker (through Streamline, see below) | 2x (3x / 4x on RTX 50 series; RTX 3070: 2x at 1080p, 4x at 720p) |
 | AMD FSR 3.1 Frame Generation | Windows (VC build) | any GPU with Vulkan | 2x |
 | Flow Frame Generation | Windows, Linux, Steam Deck | any GPU with Vulkan | 2x / 3x / 4x |
 
@@ -104,6 +104,39 @@ Settings → Video (and Ctrl+O → Enhancement) switches between *Flow* and *Zer
 motion* for comparison; **Flow Quality** sets the analysis resolution
 (Performance ≈0.5 ms). The log shows `DLSS motion vectors: Flow`.
 
+### DLSS Frame Generation through Streamline (RTX 20 / RTX 30)
+
+RTX 20 and RTX 30 cards have no DLSS Frame Generation of their own; NGX
+refuses it when chiaki-ng asks directly. [MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker)
+(MIT) turns it on for games that use NVIDIA Streamline, so chiaki-ng now has a
+Streamline route as well: put MFG Unlocker's DLL next to `chiaki.exe` as
+`version.dll` (the setup kit offers to download release 1.7.1 and checks its
+SHA-256) and pick *NVIDIA DLSS Frame Generation* or *DLSS Frame Generation via
+D3D12*. The Streamline 2.14.16 files (`sl.interposer.dll`, `sl.common.dll`,
+`sl.dlss_g.dll`, `sl.reflex.dll`, `sl.pcl.dll`, MIT) come with chiaki-ng.
+
+How it works: Streamline only generates frames on a swapchain it presents, so
+chiaki-ng gives it a hidden window one row taller than the frame. The extra
+row carries the frame number; generated frames come back with it marked, and
+each presented frame is copied back into chiaki-ng's ring of shared buffers
+together with a GPU timestamp of when it was ready.
+
+- On an RTX 3070 the generated frames come one after the other, about 5 ms
+  apart at 720p, 8.5 ms at 1080p and 24 ms at 2160p. 2x at 1080p is ready
+  about 5 ms after the stream frame; 4x holds at 720p.
+- When the frames are late (fewer than asked, or the last one ready later
+  than the next stream frame), chiaki-ng lowers the multiplier one step, and
+  raises it again when the timestamps say the next step fits, or tries it
+  again after a while. The log says `Streamline: the GPU keeps up with N
+  generated frames per stream frame at WxH (...)`.
+- DLSS FG through Streamline runs while a chiaki-ng window has the focus
+  (Streamline pauses it otherwise); the stream then shows the real frames.
+- Route: `version.dll` next to `chiaki.exe` → Streamline; without it, NGX
+  directly (RTX 40 / 50, AMD through NeuralHub). RTX 50 cards always use NGX
+  (through Streamline their frames came only every 14-20 ms).
+  `CHIAKI_DLSSG_ROUTE=sl` or `ngx` forces a route. Streamline's own log goes to
+  `%TEMP%\chiaki-ng-streamline`.
+
 ### FSR 3.1 on Linux
 
 Linux builds (AppImage, Flatpak, Steam Deck) build FSR 3.1 frame generation
@@ -174,6 +207,7 @@ it stopped.
 ## Log messages
 
 - `[framegen] ... initialized` and `Frame generation active: ... Nx` → working.
-- `DLSS Frame Generation is not available on this GPU/driver` → RTX 40+ GPU and a current driver are needed.
+- `DLSS Frame Generation is not available on this GPU/driver` → RTX 40+ GPU and a current driver are needed (RTX 20 / RTX 30: MFG Unlocker as `version.dll`, see above).
+- `Streamline: DLSS Frame Generation is not offered on this GPU` → MFG Unlocker is not next to `chiaki.exe`, or the driver is too old.
 - `Could not load ...amd_fidelityfx_vk.dll` → the DLL is missing next to `chiaki.exe`.
 - `Frame generation requires Direct Mapping` → switch Frame Mapping to Direct Mapping.
