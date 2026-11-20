@@ -8037,9 +8037,24 @@ void QmlMainWindow::render()
         if (fg_backend && !bypass_frame_queue)
             qCInfo(chiakiGui) << "Frame generation requires Direct Mapping and stays disabled";
     }
+    // "DLSS Frame Generation" runs through Vulkan NGX, which needs an NVIDIA GPU. On other GPUs
+    // (AMD with NeuralHub), or when Vulkan NGX fails, the same DLSS FG runs through the D3D12 bridge.
+    int fg_run_backend = fg_backend;
+    if (fg_backend == static_cast<int>(FrameGen::Backend::Dlss) && frame_gen &&
+        FrameGen::backendCompiledIn(FrameGen::Backend::Dlss12) &&
+        (!nvidia_card || frame_gen->backendFailed(FrameGen::Backend::Dlss))) {
+        fg_run_backend = static_cast<int>(FrameGen::Backend::Dlss12);
+        if (!fg_dlss12_route_logged) {
+            fg_dlss12_route_logged = true;
+            qCInfo(chiakiGui).nospace() << "DLSS Frame Generation: "
+                << (nvidia_card ? "Vulkan NGX is unavailable" : "not an NVIDIA GPU")
+                << ", running it through D3D12 (" << FrameGen::backendName(FrameGen::Backend::Dlss12)
+                << ", NeuralHub on AMD)";
+        }
+    }
     bool fg_applied = fg_override;
-    if (!fg_override && direct_frame_fresh && fg_backend > 0 && stream_active && direct_render_frame.num_planes > 0) {
-        const auto backend_choice = static_cast<FrameGen::Backend>(fg_backend);
+    if (!fg_override && direct_frame_fresh && fg_run_backend > 0 && stream_active && direct_render_frame.num_planes > 0) {
+        const auto backend_choice = static_cast<FrameGen::Backend>(fg_run_backend);
         // With repeats dropped a picture lasts `cadence` stream frames; the
         // multiplier stays relative to the stream rate, so output fps is kept.
         const int cadence = fg_source_cadence.loadRelaxed();
@@ -8104,12 +8119,12 @@ void QmlMainWindow::render()
         fg_pending_frames.clear();
     }
     if (direct_frame_fresh || !bypass_frame_queue) {
-        fg_status_backend.storeRelaxed(stream_active ? fg_backend : 0);
+        fg_status_backend.storeRelaxed(stream_active ? fg_run_backend : 0);
         fg_status_multiplier.storeRelaxed(fg_applied ? fg_active_multiplier : 0);
         int reason = 0;
         if (!bypass_frame_queue)
             reason = 1;
-        else if (fg_backend > 0 && frame_gen->backendFailed(static_cast<FrameGen::Backend>(fg_backend)))
+        else if (fg_run_backend > 0 && frame_gen->backendFailed(static_cast<FrameGen::Backend>(fg_run_backend)))
             reason = 2;
         else if (fg_backend > 0 && fg_refresh_limited)
             reason = 3;
