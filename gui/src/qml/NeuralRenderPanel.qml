@@ -221,6 +221,7 @@ Rectangle {
 
     ColumnLayout {
         id: content
+        objectName: "panelContent"
         anchors {
             left: parent.left
             right: parent.right
@@ -388,6 +389,7 @@ Rectangle {
 
         Item { implicitHeight: 4 }
         Label {
+            objectName: "panelFooter"
             Layout.fillWidth: true
             text: panel.perPass
                   ? qsTr("↑↓ select   ←→ change   PgUp/PgDn pass   Backspace default   End close")

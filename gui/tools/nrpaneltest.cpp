@@ -254,11 +254,24 @@ int main(int argc, char **argv)
     key(Qt::Key_PageUp);
     check(panel->property("tuningPass").toInt() == 0, "PgUp: back to pass 1");
     check(near(panel->property("tuning").toMap().value("intensity").toDouble(), 1.0), "rows show pass 1's values again");
-    // The view does not follow the rows that appeared since it opened: size it to the panel.
-    check(panel->implicitHeight() > 400, qPrintable(QString("panel height %1 px with all rows").arg(panel->implicitHeight())));
-    view.resize(static_cast<int>(panel->width()), static_cast<int>(panel->implicitHeight()));
+    // The harness window starts hidden, so the render loop never polishes the ColumnLayout and
+    // its implicit height still counts the rows of the first frame (the stream window renders
+    // every frame and does not have this). Polish it, then size the view to the whole panel.
+    auto *content = panel->findChild<QQuickItem *>("panelContent");
+    auto *footer = panel->findChild<QQuickItem *>("panelFooter");
+    check(content && footer, "panel content and footer found");
+    if (content)
+        content->ensurePolished();
     settle();
+    view.resize(static_cast<int>(panel->width()), static_cast<int>(std::ceil(panel->height())));
+    settle();
+    const double footer_bottom = footer ? footer->mapToItem(panel, QPointF(0, footer->height())).y() : 1e9;
+    check(footer_bottom <= panel->height() && panel->height() > 560,
+          qPrintable(QString("all 12 rows and the key help inside the panel (footer bottom %1 of %2 px)")
+                         .arg(footer_bottom, 0, 'f', 0).arg(panel->height(), 0, 'f', 0)));
     const QImage img = view.grabWindow();
+    check(!img.isNull() && img.height() + 1 >= panel->height() * view.devicePixelRatio(),
+          qPrintable(QString("screenshot %1x%2 covers the whole panel").arg(img.width()).arg(img.height())));
     check(!img.isNull() && img.save(shot), qPrintable("screenshot " + shot));
     key(Qt::Key_Escape);
     check(closes.count == 1, "Esc sends closeRequested");
