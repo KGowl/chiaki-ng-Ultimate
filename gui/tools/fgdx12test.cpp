@@ -427,8 +427,7 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
                 hdr ? "HDR" : "SDR", base.empty() ? "pattern" : image_path.c_str(), model == 1 ? "HT" : "CC", frames,
                 mvx, with_fg ? ", with DLSS FG D3D12" : "");
     if (passes > 1 || tune_at >= 0)
-        std::printf("%d pass(es)%s
-", passes, tune_at >= 0 ? ", controls changed live (Cinematic, local tone 2) from frame --tune-at on" : "");
+        std::printf("%d pass(es)%s\n", passes, tune_at >= 0 ? ", controls changed live (Cinematic, local tone 2) from frame --tune-at on" : "");
     if (!rig.resize(w, h) || (hdr && !rig.ensureHdrSource())) {
         std::printf("VERDICT: textures\n");
         return 3;
