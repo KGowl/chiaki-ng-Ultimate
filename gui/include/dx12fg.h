@@ -49,8 +49,11 @@ public:
     // Creates the D3D12 device on the GPU of the Vulkan device, the hidden swapchain, the
     // NGX runtime and the shared fence; logs why it cannot.
     bool init();
-    // Generated frames per real frame the runtime supports (at most kMaxOutputs).
+    // Generated frames per real frame the runtime supports (at most kMaxOutputs). With Streamline,
+    // as many as the GPU keeps up with at the stream's frame rate (measured, it changes).
     int maxGenerated() const;
+    // The stream's frame interval: the time Streamline has for the generated frames of each.
+    void setFrameInterval(float ms);
 
     // (Re)creates the shared buffers, the D3D12 textures and the NGX feature for this
     // size and runs two warm-up evaluations (the runtime builds its pipelines then,
@@ -87,6 +90,20 @@ public:
     // itself), NVIDIA's own runtime uses them.
     bool generate(int count, uint64_t wait_value, uint64_t signal_value, bool reset, bool use_motion,
                   float mvec_scale_x, float mvec_scale_y);
+
+    // DLSS Frame Generation through NVIDIA Streamline (NVIDIA, with MFG Unlocker's version.dll
+    // next to chiaki.exe, or CHIAKI_DLSSG_ROUTE=sl; MFG Unlocker opens DLSS-G on RTX 20 / RTX 30
+    // for Streamline only). generate() hands the frame to Streamline, which presents the
+    // generated frames on a hidden swapchain over the following frame interval; each is copied
+    // back as it is presented. They are picked up with framesReady() / takeFrames() before
+    // recordDownload(). With NGX directly, the frames are there once `signal_value` is reached.
+    bool asyncFrames() const;
+    // Whether the generated frames of the last generate() are in, or are not coming (Streamline
+    // presented that real frame without them, or they took too long). Never waits.
+    bool framesReady();
+    // How many generated frames of the last generate() came in (0..count), in order;
+    // recordDownload(i) copies the i-th. Once per generate(), after framesReady().
+    int takeFrames();
 
     // What the NGX D3D12 runtime offers; init() succeeds with either.
     bool fgAvailable() const;

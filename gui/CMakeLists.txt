@@ -164,6 +164,19 @@ if(CHIAKI_ENABLE_NGX)
 	target_link_libraries(chiaki-fgdx12test PkgConfig::LIBPLACEBO Qt::Core Qt::Gui "${CHIAKI_NGX_LIB}"
 		advapi32 user32 setupapi version shell32 ole32 avrt winmm)
 	add_dependencies(chiaki-fgdx12test chiaki-nrgate)
+	# DLSS Frame Generation through NVIDIA Streamline: MFG Unlocker opens DLSS-G on RTX 20 / RTX 30
+	# for Streamline only (dx12fg.cpp). Headers only: sl.interposer.dll is loaded at run time, and
+	# only when that route is taken.
+	if(CHIAKI_STREAMLINE_SDK_DIR)
+		if(NOT EXISTS "${CHIAKI_STREAMLINE_SDK_DIR}/include/sl.h")
+			message(FATAL_ERROR "CHIAKI_STREAMLINE_SDK_DIR: include/sl.h not found in ${CHIAKI_STREAMLINE_SDK_DIR}")
+		endif()
+		foreach(target chiaki chiaki-fgdx12test)
+			target_include_directories(${target} PRIVATE "${CHIAKI_STREAMLINE_SDK_DIR}/include")
+			target_compile_definitions(${target} PRIVATE CHIAKI_HAVE_STREAMLINE)
+		endforeach()
+		message(STATUS "NVIDIA Streamline enabled: DLSS Frame Generation through Streamline (${CHIAKI_STREAMLINE_SDK_DIR})")
+	endif()
 	# Console test of the DLSS 5 panel (tools/nrpaneltest.cpp, the application's QML resources and
 	# a stand-in for its backend). Not built by default: --target chiaki-nrpaneltest.
 	add_executable(chiaki-nrpaneltest EXCLUDE_FROM_ALL tools/nrpaneltest.cpp src/qml/qml.qrc)

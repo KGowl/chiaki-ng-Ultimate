@@ -32,6 +32,7 @@ option(CHIAKI_LIB_OPENSSL_EXTERNAL_PROJECT "Use OpenSSL as CMake external projec
 option(CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER "Use SDL Gamecontroller for Input" ON)
 option(CHIAKI_ENABLE_NGX "Enable NVIDIA NGX features: RTX Video Super Resolution and DLSS Frame Generation (Windows, needs the NVIDIA DLSS SDK)" OFF)
 set(CHIAKI_NGX_SDK_DIR "" CACHE PATH "Root of the NVIDIA DLSS SDK (https://github.com/NVIDIA/DLSS)")
+set(CHIAKI_STREAMLINE_SDK_DIR "" CACHE PATH "Root of the NVIDIA Streamline SDK 2.x (https://github.com/NVIDIA-RTX/Streamline): DLSS Frame Generation through Streamline, with CHIAKI_ENABLE_NGX")
 option(CHIAKI_ENABLE_FFX "Enable AMD FidelityFX FSR 3.1 Frame Generation (Windows, needs the FidelityFX SDK 1.1.x headers)" OFF)
 if(WIN32 OR APPLE OR ANDROID)
 	set(CHIAKI_FFX_SOURCE_DEFAULT OFF)

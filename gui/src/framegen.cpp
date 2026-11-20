@@ -49,9 +49,11 @@ Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -210,7 +212,8 @@ struct FrameGen::Impl
 #if defined(CHIAKI_HAVE_DX12FG)
     // With `defer` the copy back of the generated frames is left to dx12Download()
     // (FrameGen::finish), see `deferred`.
-    bool processDx12(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
+    bool processDx12(FrameSet &set, int count, float frame_interval_ms,
+                     std::vector<struct pl_frame> &outputs,
                      const std::function<void(const char *)> &trace_step, bool defer = false);
     bool dx12Download(FrameSet &set, int count, uint64_t output_value, std::vector<struct pl_frame> &outputs);
     bool dx12Fail(const char *what);
@@ -1567,7 +1570,8 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
 // itself, so the first frame of a sequence goes through it as well (reset set) and only its
 // own output is dropped. Motion vectors are not passed: NeuralHub's runtime finds the motion
 // itself and ignores them.
-bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
+bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_ms,
+                                 std::vector<struct pl_frame> &outputs,
                                  const std::function<void(const char *)> &trace_step, bool defer)
 {
     auto *backend_dx = static_cast<Dx12Backend *>(backend_impl.get());
@@ -1637,6 +1641,7 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl
         trace_step("dx12 buffers ready");
     }
     const bool fresh = reset_pending || !have_history || !last_real;
+    runner->setFrameInterval(frame_interval_ms);
     count = std::clamp(count, 1, runner->maxGenerated());
 
     // (1) Real frame -> shared color buffer.
@@ -1728,6 +1733,22 @@ bool FrameGen::Impl::dx12Download(FrameSet &set, int count, uint64_t output_valu
     Dx12Fg *runner = backend_dx ? backend_dx->runner.get() : nullptr;
     if (!runner)
         return false;
+    if (runner->asyncFrames()) {
+        // Streamline presents the generated frames over the next frame interval (framesReady()
+        // gives up after a bound); some may not come.
+        while (!runner->framesReady())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        count = std::min(count, runner->takeFrames());
+        if (count <= 0) {
+            consecutive_failures = 0;
+            have_history = true;
+            reset_pending = false;
+            last_real = &set.real;
+            outputs.emplace_back();
+            fillFrame(set.real, &outputs.back());
+            return true;
+        }
+    }
     CommandSlot *slot = beginSlot();
     if (!slot)
         return dx12Fail("command buffer unavailable");
@@ -1864,7 +1885,12 @@ bool FrameGen::beginDone() const
     if (!d.deferred.active || !d.deferred.output_value || d.backend != Backend::Dlss12 || !d.backend_impl)
         return true;
     const auto *backend_dx = static_cast<const Dx12Backend *>(d.backend_impl.get());
-    return !backend_dx->runner || backend_dx->runner->completedValue() >= d.deferred.output_value;
+    if (!backend_dx->runner)
+        return true;
+    if (backend_dx->runner->completedValue() < d.deferred.output_value)
+        return false;
+    // Streamline: its generated frames come in as it presents them.
+    return !backend_dx->runner->asyncFrames() || backend_dx->runner->framesReady();
 #else
     return true;
 #endif
@@ -2018,7 +2044,7 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
         return d.processVfg(set, count, outputs, trace_step);
 #if defined(CHIAKI_HAVE_DX12FG)
     if (d.backend == FrameGen::Backend::Dlss12)
-        return d.processDx12(set, count, outputs, trace_step, defer);
+        return d.processDx12(set, count, frame_interval_ms, outputs, trace_step, defer);
 #endif
 
     if (d.backend == FrameGen::Backend::Flow) {

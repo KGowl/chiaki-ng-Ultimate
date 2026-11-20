@@ -43,6 +43,14 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <timeapi.h>
+#endif
+
 Q_LOGGING_CATEGORY(chiakiGui, "chiaki.gui", QtInfoMsg)
 
 namespace {
@@ -634,6 +642,11 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+#if defined(_WIN32)
+    // 1 ms timer resolution, as chiaki-ng sets it while streaming (windowsStreamTuning.cpp): waits
+    // for Streamline's frames sleep 1 ms at a time.
+    timeBeginPeriod(1);
+#endif
     int backend_value = 5, frames = 20, mvx = 8, w = 1920, h = 1080, model = 0, passes = 1, tune_at = -1;
     bool nr_mode = false, with_fg = false, hdr = false, pipeline = false;
     float scale = 1.0f;
