@@ -16,6 +16,7 @@
 #include <QCoreApplication>
 #include <QProcess>
 #include <QDir>
+#include <cmath>
 #include <QFileInfo>
 #if defined(_WIN32)
 #include <qt_windows.h>
@@ -1121,6 +1122,95 @@ void QmlSettings::setNeuralRenderModel(int model)
         return;
     settings->SetNeuralRenderModel(model);
     emit neuralRenderChanged();
+}
+
+int QmlSettings::neuralRenderPasses() const
+{
+    return settings->GetNeuralRenderPasses();
+}
+
+void QmlSettings::setNeuralRenderPasses(int passes)
+{
+    passes = qBound(1, passes, NeuralRenderTuning::kMaxPasses);
+    if (passes == settings->GetNeuralRenderPasses())
+        return;
+    settings->SetNeuralRenderPasses(passes);
+    emit neuralRenderChanged();
+}
+
+bool QmlSettings::neuralRenderPerPass() const
+{
+    return settings->GetNeuralRenderPerPass();
+}
+
+void QmlSettings::setNeuralRenderPerPass(bool enabled)
+{
+    if (enabled == settings->GetNeuralRenderPerPass())
+        return;
+    // Each pass starts from the shared (pass 1) controls.
+    if (enabled) {
+        const NeuralRenderTuning first = settings->GetNeuralRenderTuning(0);
+        for (int pass = 1; pass < NeuralRenderTuning::kMaxPasses; pass++)
+            settings->SetNeuralRenderTuning(pass, first);
+    }
+    settings->SetNeuralRenderPerPass(enabled);
+    emit neuralRenderChanged();
+    emit neuralRenderTuningChanged();
+}
+
+static QVariantMap neuralRenderTuningMap(const NeuralRenderTuning &t)
+{
+    QVariantMap m;
+    m[QStringLiteral("style")] = t.style;
+    m[QStringLiteral("intensity")] = t.intensity;
+    m[QStringLiteral("localStructure")] = t.local_structure;
+    m[QStringLiteral("localTone")] = t.local_tone;
+    m[QStringLiteral("autoMask")] = t.auto_mask;
+    m[QStringLiteral("skinStructure")] = t.skin_structure;
+    return m;
+}
+
+QVariantMap QmlSettings::neuralRenderTuning(int pass) const
+{
+    return neuralRenderTuningMap(settings->GetNeuralRenderTuning(pass));
+}
+
+QVariant QmlSettings::neuralRenderTuningDefault(const QString &key) const
+{
+    return neuralRenderTuningMap(NeuralRenderTuning()).value(key);
+}
+
+void QmlSettings::setNeuralRenderTuningValue(int pass, const QString &key, const QVariant &value)
+{
+    if (pass < 0 || pass >= NeuralRenderTuning::kMaxPasses)
+        return;
+    NeuralRenderTuning t = settings->GetNeuralRenderTuning(pass);
+    const NeuralRenderTuning before = t;
+    if (key == QLatin1String("style"))
+        t.style = value.toInt();
+    else if (key == QLatin1String("intensity"))
+        t.intensity = value.toFloat();
+    else if (key == QLatin1String("localStructure"))
+        t.local_structure = value.toFloat();
+    else if (key == QLatin1String("localTone"))
+        t.local_tone = value.toFloat();
+    else if (key == QLatin1String("autoMask"))
+        t.auto_mask = value.toBool();
+    else if (key == QLatin1String("skinStructure"))
+        t.skin_structure = value.toFloat();
+    else
+        return;
+    // Sliders step by 0.05; keep the stored values on that grid.
+    auto snap = [](float v) { return std::round(v * 20.0f) / 20.0f; };
+    t.intensity = snap(t.intensity);
+    t.local_structure = snap(t.local_structure);
+    t.local_tone = snap(t.local_tone);
+    t.skin_structure = snap(t.skin_structure);
+    t = Settings::ClampNeuralRenderTuning(t);
+    if (t == before)
+        return;
+    settings->SetNeuralRenderTuning(pass, t);
+    emit neuralRenderTuningChanged();
 }
 
 int QmlSettings::frameGenBackend() const

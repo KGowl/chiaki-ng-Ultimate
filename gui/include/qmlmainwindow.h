@@ -9,6 +9,7 @@
 #include <QWindow>
 #include <QQuickWindow>
 #include <QLoggingCategory>
+#include <array>
 #include <deque>
 #include <vector>
 #include <atomic>
@@ -64,6 +65,11 @@ class QmlMainWindow : public QWindow
     Q_PROPERTY(bool hasVideo READ hasVideo NOTIFY hasVideoChanged)
     Q_PROPERTY(int droppedFrames READ droppedFrames NOTIFY droppedFramesChanged)
     Q_PROPERTY(QString videoEnhancementStatus READ videoEnhancementStatus NOTIFY videoEnhancementStatusChanged)
+    // DLSS 5 neural rendering switched off for this run (the setting stays on); the panel's
+    // first row and NVIDIA's End panel.
+    Q_PROPERTY(bool neuralRenderPaused READ neuralRenderPaused WRITE setNeuralRenderPaused NOTIFY neuralRenderToggled)
+    // Whether the DLSS 5 controls reach the model (NVIDIA's feature 18 is running).
+    Q_PROPERTY(bool neuralRenderTunable READ neuralRenderTunable NOTIFY neuralRenderTunableChanged)
     Q_PROPERTY(double streamFps READ streamFps NOTIFY fpsChanged)
     Q_PROPERTY(double displayFps READ displayFps NOTIFY fpsChanged)
     Q_PROPERTY(bool keepVideo READ keepVideo WRITE setKeepVideo NOTIFY keepVideoChanged)
@@ -142,6 +148,9 @@ public:
 
     bool amdCard() const;
     bool nvidiaCard() const;
+    bool neuralRenderPaused() const;
+    void setNeuralRenderPaused(bool paused);
+    bool neuralRenderTunable() const;
     bool wasMaximized() const { return was_maximized; };
     bool isWindowAdjustable() const { return is_window_adjustable; }
     void setWindowAdjustable(bool adjustable) { is_window_adjustable = adjustable; }
@@ -187,8 +196,11 @@ signals:
     void hasVideoChanged();
     void droppedFramesChanged();
     void videoEnhancementStatusChanged();
-    // The End key switched DLSS neural rendering on or off for this run.
+    // DLSS neural rendering was switched on or off for this run.
     void neuralRenderToggled(bool enabled);
+    // End on NVIDIA: open or close the DLSS 5 panel.
+    void neuralRenderPanelRequested();
+    void neuralRenderTunableChanged();
     void fpsChanged();
     void keepVideoChanged();
     void videoModeChanged();
@@ -360,6 +372,12 @@ private:
     bool nr_user_off_seen = false;
     // 1 while NeuralHub runs neural rendering: End is then its in-game panel's key.
     QAtomicInteger<int> nr_provider_panel = 0;
+    // 1 while the DLSS 5 controls reach the model (NVIDIA's feature 18).
+    QAtomicInteger<int> nr_tunable = 0;
+    // Render thread: the DLSS 5 passes and controls as last read from the settings.
+    uint32_t nr_tuning_rev = 0;
+    int nr_passes = 1;
+    std::array<NeuralRenderTuning, NeuralRenderTuning::kMaxPasses> nr_tuning = {};
     // Stream frames per game picture (2 = 30 fps game in a 60 fps stream,
     // repeats dropped before frame generation); set by presentFrame.
     RepeatCadenceDetector repeat_detector;

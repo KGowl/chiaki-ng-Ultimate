@@ -7892,9 +7892,19 @@ void QmlMainWindow::render()
 #endif
         // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
         // the largest step DLSS Performance covers well), or the source size.
+        // The DLSS 5 controls (NVIDIA), read again whenever the settings change.
+        const uint32_t tuning_rev = settings->GetNeuralRenderTuningRevision();
+        if (tuning_rev != nr_tuning_rev) {
+            nr_tuning_rev = tuning_rev;
+            nr_passes = settings->GetNeuralRenderPasses();
+            for (int p = 0; p < NeuralRenderTuning::kMaxPasses; p++)
+                nr_tuning[static_cast<size_t>(p)] = settings->GetNeuralRenderEffectiveTuning(p);
+        }
         auto nr_options_for = [&](const struct pl_frame *src) {
             NeuralRender::Options options;
             options.model = settings->GetNeuralRenderModel();
+            options.passes = nr_passes;
+            options.tuning = nr_tuning;
             if (!settings->GetNeuralRenderUpscale() || !src)
                 return options;
             const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
@@ -7949,6 +7959,9 @@ void QmlMainWindow::render()
         if (!nr_wanted || fg_override)
             neural_render->hidePanel();
         nr_provider_panel.storeRelaxed(neural_render->hasProviderPanel() ? 1 : 0);
+        const int tunable = neural_render->tunable() ? 1 : 0;
+        if (nr_tunable.fetchAndStoreRelaxed(tunable) != tunable)
+            QMetaObject::invokeMethod(this, [this]() { emit neuralRenderTunableChanged(); }, Qt::QueuedConnection);
     }
     if (!fg_override) {
         if (nr_applied != neural_render_active) {
@@ -8197,12 +8210,9 @@ bool QmlMainWindow::handleShortcut(QKeyEvent *event)
             // console here.
             if (session && settings && settings->GetNeuralRender() && nr_provider_panel.loadRelaxed())
                 return true;
-            // NVIDIA: DLSS 5 on/off while streaming.
+            // NVIDIA: chiaki-ng's own DLSS 5 panel over the video (on/off, passes, controls).
             if (session && settings && settings->GetNeuralRender()) {
-                const bool enabled = nr_user_off.fetchAndXorRelaxed(1) != 0;
-                qCInfo(chiakiGui) << "DLSS neural rendering switched" << (enabled ? "on" : "off") << "with the End key";
-                emit neuralRenderToggled(enabled);
-                scheduleUpdate(true, UpdateRequestReason::Unknown);
+                emit neuralRenderPanelRequested();
                 return true;
             }
             break;
@@ -8248,6 +8258,26 @@ bool QmlMainWindow::amdCard() const
 bool QmlMainWindow::nvidiaCard() const
 {
     return nvidia_card;
+}
+
+bool QmlMainWindow::neuralRenderPaused() const
+{
+    return nr_user_off.loadRelaxed() != 0;
+}
+
+void QmlMainWindow::setNeuralRenderPaused(bool paused)
+{
+    if ((nr_user_off.loadRelaxed() != 0) == paused)
+        return;
+    nr_user_off.storeRelaxed(paused ? 1 : 0);
+    qCInfo(chiakiGui) << "DLSS neural rendering switched" << (paused ? "off" : "on") << "for this run";
+    emit neuralRenderToggled(!paused);
+    scheduleUpdate(true, UpdateRequestReason::Unknown);
+}
+
+bool QmlMainWindow::neuralRenderTunable() const
+{
+    return nr_tunable.loadRelaxed() != 0;
 }
 
 bool QmlMainWindow::event(QEvent *event)

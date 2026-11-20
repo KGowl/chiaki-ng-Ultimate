@@ -4,6 +4,9 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
 
+#include "neuralrendertuning.h"
+
+#include <array>
 #include <cstdint>
 #include <memory>
 
@@ -60,6 +63,9 @@ public:
     void setPanelWindow(void *window);
     bool hasProviderPanel() const;
     void hidePanel();
+    // Whether Options::passes and Options::tuning reach the model (NVIDIA's feature 18);
+    // any thread.
+    bool tunable() const;
 
     struct Options
     {
@@ -68,6 +74,10 @@ public:
         int out_height = 0;
         // NVIDIA feature 18 model: 0 = CC, 1 = HT. NeuralHub uses its own setting.
         int model = 0;
+        // NVIDIA: feature 18 passes in a row (1..3; changing it re-creates the features) and
+        // the live controls of each pass (applied from this frame on). NeuralHub has its own.
+        int passes = 1;
+        std::array<NeuralRenderTuning, NeuralRenderTuning::kMaxPasses> tuning = {};
     };
 
     // Runs neural rendering on `src`. On success `out_frame` describes an RGB texture owned

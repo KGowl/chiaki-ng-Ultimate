@@ -6,7 +6,7 @@
 // Usage: chiaki-fgdx12test [--backend 5] [--frames N] [--mvx N] [--w W --h H]
 //   --backend  FrameGen::Backend value: 1 DLSS (Vulkan), 3 Flow, 5 DLSS through D3D12 (default)
 //        chiaki-fgdx12test --nr [--image file] [--out file.png] [--with-fg] [--frames N] [--mvx N]
-//                          [--scale 1|1.5|2] [--hdr] [--model 0|1]
+//                          [--scale 1|1.5|2] [--hdr] [--model 0|1] [--passes 1-3] [--tune-at K]
 //   --nr       neural rendering (NeuralRender, DLSS 5 through D3D12) on a moving pattern or on
 //              an image panned by --mvx px per frame; --out saves the last output, --with-fg
 //              also runs DLSS Frame Generation through D3D12 on the output (shared runtime),
@@ -399,7 +399,7 @@ HdrStats hdrStats(const std::vector<float> &f)
 // working when frame generation through D3D12 shares it. --scale upscales after it, --hdr
 // feeds a linear-light HDR frame (highlights to 8x SDR white) and checks they stay HDR.
 int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &out_path, int frames, int mvx, int w,
-                    int h, bool with_fg, float scale, bool hdr, int model)
+                    int h, bool with_fg, float scale, bool hdr, int model, int passes, int tune_at)
 {
     std::vector<uint8_t> base;
     if (!image_path.empty()) {
@@ -417,6 +417,7 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
     }
     NeuralRender::Options options;
     options.model = model;
+    options.passes = passes;
     if (scale > 1.01f) {
         options.out_width = static_cast<int>(std::lround(w * scale / 2.0f)) * 2;
         options.out_height = static_cast<int>(std::lround(h * scale / 2.0f)) * 2;
@@ -425,6 +426,9 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
                 options.out_width ? options.out_width : w, options.out_height ? options.out_height : h,
                 hdr ? "HDR" : "SDR", base.empty() ? "pattern" : image_path.c_str(), model == 1 ? "HT" : "CC", frames,
                 mvx, with_fg ? ", with DLSS FG D3D12" : "");
+    if (passes > 1 || tune_at >= 0)
+        std::printf("%d pass(es)%s
+", passes, tune_at >= 0 ? ", controls changed live (Cinematic, local tone 2) from frame --tune-at on" : "");
     if (!rig.resize(w, h) || (hdr && !rig.ensureHdrSource())) {
         std::printf("VERDICT: textures\n");
         return 3;
@@ -478,6 +482,13 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
         } else {
             rig.uploadRgba(input.data());
             src = rig.sourceFrame();
+        }
+        // --tune-at: the controls change while running (no new feature, a new history).
+        if (tune_at >= 0 && k == tune_at) {
+            for (auto &t : options.tuning) {
+                t.style = 2;
+                t.local_tone = 2.0f;
+            }
         }
         struct pl_frame out = {};
         uint64_t signature = 0;
@@ -574,7 +585,7 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
-    int backend_value = 5, frames = 20, mvx = 8, w = 1920, h = 1080, model = 0;
+    int backend_value = 5, frames = 20, mvx = 8, w = 1920, h = 1080, model = 0, passes = 1, tune_at = -1;
     bool nr_mode = false, with_fg = false, hdr = false;
     float scale = 1.0f;
     std::string image_path, out_path;
@@ -592,6 +603,8 @@ int main(int argc, char **argv)
         else if (a == "--scale" && i + 1 < argc) scale = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--hdr") hdr = true;
         else if (a == "--model" && i + 1 < argc) model = std::atoi(argv[++i]);
+        else if (a == "--passes" && i + 1 < argc) passes = std::atoi(argv[++i]);
+        else if (a == "--tune-at" && i + 1 < argc) tune_at = std::atoi(argv[++i]);
     }
     if (nr_mode) {
         if (!NeuralRender::compiledIn()) {
@@ -604,7 +617,8 @@ int main(int argc, char **argv)
             rig.destroy();
             return 3;
         }
-        const int result = runNeuralRender(rig, image_path, out_path, frames, mvx, w, h, with_fg, scale, hdr, model);
+        const int result =
+            runNeuralRender(rig, image_path, out_path, frames, mvx, w, h, with_fg, scale, hdr, model, passes, tune_at);
         rig.destroy();
         return result;
     }

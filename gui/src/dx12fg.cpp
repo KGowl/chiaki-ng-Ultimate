@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -430,6 +431,19 @@ struct Dx12Fg::Impl
     NVSDK_NGX_Parameter *nr_sr_params = nullptr;
     NVSDK_NGX_Handle *nr_sr_handle = nullptr;
     NrConfig nr_cfg;
+    // Feature 18 passes after the first (nr_handle) and the textures between the passes.
+    std::array<NVSDK_NGX_Handle *, kMaxNrPasses - 1> nr_more = {};
+    std::array<Tex, 2> nr_chain;
+    // Feature 18's live controls per pass: what the next evaluation sets, and what the last
+    // one set (a difference starts a new temporal history in that pass and the ones after).
+    std::array<NrTuning, kMaxNrPasses> nr_tuning, nr_tuning_set;
+    bool nr_tuning_valid = false;
+    ULONGLONG nr_tuning_logged = 0;
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+    std::string nr_test_keys; // CHIAKI_DX12FG_NR_KEYS as last applied
+    bool nrTestKeys();
+#endif
+    void nrSetKeys(int pass);
     Tex nr_in, nr_out, nr_depth, nr_motion;
     // NVIDIA: feature 18's output at the input size when upscaling follows (nr_mid), and
     // the RGBA8 SDR proxy of an HDR frame before / after the model.
@@ -503,7 +517,8 @@ struct Dx12Fg::Impl
     std::vector<Tex *> nrTextures()
     {
         std::vector<Tex *> all;
-        for (Tex *t : { &nr_in, &nr_out, &nr_depth, &nr_motion, &nr_mid, &nr_proxy_in, &nr_proxy_out, &nr_panel }) {
+        for (Tex *t : { &nr_in, &nr_out, &nr_depth, &nr_motion, &nr_mid, &nr_proxy_in, &nr_proxy_out, &nr_chain[0],
+                        &nr_chain[1], &nr_panel }) {
             if (t->res)
                 all.push_back(t);
         }
@@ -1274,6 +1289,59 @@ void Dx12Fg::Impl::destroySized()
 // of, the same route as the DLSS 5 video players. Video has no depth and no motion vectors:
 // the depth is a constant 0.5 and the motion vectors are zero.
 
+// Feature 18's controls of one pass, set before its CreateFeature and every evaluation. Skin
+// structure only takes effect with the automatic mask (-1 = the model's own, as 1). Values out
+// of range are not clamped by the snippet: it falls back to the default (intensity 2 = 1).
+void Dx12Fg::Impl::nrSetKeys(int pass)
+{
+    const NrTuning &t = nr_tuning[static_cast<size_t>(pass)];
+    NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Style", static_cast<unsigned int>(t.style));
+    NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.Intensity", t.intensity);
+    NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.LocalStructureStrength", t.local_structure);
+    NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.LocalToneStrength", t.local_tone);
+    NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.UseAutoMask", t.auto_mask ? 1u : 0u);
+    NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.SkinStructureStrength", t.auto_mask ? t.skin_structure : -1.0f);
+    NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.UICorrection", 1);
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+    // Test hook (dev builds only): CHIAKI_DX12FG_NR_KEYS="DLSSNR.Name=u3;DLSSNR.Other=f0.5"
+    // sets more keys (u = unsigned, f = float) after these.
+    size_t at = 0;
+    while (at < nr_test_keys.size()) {
+        size_t end = nr_test_keys.find(';', at);
+        if (end == std::string::npos)
+            end = nr_test_keys.size();
+        const std::string item = nr_test_keys.substr(at, end - at);
+        const size_t eq = item.find('=');
+        if (eq != std::string::npos && eq + 2 <= item.size()) {
+            const std::string key = item.substr(0, eq);
+            const char kind = item[eq + 1];
+            const std::string value = item.substr(eq + 2);
+            if (kind == 'u')
+                NVSDK_NGX_Parameter_SetUI(nr_params, key.c_str(), static_cast<unsigned int>(std::stoul(value)));
+            else if (kind == 'f')
+                NVSDK_NGX_Parameter_SetF(nr_params, key.c_str(), std::stof(value));
+            else if (kind == 'i')
+                NVSDK_NGX_Parameter_SetI(nr_params, key.c_str(), std::stoi(value));
+        }
+        at = end + 1;
+    }
+#endif
+}
+
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+// Reads CHIAKI_DX12FG_NR_KEYS; true when it changed since the last call.
+bool Dx12Fg::Impl::nrTestKeys()
+{
+    const char *env = std::getenv("CHIAKI_DX12FG_NR_KEYS");
+    const std::string keys = env ? env : "";
+    if (keys == nr_test_keys)
+        return false;
+    log(0, "test keys: \"%s\"", keys.c_str());
+    nr_test_keys = keys;
+    return true;
+}
+#endif
+
 bool Dx12Fg::Impl::nrCreateFeature()
 {
     const unsigned int w = static_cast<unsigned int>(nr_cfg.width), h = static_cast<unsigned int>(nr_cfg.height);
@@ -1293,25 +1361,29 @@ bool Dx12Fg::Impl::nrCreateFeature()
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Width", w);
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Height", h);
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Hint.Render.Preset", preset);
-        NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.Intensity", 1.0f);
-        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Style", 0);
-        NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.LocalStructureStrength", 1.0f);
-        NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.LocalToneStrength", 1.0f);
-        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.UseAutoMask", 0);
-        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.UICorrection", 1);
-        Slot *slot = nullptr;
-        if (!beginList(&slot))
-            return false;
-        stage = "nvngx_dlssnr CreateFeature";
-        const auto r = static_cast<NVSDK_NGX_Result>(
-            gate.create(list.Get(), kFeatureNeuralRendering, nr_params, reinterpret_cast<void **>(&nr_handle)));
-        const bool executed = endList(*slot) && waitIdle();
-        if (NVSDK_NGX_FAILED(r) || !nr_handle) {
-            log(1, "creating DLSS 5 neural rendering (feature 18) failed: %s (0x%08x) %s", ngxResultString(r),
-                static_cast<unsigned>(r), gate.fault());
-            nr_handle = nullptr;
-            return false;
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+        nrTestKeys();
+#endif
+        bool executed = true;
+        for (int pass = 0; pass < nr_cfg.passes; pass++) {
+            NVSDK_NGX_Handle *&handle = pass == 0 ? nr_handle : nr_more[static_cast<size_t>(pass - 1)];
+            nrSetKeys(pass);
+            Slot *slot = nullptr;
+            if (!beginList(&slot))
+                return false;
+            stage = "nvngx_dlssnr CreateFeature";
+            const auto r = static_cast<NVSDK_NGX_Result>(
+                gate.create(list.Get(), kFeatureNeuralRendering, nr_params, reinterpret_cast<void **>(&handle)));
+            executed = endList(*slot) && waitIdle() && executed;
+            if (NVSDK_NGX_FAILED(r) || !handle) {
+                log(1, "creating DLSS 5 neural rendering (feature 18, pass %d) failed: %s (0x%08x) %s", pass + 1,
+                    ngxResultString(r), static_cast<unsigned>(r), gate.fault());
+                handle = nullptr;
+                return false;
+            }
         }
+        nr_tuning_set = nr_tuning;
+        nr_tuning_valid = true;
         return executed && (!nrUpscales() || nrCreateUpscaler());
     }
     NVSDK_NGX_DLSS_Create_Params cp = {};
@@ -1722,14 +1794,9 @@ bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
             dispatchProxy(false);
         Tex &model_in = proxy ? nr_proxy_in : nr_in;
         Tex &model_out = proxy ? nr_proxy_out : nrUpscales() ? nr_mid : nr_out;
-        barrier(model_in, srv);
-        barrier(model_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Color", model_in.res.Get());
         NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Depth", nr_depth.res.Get());
         NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.MVec", nr_motion.res.Get());
-        NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Output", model_out.res.Get());
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Enabled", 1);
-        NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Reset", reset ? 1 : 0);
         NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.DepthInverted", 0);
         for (const char *name : { "Color", "Output", "Depth", "MVec" }) {
             const std::string base = std::string("DLSSNR.") + name + "Subrect";
@@ -1740,13 +1807,47 @@ bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
         }
         NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.MVecScaleX", 1.0f);
         NVSDK_NGX_Parameter_SetF(nr_params, "DLSSNR.MVecScaleY", 1.0f);
-        stage = "nvngx_dlssnr EvaluateFeature";
-        auto r = static_cast<NVSDK_NGX_Result>(gate.evaluate(list.Get(), nr_handle, nr_params));
-        if (NVSDK_NGX_FAILED(r)) {
-            log(log_level, "evaluating DLSS 5 neural rendering (feature 18) failed: %s (0x%08x) %s", ngxResultString(r),
-                static_cast<unsigned>(r), gate.fault());
-            return false;
+        // A pass whose controls changed starts a new history, and so does every pass after it
+        // (its input changed).
+        int first_reset = reset ? 0 : nr_cfg.passes;
+        for (int pass = 0; pass < first_reset; pass++) {
+            if (!nr_tuning_valid || nr_tuning_set[static_cast<size_t>(pass)] != nr_tuning[static_cast<size_t>(pass)])
+                first_reset = pass;
         }
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+        if (nrTestKeys())
+            first_reset = 0;
+#endif
+        if (first_reset < nr_cfg.passes && !reset && GetTickCount64() - nr_tuning_logged > 1000) {
+            nr_tuning_logged = GetTickCount64();
+            const NrTuning &t = nr_tuning[static_cast<size_t>(first_reset)];
+            log(0, "DLSS 5 controls (pass %d of %d): style %d, intensity %.2f, local structure %.2f, local tone %.2f, "
+                   "auto mask %d, skin structure %.2f",
+                first_reset + 1, nr_cfg.passes, t.style, t.intensity, t.local_structure, t.local_tone,
+                t.auto_mask ? 1 : 0, t.skin_structure);
+        }
+        // Passes in a row: model_in -> chain[0] -> chain[1] -> model_out.
+        for (int pass = 0; pass < nr_cfg.passes; pass++) {
+            Tex &in = pass == 0 ? model_in : nr_chain[static_cast<size_t>((pass - 1) % 2)];
+            Tex &out = pass == nr_cfg.passes - 1 ? model_out : nr_chain[static_cast<size_t>(pass % 2)];
+            barrier(in, srv);
+            barrier(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Color", in.res.Get());
+            NVSDK_NGX_Parameter_SetD3d12Resource(nr_params, "DLSSNR.Output", out.res.Get());
+            NVSDK_NGX_Parameter_SetUI(nr_params, "DLSSNR.Reset", pass >= first_reset ? 1 : 0);
+            nrSetKeys(pass);
+            stage = "nvngx_dlssnr EvaluateFeature";
+            NVSDK_NGX_Handle *handle = pass == 0 ? nr_handle : nr_more[static_cast<size_t>(pass - 1)];
+            const auto r = static_cast<NVSDK_NGX_Result>(gate.evaluate(list.Get(), handle, nr_params));
+            if (NVSDK_NGX_FAILED(r)) {
+                log(log_level, "evaluating DLSS 5 neural rendering (feature 18, pass %d) failed: %s (0x%08x) %s",
+                    pass + 1, ngxResultString(r), static_cast<unsigned>(r), gate.fault());
+                return false;
+            }
+        }
+        nr_tuning_set = nr_tuning;
+        nr_tuning_valid = true;
+        NVSDK_NGX_Result r = NVSDK_NGX_Result_Success;
         if (proxy)
             dispatchProxy(true);
         if (!nrUpscales())
@@ -1856,6 +1957,12 @@ void Dx12Fg::Impl::destroyNr()
             NVSDK_NGX_D3D12_ReleaseFeature(nr_handle);
     }
     nr_handle = nullptr;
+    for (auto &h : nr_more) {
+        if (h)
+            gate.release(h);
+        h = nullptr;
+    }
+    nr_tuning_valid = false;
     if (nr_sr_handle)
         NVSDK_NGX_D3D12_ReleaseFeature(nr_sr_handle);
     nr_sr_handle = nullptr;
@@ -1868,6 +1975,8 @@ void Dx12Fg::Impl::destroyNr()
     nr_mid = Tex();
     nr_proxy_in = Tex();
     nr_proxy_out = Tex();
+    for (auto &t : nr_chain)
+        t = Tex();
     nr_cfg = NrConfig();
     nr_sized = false;
     nr_query_done = 0;
@@ -2132,7 +2241,7 @@ bool Dx12Fg::nrEnsure(const NrConfig &config)
         return false;
     }
     if (config.width <= 0 || config.height <= 0 || config.out_width < config.width
-        || config.out_height < config.height) {
+        || config.out_height < config.height || config.passes < 1 || config.passes > kMaxNrPasses) {
         d.log(1, "neural rendering: invalid size %dx%d -> %dx%d", config.width, config.height, config.out_width,
               config.out_height);
         return false;
@@ -2154,6 +2263,10 @@ bool Dx12Fg::nrEnsure(const NrConfig &config)
               && d.makeTex(d.nr_motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4);
     if (ok && d.gate_ready && upscale)
         ok = d.makeTex(d.nr_mid, w, h, color, bpt);
+    // Between feature 18 passes: what the model reads and writes (RGBA8; HDR goes through the
+    // RGBA8 proxy).
+    for (int i = 0; ok && d.gate_ready && i < std::min(config.passes - 1, 2); i++)
+        ok = d.makeTex(d.nr_chain[static_cast<size_t>(i)], w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4);
     if (ok && d.nrUsesProxy()) {
         ok = d.makeTex(d.nr_proxy_in, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4)
              && d.makeTex(d.nr_proxy_out, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) && d.createProxyPipeline();
@@ -2205,6 +2318,8 @@ bool Dx12Fg::nrEnsure(const NrConfig &config)
     std::string route;
     if (d.gate_ready) {
         route = std::string("NGX feature 18 ") + (config.model == 1 ? "HT" : "CC");
+        if (config.passes > 1)
+            route += " x" + std::to_string(config.passes) + " passes";
         if (d.nrUsesProxy())
             route += " + HDR proxy";
         if (upscale)
@@ -2216,6 +2331,24 @@ bool Dx12Fg::nrEnsure(const NrConfig &config)
     d.log(0, "neural rendering ready: %dx%d -> %dx%d, %s, %s", w, h, ow, oh, config.hdr ? "HDR" : "SDR",
           route.c_str());
     return true;
+}
+
+void Dx12Fg::nrSetTuning(int pass, const NrTuning &tuning)
+{
+    if (pass < 0 || pass >= kMaxNrPasses)
+        return;
+    NrTuning t = tuning;
+    t.style = std::clamp(t.style, 0, 2);
+    t.intensity = std::isfinite(t.intensity) ? std::clamp(t.intensity, 0.0f, 1.0f) : 1.0f;
+    t.local_structure = std::isfinite(t.local_structure) ? std::clamp(t.local_structure, 0.0f, 2.0f) : 1.0f;
+    t.local_tone = std::isfinite(t.local_tone) ? std::clamp(t.local_tone, 0.0f, 2.0f) : 1.0f;
+    t.skin_structure = std::isfinite(t.skin_structure) ? std::clamp(t.skin_structure, 0.0f, 2.5f) : 1.0f;
+    impl->nr_tuning[static_cast<size_t>(pass)] = t;
+}
+
+bool Dx12Fg::nrTunable() const
+{
+    return impl->gate_ready;
 }
 
 float Dx12Fg::nrGpuTimeMs() const

@@ -107,10 +107,13 @@ public:
         // NVIDIA feature 18 model: 0 = CC (as NeuralHub's default), 1 = HT. NeuralHub picks
         // its model in neuralhub.ini.
         int model = 0;
+        // NVIDIA: feature 18 runs this many times in a row (1..kMaxNrPasses), each pass on the
+        // one before's output with its own feature, temporal history and NrTuning.
+        int passes = 1;
         bool operator==(const NrConfig &o) const
         {
             return width == o.width && height == o.height && out_width == o.out_width && out_height == o.out_height
-                && hdr == o.hdr && model == o.model;
+                && hdr == o.hdr && model == o.model && passes == o.passes;
         }
     };
     // Whether this GPU can upscale after neural rendering (NeuralHub: always; NVIDIA: with
@@ -131,6 +134,33 @@ public:
     // Average GPU time of the neural rendering evaluation in milliseconds (0 if unknown),
     // upscaling and the HDR proxy passes included.
     float nrGpuTimeMs() const;
+
+    // Live controls of NVIDIA's feature 18 (its DLSSNR.* evaluation keys). They are set with
+    // every evaluation, so a change needs no new feature; the evaluation after a change starts
+    // a new temporal history. NeuralHub sets these in its own panel (nrProviderPanel).
+    struct NrTuning
+    {
+        int style = 0;                // 0 Default, 1 Natural, 2 Cinematic
+        float intensity = 1.0f;       // 0..1
+        float local_structure = 1.0f; // 0..2
+        float local_tone = 1.0f;      // 0..2
+        bool auto_mask = false;       // the model finds skin (and masks it) itself
+        float skin_structure = 1.0f;  // 0..2.5, only with auto_mask (1 = the model's own: the
+                                      // snippet gives negative values the same result)
+        bool operator==(const NrTuning &o) const
+        {
+            return style == o.style && intensity == o.intensity && local_structure == o.local_structure
+                && local_tone == o.local_tone && auto_mask == o.auto_mask && skin_structure == o.skin_structure;
+        }
+        bool operator!=(const NrTuning &o) const { return !(*this == o); }
+    };
+    static constexpr int kMaxNrPasses = 3;
+    // The controls of one pass (0..kMaxNrPasses-1), from the next neuralRender() on (call it
+    // on the same thread). Values are clamped. A change also starts a new history in the
+    // passes after it (their input changed).
+    void nrSetTuning(int pass, const NrTuning &tuning);
+    // Whether NrTuning reaches the model (NVIDIA's feature 18 route).
+    bool nrTunable() const;
 
     // NeuralHub's in-game panel (its key, End by default), as in games. NeuralHub polls its
     // keys and draws the panel when its swapchain is presented, so on the NeuralHub route the

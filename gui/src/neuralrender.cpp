@@ -77,6 +77,7 @@ struct NeuralRender::Impl
     // the neural rendering (read from the GUI thread).
     void *panel_window = nullptr;
     std::atomic<bool> provider_panel{ false };
+    std::atomic<bool> tunable{ false };
 
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queue_family = 0;
@@ -215,6 +216,7 @@ bool NeuralRender::Impl::init(pl_vulkan vk_)
         return false;
     }
     provider_panel.store(runner->nrProviderPanel());
+    tunable.store(runner->nrTunable());
     if (provider_panel.load())
         qCInfo(chiakiGui) << "[neural-render] NeuralHub runs DLSS 5: End opens its in-game panel over the video";
     return true;
@@ -471,6 +473,7 @@ void NeuralRender::Impl::shutdown()
     initialized = false;
     reset_pending = true;
     provider_panel.store(false);
+    tunable.store(false);
     vk = nullptr;
     gpu = nullptr;
 }
@@ -544,6 +547,11 @@ bool NeuralRender::hasProviderPanel() const
     return impl->provider_panel.load();
 }
 
+bool NeuralRender::tunable() const
+{
+    return impl->tunable.load();
+}
+
 void NeuralRender::hidePanel()
 {
     if (impl->runner)
@@ -584,6 +592,31 @@ bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, const
     }
     config.hdr = hdr;
     config.model = options.model == 1 ? 1 : 0;
+    const bool tunable = d.runner->nrTunable();
+    config.passes = tunable ? std::clamp(options.passes, 1, Dx12Fg::kMaxNrPasses) : 1;
+    // The controls go with every evaluation; a frame rendered with other controls is not
+    // reused from the cache.
+    uint64_t tuning_key = 0;
+    if (tunable) {
+        for (int p = 0; p < config.passes; p++) {
+            const NeuralRenderTuning &t = options.tuning[static_cast<size_t>(p)];
+            Dx12Fg::NrTuning nt;
+            nt.style = t.style;
+            nt.intensity = t.intensity;
+            nt.local_structure = t.local_structure;
+            nt.local_tone = t.local_tone;
+            nt.auto_mask = t.auto_mask;
+            nt.skin_structure = t.skin_structure;
+            d.runner->nrSetTuning(p, nt);
+            const uint64_t h = static_cast<uint64_t>(t.style) | (static_cast<uint64_t>(t.auto_mask) << 2)
+                | (static_cast<uint64_t>(std::lround(t.intensity * 20.0f)) << 3)
+                | (static_cast<uint64_t>(std::lround(t.local_structure * 20.0f)) << 11)
+                | (static_cast<uint64_t>(std::lround(t.local_tone * 20.0f)) << 19)
+                | (static_cast<uint64_t>(std::lround((t.skin_structure + 1.0f) * 20.0f)) << 27);
+            tuning_key = (tuning_key ^ h) * 0x100000001B3ull;
+        }
+        tuning_key ^= static_cast<uint64_t>(config.passes) << 40;
+    }
 
     // Linear light, 1.0 = SDR white (libplacebo's linear convention), BT.709 primaries and
     // gamut (libplacebo maps wider gamuts into it), the stream's HDR peak: no tone mapping.
@@ -601,7 +634,7 @@ bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, const
     const uint64_t key = signature ^ (static_cast<uint64_t>(config.width) * 0x9E3779B97F4A7C15ull)
         ^ (static_cast<uint64_t>(config.height) << 32) ^ (static_cast<uint64_t>(config.out_width) * 0xC2B2AE3D27D4EB4Full)
         ^ (static_cast<uint64_t>(config.out_height) << 20) ^ (hdr ? 0x1000000000ull : 0) ^ (config.model ? 0x2000000000ull : 0)
-        ^ 0x4E52000000000000ull;
+        ^ (tuning_key * 0x9E3779B97F4A7C15ull) ^ 0x4E52000000000000ull;
 
     auto fill_frame = [&](Impl::CacheEntry &entry) {
         entry.last_use = ++d.use_counter;
@@ -690,6 +723,7 @@ void NeuralRender::destroy() {}
 void NeuralRender::resetHistory() {}
 void NeuralRender::setPanelWindow(void *) {}
 bool NeuralRender::hasProviderPanel() const { return false; }
+bool NeuralRender::tunable() const { return false; }
 void NeuralRender::hidePanel() {}
 bool NeuralRender::process(const struct pl_frame *, uint64_t, const Options &, struct pl_frame *, uint64_t *)
 {

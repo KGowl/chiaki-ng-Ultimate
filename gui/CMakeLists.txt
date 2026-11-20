@@ -59,6 +59,7 @@ set(SOURCE_FILES
 	include/rtxvsr.h
 	src/rtxvsr.cpp
 	include/neuralrender.h
+	include/neuralrendertuning.h
 	src/neuralrender.cpp
 	include/framegen.h
 	src/framegen.cpp
@@ -163,6 +164,10 @@ if(CHIAKI_ENABLE_NGX)
 	target_link_libraries(chiaki-fgdx12test PkgConfig::LIBPLACEBO Qt::Core Qt::Gui "${CHIAKI_NGX_LIB}"
 		advapi32 user32 setupapi version shell32 ole32 avrt winmm)
 	add_dependencies(chiaki-fgdx12test chiaki-nrgate)
+	# Console test of the DLSS 5 panel (tools/nrpaneltest.cpp, the application's QML resources and
+	# a stand-in for its backend). Not built by default: --target chiaki-nrpaneltest.
+	add_executable(chiaki-nrpaneltest EXCLUDE_FROM_ALL tools/nrpaneltest.cpp src/qml/qml.qrc)
+	target_link_libraries(chiaki-nrpaneltest Qt::Core Qt::Gui Qt::Qml Qt::Quick)
 	message(STATUS "NVIDIA NGX enabled: RTX Video Super Resolution, DLSS Frame Generation, DLSS neural rendering through D3D12 (${CHIAKI_NGX_LIB})")
 endif()
 

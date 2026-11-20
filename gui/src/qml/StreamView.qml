@@ -68,6 +68,7 @@ Item {
 
     function updateOverlayInteractionActive() {
         Chiaki.window.setOverlayInteractionActive(
+            neuralRenderPanel.visible ||
             menuController.open ||
             menuController.closing ||
             sessionStopDialogActive ||
@@ -310,7 +311,46 @@ Item {
         }
     }
 
-    // Shown for a moment when the End key switches DLSS 5 neural rendering on or off.
+    // DLSS 5 panel (NVIDIA): End opens and closes it, Esc closes it. The keys stay in it
+    // while it is open.
+    function toggleNeuralRenderPanel() {
+        if (neuralRenderPanel.visible) {
+            closeNeuralRenderPanel();
+            return;
+        }
+        if (sessionLoading || sessionError)
+            return;
+        neuralRenderPanel.visible = true;
+        view.grabInput(neuralRenderPanel);
+        view.updateOverlayInteractionActive();
+    }
+
+    function closeNeuralRenderPanel() {
+        if (!neuralRenderPanel.visible)
+            return;
+        neuralRenderPanel.visible = false;
+        view.releaseInput();
+        view.updateOverlayInteractionActive();
+    }
+
+    NeuralRenderPanel {
+        id: neuralRenderPanel
+        anchors {
+            left: parent.left
+            leftMargin: 24
+            verticalCenter: parent.verticalCenter
+        }
+        height: implicitHeight
+        visible: false
+        onCloseRequested: view.closeNeuralRenderPanel()
+    }
+
+    Connections {
+        target: Chiaki.window
+        function onNeuralRenderPanelRequested() { view.toggleNeuralRenderPanel() }
+    }
+
+    // Shown for a moment when DLSS 5 neural rendering is switched on or off (not under the panel).
     Label {
         id: neuralRenderToast
         anchors {
@@ -338,6 +378,8 @@ Item {
         Connections {
             target: Chiaki.window
             function onNeuralRenderToggled(enabled) {
+                if (neuralRenderPanel.visible)
+                    return;
                 neuralRenderToast.text = enabled ? qsTr("DLSS 5: on") : qsTr("DLSS 5: off");
                 neuralRenderToastTimer.restart();
             }

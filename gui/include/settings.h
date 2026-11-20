@@ -6,8 +6,11 @@
 #include <chiaki/session.h>
 
 #include "host.h"
+#include "neuralrendertuning.h"
 
 #include <QSettings>
+#include <atomic>
+#include <cstdint>
 #include <QList>
 #include <QMap>
 #include <QRect>
@@ -211,6 +214,8 @@ class Settings : public QObject
 		size_t ps4s_registered;
 		QMap<int, ManualHost> manual_hosts;
 		int manual_hosts_id_next;
+		// Bumped by every change of the neural rendering passes or controls.
+		std::atomic<uint32_t> neural_render_tuning_rev{ 1 };
 
 		void LoadRegisteredHosts(QSettings *qsettings = nullptr);
 		void SaveRegisteredHosts(QSettings *qsettings = nullptr);
@@ -560,6 +565,23 @@ class Settings : public QObject
 		// NVIDIA feature 18 model: 0 = CC, 1 = HT.
 		int GetNeuralRenderModel() const { return settings.value("settings/neural_render_model", 0).toInt(); }
 		void SetNeuralRenderModel(int model) { settings.setValue("settings/neural_render_model", model); }
+		// NVIDIA feature 18 passes in a row (1-3), and whether each pass has its own controls
+		// (otherwise all of them use pass 1's).
+		int GetNeuralRenderPasses() const { return qBound(1, settings.value("settings/neural_render_passes", 1).toInt(), NeuralRenderTuning::kMaxPasses); }
+		void SetNeuralRenderPasses(int passes);
+		bool GetNeuralRenderPerPass() const { return settings.value("settings/neural_render_per_pass", false).toBool(); }
+		void SetNeuralRenderPerPass(bool enabled);
+		// Live controls of one pass (0-2) as stored; ClampNeuralRenderTuning keeps them in range.
+		NeuralRenderTuning GetNeuralRenderTuning(int pass) const;
+		void SetNeuralRenderTuning(int pass, const NeuralRenderTuning &tuning);
+		// The controls pass `pass` runs with (pass 1's unless each pass has its own).
+		NeuralRenderTuning GetNeuralRenderEffectiveTuning(int pass) const
+		{
+			return GetNeuralRenderTuning(GetNeuralRenderPerPass() ? pass : 0);
+		}
+		static NeuralRenderTuning ClampNeuralRenderTuning(NeuralRenderTuning tuning);
+		// Changes with every change of the passes or the controls (polled by the render thread).
+		uint32_t GetNeuralRenderTuningRevision() const { return neural_render_tuning_rev.load(std::memory_order_relaxed); }
 		// AMD RCAS sharpening of the final image: 0 = off, 1-100 = strength in percent
 		int GetRcasStrength() const { return qBound(0, settings.value("settings/rcas_strength", 0).toInt(), 100); }
 		void SetRcasStrength(int strength) { settings.setValue("settings/rcas_strength", qBound(0, strength, 100)); }
