@@ -181,6 +181,8 @@ public:
             return row;
         };
 
+        // First row: the GPU that renders the stream (DLSS on AMD runs through NeuralHub, so it is worth seeing).
+        gpuRow = makeRow(tr("GPU"), QColor(QStringLiteral("#eceff1")), gpuValue);
         bitrateRow = makeRow(tr("Mbps"), QColor(QStringLiteral("#00a7ff")), bitrateValue);
         fpsRow = makeRow(tr("fps stream / display"), QColor(QStringLiteral("#ffe082")), fpsValue, &fpsTitle);
         queueRow = makeRow(tr("queue depth avg"), QColor(QStringLiteral("#90caf9")), queueDepthValue);
@@ -331,6 +333,10 @@ public:
         }
 
         const bool full = style == Full;
+        const QString gpu = owner ? owner->gpuName() : QString();
+        gpuValue->setText(gpu);
+        gpuRow->setVisible(!gpu.isEmpty());
+
         bitrateRow->setVisible(hasSession);
         bitrateValue->setText(hasSession ? QString::number(bitrate, 'f', 1) : QString());
 
@@ -389,7 +395,7 @@ private:
     {
         const bool line = style == Mini || style == Compact;
         lineLabel->setVisible(line);
-        for (QWidget *row : { bitrateRow, fpsRow, queueRow, pendingRow, packetLossRow, droppedFramesRow, lostFramesRow, enhancementRow })
+        for (QWidget *row : { gpuRow, bitrateRow, fpsRow, queueRow, pendingRow, packetLossRow, droppedFramesRow, lostFramesRow, enhancementRow })
             row->setVisible(!line);
         QFont titleFont;
         QFont valueFont;
@@ -430,6 +436,8 @@ private:
     QList<QLabel *> titles;
     QList<QLabel *> values;
     QLabel *fpsTitle = nullptr;
+    QWidget *gpuRow = nullptr;
+    QLabel *gpuValue = nullptr;
     QWidget *bitrateRow = nullptr;
     QWidget *fpsRow = nullptr;
     QLabel *fpsValue = nullptr;
@@ -2261,6 +2269,9 @@ static void detectOpenGLGpuVendor(QmlMainWindow *window)
     const GLubyte *vendor_raw = ctx->extraFunctions()->glGetString(GL_VENDOR);
     if (!vendor_raw)
         return;
+
+    if (const GLubyte *renderer_raw = ctx->extraFunctions()->glGetString(GL_RENDERER))
+        window->setProperty("_chiaki_gpu_name", QString::fromUtf8(reinterpret_cast<const char *>(renderer_raw)).trimmed());
 
     QByteArray vendor = QByteArray(reinterpret_cast<const char *>(vendor_raw)).toLower();
     if (vendor.contains("amd") || vendor.contains("ati"))
@@ -5042,6 +5053,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
         detectOpenGLGpuVendor(this);
         amd_card = property("_chiaki_detected_amd").toBool();
         nvidia_card = property("_chiaki_detected_nvidia").toBool();
+        gpu_name = property("_chiaki_gpu_name").toString();
 
         struct pl_opengl_params gl_params = {
             .get_proc_addr_ex = [](void *proc_ctx, const char *procname) -> pl_voidfunc_t {
@@ -5211,6 +5223,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
         vk_funcs.vkGetPhysicalDeviceProperties2(placebo_vulkan->phys_device, &device_props);
         vk_device_props = device_props.properties;
         vk_device_driver_props = driver_props;
+        gpu_name = QString::fromUtf8(vk_device_props.deviceName).trimmed();
         if(vk_device_props.vendorID == 0x1002)
         {
             amd_card = true;
@@ -8273,6 +8286,11 @@ bool QmlMainWindow::amdCard() const
 bool QmlMainWindow::nvidiaCard() const
 {
     return nvidia_card;
+}
+
+QString QmlMainWindow::gpuName() const
+{
+    return gpu_name;
 }
 
 bool QmlMainWindow::neuralRenderPaused() const

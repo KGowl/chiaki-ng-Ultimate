@@ -148,6 +148,8 @@ public:
 
     bool amdCard() const;
     bool nvidiaCard() const;
+    // The GPU that renders the stream, as its driver names it (shown in the stats overlay).
+    QString gpuName() const;
     bool neuralRenderPaused() const;
     void setNeuralRenderPaused(bool paused);
     bool neuralRenderTunable() const;
@@ -323,6 +325,7 @@ private:
     bool was_maximized = false;
     bool amd_card = false;
     bool nvidia_card = false;
+    QString gpu_name;
     bool direct_stream = false;
     std::atomic<qint64> queue_pts_origin_cached_us = -1;
     uint64_t next_frame_target_us = 0;
