@@ -2201,6 +2201,12 @@ void Dx12Fg::setLastValue(uint64_t value)
     impl->last_value = value;
 }
 
+uint64_t Dx12Fg::completedValue() const
+{
+    // No fence: nothing can be waited for, report everything as done.
+    return impl->shared_fence ? impl->shared_fence->GetCompletedValue() : UINT64_MAX;
+}
+
 void Dx12Fg::recordColor(VkCommandBuffer cmd, VkImage image)
 {
     Impl &d = *impl;

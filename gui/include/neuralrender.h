@@ -87,6 +87,16 @@ public:
     bool process(const struct pl_frame *src, uint64_t signature, const Options &options,
                  struct pl_frame *out_frame, uint64_t *out_signature);
 
+    // Pipelined use (frame generation): starts neural rendering of `src` like process() but
+    // returns once the D3D12 work is queued, without queueing the copy back into the Vulkan
+    // texture (Vulkan work that waits for D3D12 holds up everything queued after it, like
+    // the frames presented meanwhile). beginDone() says whether the D3D12 side finished.
+    // process() with the same frame, signature and options then returns the result; it
+    // queues the copy back, which waits on the GPU if the D3D12 side is not done yet.
+    // Starting another frame drops a begun frame nobody collected.
+    bool begin(const struct pl_frame *src, uint64_t signature, const Options &options);
+    bool beginDone() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

@@ -3,6 +3,7 @@
 #include "streamsession.h"
 #include "settings.h"
 #include "repeatcadence.h"
+#include "neuralrender.h"
 
 #include <QMutex>
 #include <QAtomicInteger>
@@ -275,6 +276,11 @@ private:
     void beginFrame();
     void endFrame();
     void render();
+    // Pipelined frame generation (fg_pipe_stage): queues the Vulkan side of every step whose
+    // D3D12 side is done (all of them when `drain`), moving the stage on.
+    void fgPipeAdvance(bool drain);
+    void fgPipeCancel();
+    static bool fgPipeEnabled();
     void handleVulkanDeviceLost(const QString &reason);
     void handleVulkanRendererFallback(const QString &title, const QString &message, const QString &fallback_reason);
     void applyPendingFrame();
@@ -449,6 +455,33 @@ private:
     int fg_active_multiplier = 1;
     int fg_active_cadence = 1;
     int fg_last_backend = 0;
+    // Pipelined frame generation (DLSS FG through D3D12, render thread): when the next stream
+    // frame comes while frames generated from the last one are still to be presented, its
+    // DLSS 5 and DLSS FG work starts on the D3D12 queue and those frames keep being presented
+    // meanwhile instead of being dropped. The Vulkan work that waits for a D3D12 result is
+    // only queued once that result is done (or once nothing else is left to present), so it
+    // never holds up a present on libplacebo's queue.
+    enum class FgPipeStage {
+        Idle,
+        Taken,        // the frame is mapped in direct_frame, its work not started (or failed)
+        NeuralRender, // DLSS 5 begun on direct_frame
+        FrameGen,     // DLSS FG begun on fg_pipe_fg_src
+        Ready,        // its frames are in fg_pipe_outputs
+    };
+    FgPipeStage fg_pipe_stage = FgPipeStage::Idle;
+    NeuralRender::Options fg_pipe_nr_options;
+    struct pl_frame fg_pipe_fg_src = {};
+    std::vector<struct pl_frame> fg_pipe_outputs;
+    int fg_pipe_multiplier = 1;
+    int fg_pipe_cadence = 1;
+    int fg_pipe_out_w = 0;
+    int fg_pipe_out_h = 0;
+    float fg_pipe_interval_ms = 0.0f;
+    // The last stream frame went through DLSS FG via D3D12 (no RTX VSR): the next may be pipelined.
+    bool fg_pipe_allowed = false;
+    // The last pipelined stream frame went through DLSS 5 (NeuralHub's panel stays up).
+    bool fg_pipe_nr = false;
+    bool fg_pipe_logged = false;
     uint64_t direct_frame_serial = 0;
     pl_queue placebo_queue = {};
     std::array<pl_tex, 8> placebo_tex{};

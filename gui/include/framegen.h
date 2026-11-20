@@ -88,11 +88,22 @@ public:
     bool process(const struct pl_frame *src, int out_w, int out_h, int multiplier,
                  float frame_interval_ms, std::vector<struct pl_frame> &outputs);
 
+    // Pipelined use, DLSS Frame Generation through D3D12 only (other backends return false,
+    // use process()): begin() does what process() does up to queueing the D3D12 generation
+    // and returns without queueing the copy back of the generated frames, so the frames
+    // presented meanwhile are not held up behind Vulkan work waiting for D3D12.
+    // beginDone() says whether the D3D12 side finished; finish() then fills `outputs` as
+    // process() would (it queues the copy back, which waits on the GPU if needed). A begun
+    // call that is never finished is dropped by the next begin(), process() or reset().
+    bool begin(const struct pl_frame *src, int out_w, int out_h, int multiplier, float frame_interval_ms);
+    bool beginDone() const;
+    bool finish(std::vector<struct pl_frame> &outputs);
+
     struct Impl;
 
 private:
     bool processFrames(const struct pl_frame *src, int out_w, int out_h, int multiplier,
-                       float frame_interval_ms, std::vector<struct pl_frame> &outputs);
+                       float frame_interval_ms, std::vector<struct pl_frame> &outputs, bool defer = false);
 
     std::unique_ptr<Impl> impl;
 };

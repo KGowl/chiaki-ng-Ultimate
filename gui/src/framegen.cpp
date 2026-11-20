@@ -208,10 +208,32 @@ struct FrameGen::Impl
     bool processVfg(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
                     const std::function<void(const char *)> &trace_step);
 #if defined(CHIAKI_HAVE_DX12FG)
+    // With `defer` the copy back of the generated frames is left to dx12Download()
+    // (FrameGen::finish), see `deferred`.
     bool processDx12(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
-                     const std::function<void(const char *)> &trace_step);
+                     const std::function<void(const char *)> &trace_step, bool defer = false);
+    bool dx12Download(FrameSet &set, int count, uint64_t output_value, std::vector<struct pl_frame> &outputs);
+    bool dx12Fail(const char *what);
 #endif
+    CommandSlot *beginSlot();
+    // Clean-up of the generated frames in `outputs` (real frame last) against `prev`.
+    void fixupAfter(pl_tex prev, std::vector<struct pl_frame> &outputs);
     static void fillFrame(const FgImage &img, struct pl_frame *frame);
+
+    // FrameGen::begin(): the call whose generated frames are not copied back yet.
+    struct Deferred
+    {
+        bool active = false;
+        FrameSet *set = nullptr;
+        int count = 0;
+        // D3D12 value the generated frames are signalled with; 0 = `outputs` already hold
+        // the result (a first frame: only the real frame, nothing generated).
+        uint64_t output_value = 0;
+        std::vector<struct pl_frame> outputs;
+        // The previous real frame, for the clean-up.
+        pl_tex prev = nullptr;
+    };
+    Deferred deferred;
 };
 
 bool FrameGen::Impl::loadFunctions()
@@ -1322,6 +1344,7 @@ int FrameGen::maxMultiplier() const
 void FrameGen::reset()
 {
     impl->reset_pending = true;
+    impl->deferred = {};
 }
 
 void FrameGen::setFlowHighQuality(bool high)
@@ -1536,7 +1559,7 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
 // own output is dropped. Motion vectors are not passed: NeuralHub's runtime finds the motion
 // itself and ignores them.
 bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl_frame> &outputs,
-                                 const std::function<void(const char *)> &trace_step)
+                                 const std::function<void(const char *)> &trace_step, bool defer)
 {
     auto *backend_dx = static_cast<Dx12Backend *>(backend_impl.get());
     Dx12Fg *runner = backend_dx ? backend_dx->runner.get() : nullptr;
@@ -1657,10 +1680,48 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl
         return true;
     }
 
-    // (3) Shared output buffers -> generated textures, once D3D12 is done.
-    slot = begin_slot();
+    if (defer) {
+        // The runtime keeps this frame as the previous one already.
+        consecutive_failures = 0;
+        have_history = true;
+        reset_pending = false;
+        last_real = &set.real;
+        deferred.set = &set;
+        deferred.count = count;
+        deferred.output_value = output_value;
+        trace_step("dx12 copy back deferred");
+        return true;
+    }
+    if (!dx12Download(set, count, output_value, outputs))
+        return false;
+    trace_step("dx12 frames submitted");
+    return true;
+}
+
+bool FrameGen::Impl::dx12Fail(const char *what)
+{
+    qCWarning(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << what;
+    have_history = false;
+    last_real = nullptr;
+    if (++consecutive_failures >= kMaxConsecutiveFailures) {
+        qCWarning(chiakiGui) << "[framegen] Disabling" << FrameGen::backendName(backend) << "after repeated failures";
+        backend_failed[static_cast<size_t>(backend)] = true;
+        destroyBackend();
+    }
+    return false;
+}
+
+// (3) Shared output buffers -> generated textures; the copy waits for `output_value` on the
+// GPU. Then `outputs` gets the frames in presentation order, the real frame last.
+bool FrameGen::Impl::dx12Download(FrameSet &set, int count, uint64_t output_value, std::vector<struct pl_frame> &outputs)
+{
+    auto *backend_dx = static_cast<Dx12Backend *>(backend_impl.get());
+    Dx12Fg *runner = backend_dx ? backend_dx->runner.get() : nullptr;
+    if (!runner)
+        return false;
+    CommandSlot *slot = beginSlot();
     if (!slot)
-        return fail("command buffer unavailable");
+        return dx12Fail("command buffer unavailable");
     std::array<FgImage *, kMaxGenerated> held = {};
     size_t num_held = 0;
     bool holds_ok = true;
@@ -1673,7 +1734,7 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl
         held[num_held++] = &img;
         runner->recordDownload(slot->cmd, img.image, i);
     }
-    ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
+    bool ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
     {
         const SemValue extra_waits[] = { { runner->semaphore(), output_value } };
         ok = ok && submitEx(slot->cmd, held.data(), num_held, extra_waits, 1, nullptr, 0);
@@ -1687,8 +1748,7 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl
             release(*held[i], held[i]->sem, held[i]->value);
     }
     if (!ok || !holds_ok)
-        return fail("copying the generated frames failed");
-    trace_step("dx12 frames submitted");
+        return dx12Fail("copying the generated frames failed");
 
     consecutive_failures = 0;
     have_history = true;
@@ -1704,43 +1764,129 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, std::vector<struct pl
 }
 #endif // CHIAKI_HAVE_DX12FG
 
-bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int multiplier,
-                       float frame_interval_ms, std::vector<struct pl_frame> &outputs)
+FrameGen::Impl::CommandSlot *FrameGen::Impl::beginSlot()
 {
-    Impl &d = *impl;
-    // The previous real frame, before processFrames() moves on.
-    pl_tex prev = (d.reset_pending || !d.have_history || !d.last_real) ? nullptr : d.last_real->tex;
-    if (!processFrames(src, out_w, out_h, multiplier, frame_interval_ms, outputs))
-        return false;
+    CommandSlot &slot = cmd_slots[next_slot];
+    next_slot = (next_slot + 1) % cmd_slots.size();
+    if (!waitDone(slot.done_value) || vkResetCommandBuffer(slot.cmd, 0) != VK_SUCCESS)
+        return nullptr;
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    return vkBeginCommandBuffer(slot.cmd, &begin_info) == VK_SUCCESS ? &slot : nullptr;
+}
+
+void FrameGen::Impl::fixupAfter(pl_tex prev, std::vector<struct pl_frame> &outputs)
+{
     const size_t generated = outputs.size() > 1 ? outputs.size() - 1 : 0;
-    if (!generated || !prev || !d.fixup || d.cleanup_mode <= 0 || d.fixup_failed)
-        return true;
+    if (!generated || !prev || !fixup || cleanup_mode <= 0 || fixup_failed)
+        return;
     pl_tex cur = outputs.back().planes[0].texture;
     // DLSS with zero motion keeps its motion texture at zero: no detail pass.
-    pl_tex motion = d.mvecs_from_flow ? d.mvec.tex : nullptr;
+    pl_tex motion = mvecs_from_flow ? mvec.tex : nullptr;
     // Flow's own synthesis already picks one frame where they disagree; on
     // its output the detail pass only adds sub-pixel misplacements.
-    const bool detail = d.cleanup_mode >= 2 && d.backend != FrameGen::Backend::Flow;
+    const bool detail = cleanup_mode >= 2 && backend != FrameGen::Backend::Flow;
     for (size_t i = 0; i < generated; i++) {
         const float t = static_cast<float>(i + 1) / static_cast<float>(generated + 1);
-        if (!d.fixup->after(prev, cur, motion, outputs[i].planes[0].texture, t, detail, true)) {
+        if (!fixup->after(prev, cur, motion, outputs[i].planes[0].texture, t, detail, true)) {
             qCWarning(chiakiGui) << "[framegen] Generated frame clean-up failed, turned off";
-            d.fixup.reset();
-            d.fixup_failed = true;
+            fixup.reset();
+            fixup_failed = true;
             break;
         }
     }
-    if (!d.fixup_logged && d.fixup) {
-        d.fixup_logged = true;
+    if (!fixup_logged && fixup) {
+        fixup_logged = true;
         qCInfo(chiakiGui) << "[framegen] Generated frame clean-up:"
                           << (detail && motion ? "static content + detail" : "static content")
                           << (motion ? "" : "(no motion vectors)");
     }
+}
+
+bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int multiplier,
+                       float frame_interval_ms, std::vector<struct pl_frame> &outputs)
+{
+    Impl &d = *impl;
+    // A begun call nobody finished: its frames are not wanted anymore.
+    d.deferred = {};
+    // The previous real frame, before processFrames() moves on.
+    pl_tex prev = (d.reset_pending || !d.have_history || !d.last_real) ? nullptr : d.last_real->tex;
+    if (!processFrames(src, out_w, out_h, multiplier, frame_interval_ms, outputs))
+        return false;
+    d.fixupAfter(prev, outputs);
     return true;
 }
 
+bool FrameGen::begin(const struct pl_frame *src, int out_w, int out_h, int multiplier, float frame_interval_ms)
+{
+    Impl &d = *impl;
+    d.deferred = {};
+#if defined(CHIAKI_HAVE_DX12FG)
+    if (d.backend != Backend::Dlss12 || !d.backend_impl)
+        return false;
+    pl_tex prev = (d.reset_pending || !d.have_history || !d.last_real) ? nullptr : d.last_real->tex;
+    std::vector<struct pl_frame> outputs;
+    if (!processFrames(src, out_w, out_h, multiplier, frame_interval_ms, outputs, true)) {
+        d.deferred = {};
+        return false;
+    }
+    d.deferred.active = true;
+    d.deferred.prev = prev;
+    if (!outputs.empty()) {
+        // Nothing was generated (first frame): the result is ready.
+        d.deferred.output_value = 0;
+        d.deferred.outputs = std::move(outputs);
+    } else if (!d.deferred.set || !d.deferred.output_value) {
+        d.deferred = {};
+        return false;
+    }
+    return true;
+#else
+    (void)src; (void)out_w; (void)out_h; (void)multiplier; (void)frame_interval_ms;
+    return false;
+#endif
+}
+
+bool FrameGen::beginDone() const
+{
+#if defined(CHIAKI_HAVE_DX12FG)
+    const Impl &d = *impl;
+    if (!d.deferred.active || !d.deferred.output_value || d.backend != Backend::Dlss12 || !d.backend_impl)
+        return true;
+    const auto *backend_dx = static_cast<const Dx12Backend *>(d.backend_impl.get());
+    return !backend_dx->runner || backend_dx->runner->completedValue() >= d.deferred.output_value;
+#else
+    return true;
+#endif
+}
+
+bool FrameGen::finish(std::vector<struct pl_frame> &outputs)
+{
+    Impl &d = *impl;
+    outputs.clear();
+    Impl::Deferred deferred = std::move(d.deferred);
+    d.deferred = {};
+    if (!deferred.active)
+        return false;
+#if defined(CHIAKI_HAVE_DX12FG)
+    if (deferred.output_value) {
+        if (d.backend != Backend::Dlss12 || !d.backend_impl || !deferred.set)
+            return false;
+        if (!d.dx12Download(*deferred.set, deferred.count, deferred.output_value, outputs))
+            return false;
+    } else {
+        outputs = std::move(deferred.outputs);
+    }
+    d.fixupAfter(deferred.prev, outputs);
+    return !outputs.empty();
+#else
+    return false;
+#endif
+}
+
 bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, int multiplier,
-                             float frame_interval_ms, std::vector<struct pl_frame> &outputs)
+                             float frame_interval_ms, std::vector<struct pl_frame> &outputs, bool defer)
 {
     Impl &d = *impl;
     outputs.clear();
@@ -1863,7 +2009,7 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
         return d.processVfg(set, count, outputs, trace_step);
 #if defined(CHIAKI_HAVE_DX12FG)
     if (d.backend == FrameGen::Backend::Dlss12)
-        return d.processDx12(set, count, outputs, trace_step);
+        return d.processDx12(set, count, outputs, trace_step, defer);
 #endif
 
     if (d.backend == FrameGen::Backend::Flow) {
@@ -2032,5 +2178,8 @@ void FrameGen::setVfgMode(int) {}
 void FrameGen::setCleanup(int) {}
 void FrameGen::destroy() {}
 bool FrameGen::process(const struct pl_frame *, int, int, int, float, std::vector<struct pl_frame> &) { return false; }
+bool FrameGen::begin(const struct pl_frame *, int, int, int, float) { return false; }
+bool FrameGen::beginDone() const { return true; }
+bool FrameGen::finish(std::vector<struct pl_frame> &) { return false; }
 
 #endif // CHIAKI_HAVE_FRAMEGEN

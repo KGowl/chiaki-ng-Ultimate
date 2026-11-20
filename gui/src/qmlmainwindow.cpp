@@ -7049,32 +7049,59 @@ void QmlMainWindow::render()
     struct pl_frame fg_override_frame = {};
     bool fg_override = false;
     bool direct_frame_fresh = false;
+    // Pipelined frame generation (fg_pipe_stage): `fg_pipe_take` maps the waiting stream frame
+    // now and starts its work further down, `fg_pipe_present` presents the first frame made
+    // from a pipelined stream frame, `fg_pipe_reprocess` sends a taken frame whose pipeline
+    // did not get through down the normal path.
+    bool fg_pipe_take = false;
+    bool fg_pipe_present = false;
+    bool fg_pipe_reprocess = false;
+    if (fg_pipe_stage != FgPipeStage::Idle && (!bypass_frame_queue || !stream_active))
+        fgPipeCancel();
+    if (fg_pipe_stage != FgPipeStage::Idle)
+        fgPipeAdvance(fg_pending_frames.empty());
     if (bypass_frame_queue && !fg_pending_frames.empty()) {
         bool incoming_waiting = false;
         {
             QMutexLocker locker(&direct_frame_mutex);
             incoming_waiting = direct_pending_frame != nullptr;
         }
-        if (incoming_waiting) {
+        // RTX VSR (switched on since the last stream frame) has no D3D12 half to pipeline.
+        const bool vsr_wanted_now = rtx_vsr && has_settings && nvidia_card && settings->GetRtxVsrQuality() > 0;
+        if (incoming_waiting && fg_pipe_stage == FgPipeStage::Idle && fg_pipe_allowed && !vsr_wanted_now &&
+            fgPipeEnabled()) {
+            // Start the new stream frame's DLSS work now and keep presenting the frames
+            // generated from the last one while the D3D12 side runs.
+            fg_pipe_take = true;
+            fg_override_frame = fg_pending_frames.front();
+            fg_pending_frames.erase(fg_pending_frames.begin());
+        } else if (incoming_waiting && fg_pipe_stage == FgPipeStage::Idle) {
             // A new stream frame is already waiting: drop the remaining
             // generated frames but still show the real one.
             fg_override_frame = fg_pending_frames.back();
             fg_pending_frames.clear();
         } else {
+            // (With a pipelined stream frame in flight its frames follow these.)
             fg_override_frame = fg_pending_frames.front();
             fg_pending_frames.erase(fg_pending_frames.begin());
         }
         fg_override = true;
+    } else if (bypass_frame_queue && fg_pipe_stage == FgPipeStage::Ready && !fg_pipe_outputs.empty()) {
+        // Every frame of the last stream frame is out: the pipelined one's frames follow.
+        fg_pending_frames = std::move(fg_pipe_outputs);
+        fg_pipe_outputs.clear();
+        fg_pipe_stage = FgPipeStage::Idle;
+        fg_override_frame = fg_pending_frames.front();
+        fg_pending_frames.erase(fg_pending_frames.begin());
+        fg_pipe_present = true;
+        fg_override = true;
+    } else if (bypass_frame_queue && fg_pipe_stage != FgPipeStage::Idle) {
+        // Taken, but its pipeline failed: the normal path below handles it.
+        fgPipeCancel();
+        fg_pipe_reprocess = direct_frame.num_planes > 0;
     }
-    if (bypass_frame_queue && fg_override) {
-        direct_render_frame = fg_override_frame;
-        frame_mix = {};
-        frame_mix.num_frames = 1;
-        frame_mix.frames = direct_frames;
-        frame_mix.timestamps = direct_timestamps;
-        queue_status = PL_QUEUE_OK;
-        queue_depth_before_update = 0;
-    } else if (bypass_frame_queue) {
+    // Maps the waiting stream frame (if any) into direct_frame; true when it did.
+    auto take_incoming_frame = [&]() {
         AVFrame *incoming = nullptr;
         bool reset_direct_frame = false;
         {
@@ -7088,6 +7115,7 @@ void QmlMainWindow::render()
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
         }
+        bool mapped = false;
         if (incoming) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
@@ -7102,10 +7130,31 @@ void QmlMainWindow::render()
                     backend->disableZeroCopy();
             } else {
                 direct_frame_serial++;
-                direct_frame_fresh = true;
+                mapped = true;
             }
             av_frame_free(&incoming);
         }
+        return mapped;
+    };
+    if (fg_pipe_take) {
+        if (take_incoming_frame())
+            fg_pipe_stage = FgPipeStage::Taken;
+        else
+            fg_pipe_take = false;
+    }
+    if (bypass_frame_queue && fg_override) {
+        direct_render_frame = fg_override_frame;
+        frame_mix = {};
+        frame_mix.num_frames = 1;
+        frame_mix.frames = direct_frames;
+        frame_mix.timestamps = direct_timestamps;
+        queue_status = PL_QUEUE_OK;
+        queue_depth_before_update = 0;
+    } else if (bypass_frame_queue) {
+        if (fg_pipe_reprocess)
+            direct_frame_fresh = true;
+        else
+            direct_frame_fresh = take_incoming_frame();
         direct_render_frame = direct_frame;
         frame_mix = {};
         frame_mix.num_frames = direct_frame.num_planes > 0 ? 1 : 0;
@@ -7906,14 +7955,8 @@ void QmlMainWindow::render()
     if (nr_wanted && nr_user_off_seen)
         neural_render->resetHistory();
     nr_user_off_seen = nr_user_off_now;
-    if (!fg_override && nr_wanted && neural_render->ensureInitialized(placebo_vulkan)) {
-#ifdef Q_OS_WIN
-        // NeuralHub's in-game panel (End) is shown over the video in this window.
-        neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
-#endif
-        // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
-        // the largest step DLSS Performance covers well), or the source size.
-        // The DLSS 5 controls (NVIDIA), read again whenever the settings change.
+    // The DLSS 5 controls (NVIDIA), read again whenever the settings change.
+    if (has_settings) {
         const uint32_t tuning_rev = settings->GetNeuralRenderTuningRevision();
         if (tuning_rev != nr_tuning_rev) {
             nr_tuning_rev = tuning_rev;
@@ -7921,31 +7964,102 @@ void QmlMainWindow::render()
             for (int p = 0; p < NeuralRenderTuning::kMaxPasses; p++)
                 nr_tuning[static_cast<size_t>(p)] = settings->GetNeuralRenderEffectiveTuning(p);
         }
-        auto nr_options_for = [&](const struct pl_frame *src) {
-            NeuralRender::Options options;
-            options.model = settings->GetNeuralRenderModel();
-            options.passes = nr_passes;
-            options.tuning = nr_tuning;
-            if (!settings->GetNeuralRenderUpscale() || !src)
-                return options;
-            const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
-            const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
-            if (src_w < 1.0f || src_h < 1.0f)
-                return options;
-            const float ratio = qMin(dst_w / src_w, dst_h / src_h);
-            const float scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
-            if (scale > 1.0f) {
-                // Even sizes keep the chroma-free RGB textures and the upscaler's ratios exact.
-                options.out_width = static_cast<int>(lroundf(src_w * scale / 2.0f)) * 2;
-                options.out_height = static_cast<int>(lroundf(src_h * scale / 2.0f)) * 2;
-            }
+    }
+    // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
+    // the largest step DLSS Performance covers well), or the source size.
+    auto nr_options_for = [&](const struct pl_frame *src) {
+        NeuralRender::Options options;
+        options.model = settings->GetNeuralRenderModel();
+        options.passes = nr_passes;
+        options.tuning = nr_tuning;
+        if (!settings->GetNeuralRenderUpscale() || !src)
             return options;
-        };
-        auto note_result = [&](const struct pl_frame *src, const struct pl_frame &out) {
-            nr_upscaled = fabsf(pl_rect_w(out.crop)) > fabsf(pl_rect_w(src->crop)) + 0.5f;
-            nr_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(out.crop))));
-            nr_hdr = pl_color_space_is_hdr(&out.color);
-        };
+        const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
+        const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
+        if (src_w < 1.0f || src_h < 1.0f)
+            return options;
+        const float ratio = qMin(dst_w / src_w, dst_h / src_h);
+        const float scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
+        if (scale > 1.0f) {
+            // Even sizes keep the chroma-free RGB textures and the upscaler's ratios exact.
+            options.out_width = static_cast<int>(lroundf(src_w * scale / 2.0f)) * 2;
+            options.out_height = static_cast<int>(lroundf(src_h * scale / 2.0f)) * 2;
+        }
+        return options;
+    };
+    auto note_result = [&](const struct pl_frame *src, const struct pl_frame &out) {
+        nr_upscaled = fabsf(pl_rect_w(out.crop)) > fabsf(pl_rect_w(src->crop)) + 0.5f;
+        nr_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(out.crop))));
+        nr_hdr = pl_color_space_is_hdr(&out.color);
+    };
+    // How many frames frame generation makes per source picture: the multiplier asked for,
+    // held back by the display. Also sets the status note on what the display holds back.
+    auto plan_fg_multiplier = [&](int cadence, double source_interval_s, double refresh_hz) {
+        // More output frames than the display can show only adds latency.
+        const int refresh_cap = source_interval_s > 0.0
+            ? static_cast<int>(std::floor(refresh_hz * source_interval_s + 0.15))
+            : 2;
+        const int multiplier = qMin(settings->GetFrameGenMultiplier() * cadence, refresh_cap);
+        // When the display holds back the multiplier asked for, the status says what it would take.
+        // Counted per source picture like the status's own number: 4x of a 30 fps stream needs 120 Hz.
+        // Never more than the backend can make (4 until it has started), so a half-rate source with 4x
+        // at 150 Hz, already at the backend's 4 per picture, gets no note.
+        const int fg_max_known = frame_gen && frame_gen->maxMultiplier() > 1 ? frame_gen->maxMultiplier() : 4;
+        const int fg_requested = qMin(settings->GetFrameGenMultiplier() * cadence, fg_max_known);
+        const bool fg_capped = refresh_cap < fg_requested && source_interval_s > 0.0;
+        fg_status_requested.storeRelaxed(fg_capped ? fg_requested : 0);
+        fg_status_needed_hz.storeRelaxed(fg_capped ? static_cast<int>(std::lround(fg_requested / source_interval_s)) : 0);
+        fg_status_refresh_hz.storeRelaxed(static_cast<int>(std::lround(refresh_hz)));
+        return multiplier;
+    };
+    // Pipelined frame generation: start the stream frame taken above (fg_pipe_stage). Its
+    // DLSS 5 (or, without it, its DLSS FG) is queued on D3D12 now; the rest follows in
+    // fgPipeAdvance() while this render presents a frame generated from the last one.
+    if (fg_pipe_take && fg_pipe_stage == FgPipeStage::Taken && frame_gen && has_settings) {
+        const int cadence = fg_source_cadence.loadRelaxed();
+        const double source_interval_s = stream_interval_s * cadence;
+        const int multiplier = qMin(plan_fg_multiplier(cadence, source_interval_s, refresh_rate),
+                                    frame_gen->maxMultiplier());
+        const bool nr_on = nr_wanted && neural_render->ensureInitialized(placebo_vulkan);
+        if (!nr_on) {
+            nr_status_state.storeRelaxed(!nr_wanted ? 0 : neural_render && neural_render->failed() ? 3 : 2);
+            nr_status_gpu_cms.storeRelaxed(0);
+            nr_status_out_h.storeRelaxed(0);
+            nr_status_hdr.storeRelaxed(0);
+        }
+        // Fewer than 2 frames, or a failure: the frame stays Taken and goes down the normal
+        // path once the last stream frame's frames are out.
+        if (multiplier >= 2 && frame_gen->backend() == FrameGen::Backend::Dlss12) {
+            fg_pipe_multiplier = multiplier;
+            fg_pipe_cadence = cadence;
+            fg_pipe_out_w = static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop))));
+            fg_pipe_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(target_frame.crop))));
+            fg_pipe_interval_ms = static_cast<float>(source_interval_s * 1000.0);
+            fg_pipe_nr = nr_on;
+            frame_gen->setFlowHighQuality(settings->GetFrameGenFlowHighQuality());
+            frame_gen->setDlssMotion(settings->GetFrameGenDlssMotion());
+            frame_gen->setCleanup(settings->GetFrameGenCleanup());
+            frame_gen->setVfgMode(settings->GetFrameGenVfgMode());
+            if (nr_on) {
+#ifdef Q_OS_WIN
+                neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
+#endif
+                fg_pipe_nr_options = nr_options_for(&direct_frame);
+                if (neural_render->begin(&direct_frame, direct_frame_serial, fg_pipe_nr_options))
+                    fg_pipe_stage = FgPipeStage::NeuralRender;
+            } else {
+                fg_pipe_fg_src = direct_frame;
+                if (frame_gen->begin(&fg_pipe_fg_src, fg_pipe_out_w, fg_pipe_out_h, fg_pipe_multiplier,
+                                     fg_pipe_interval_ms))
+                    fg_pipe_stage = FgPipeStage::FrameGen;
+            }
+        }
+    }
+    if (!fg_override && nr_wanted && neural_render->ensureInitialized(placebo_vulkan)) {
+#ifdef Q_OS_WIN
+        // NeuralHub's in-game panel (End) is shown over the video in this window.
+        neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
+#endif
         if (bypass_frame_queue) {
             struct pl_frame rendered = {};
             uint64_t rendered_signature = 0;
@@ -7976,8 +8090,9 @@ void QmlMainWindow::render()
         nr_upscaled = false;
     if (neural_render) {
         // NeuralHub's panel window only stays up while neural rendering runs (a failure hides
-        // it on its own; a render without a new frame keeps it).
-        if (!nr_wanted || fg_override)
+        // it on its own; a render without a new frame keeps it). Pipelined, every render
+        // presents a generated frame and DLSS 5 runs in between: the panel stays up.
+        if (!nr_wanted || (fg_override && !(fg_pipe_nr && fg_pipe_allowed)))
             neural_render->hidePanel();
         nr_provider_panel.storeRelaxed(neural_render->hasProviderPanel() ? 1 : 0);
         const int tunable = neural_render->tunable() ? 1 : 0;
@@ -8051,6 +8166,8 @@ void QmlMainWindow::render()
     if (fg_backend != fg_last_backend) {
         fg_last_backend = fg_backend;
         fg_pending_frames.clear();
+        fgPipeCancel();
+        fg_pipe_allowed = false;
         fg_active_multiplier = 1;
         fg_active_cadence = 1;
         if (frame_gen)
@@ -8080,22 +8197,8 @@ void QmlMainWindow::render()
         // multiplier stays relative to the stream rate, so output fps is kept.
         const int cadence = fg_source_cadence.loadRelaxed();
         const double source_interval_s = stream_interval_s * cadence;
-        // More output frames than the display can show only adds latency.
-        const int refresh_cap = source_interval_s > 0.0
-            ? static_cast<int>(std::floor(refresh_rate * source_interval_s + 0.15))
-            : 2;
-        int multiplier = qMin(settings->GetFrameGenMultiplier() * cadence, refresh_cap);
+        int multiplier = plan_fg_multiplier(cadence, source_interval_s, refresh_rate);
         fg_refresh_limited = multiplier < 2;
-        // When the display holds back the multiplier asked for, the status says what it would take.
-        // Counted per source picture like the status's own number: 4x of a 30 fps stream needs 120 Hz.
-        // Never more than the backend can make (4 until it has started), so a half-rate source with 4x
-        // at 150 Hz, already at the backend's 4 per picture, gets no note.
-        const int fg_max_known = frame_gen && frame_gen->maxMultiplier() > 1 ? frame_gen->maxMultiplier() : 4;
-        const int fg_requested = qMin(settings->GetFrameGenMultiplier() * cadence, fg_max_known);
-        const bool fg_capped = refresh_cap < fg_requested && source_interval_s > 0.0;
-        fg_status_requested.storeRelaxed(fg_capped ? fg_requested : 0);
-        fg_status_needed_hz.storeRelaxed(fg_capped ? static_cast<int>(std::lround(fg_requested / source_interval_s)) : 0);
-        fg_status_refresh_hz.storeRelaxed(static_cast<int>(std::lround(refresh_rate)));
         if (fg_refresh_limited && fg_skip_logged != 3) {
             fg_skip_logged = 3;
             qCInfo(chiakiGui).nospace() << "Frame generation skipped: the display runs at " << refresh_rate
@@ -8140,14 +8243,41 @@ void QmlMainWindow::render()
                 fg_active_multiplier = multiplier;
                 fg_active_cadence = cadence;
                 fg_applied = true;
+                // RTX VSR has no split into a D3D12 half, so it keeps the frames unpipelined.
+                fg_pipe_allowed = backend_choice == FrameGen::Backend::Dlss12 && !vsr_applied;
             }
         }
     }
-    if (direct_frame_fresh && !fg_applied && fg_active_multiplier != 1) {
-        qCInfo(chiakiGui) << "Frame generation inactive";
-        fg_active_multiplier = 1;
-        fg_active_cadence = 1;
-        fg_pending_frames.clear();
+    if (direct_frame_fresh && !fg_applied) {
+        fg_pipe_allowed = false;
+        if (fg_active_multiplier != 1) {
+            qCInfo(chiakiGui) << "Frame generation inactive";
+            fg_active_multiplier = 1;
+            fg_active_cadence = 1;
+            fg_pending_frames.clear();
+        }
+    }
+    if (fg_pipe_present) {
+        // The first frame made from a pipelined stream frame: what the block above does for a
+        // stream frame processed in this render.
+        if (fg_active_multiplier != fg_pipe_multiplier || fg_active_cadence != fg_pipe_cadence)
+            qCInfo(chiakiGui).nospace() << "Frame generation active: "
+                << FrameGen::backendName(FrameGen::Backend::Dlss12) << " " << fg_pipe_multiplier << "x"
+                << (fg_pipe_cadence == 2 ? " of a half-rate source (repeats dropped)" : "") << ", pipelined";
+        if (!fg_pipe_logged) {
+            fg_pipe_logged = true;
+            qCInfo(chiakiGui) << "[framegen] Pipelined: the next stream frame's DLSS work runs on D3D12 while the"
+                                 " frames generated from the last one are presented";
+        }
+        fg_active_multiplier = fg_pipe_multiplier;
+        fg_active_cadence = fg_pipe_cadence;
+        if (!fg_pending_frames.empty() && fg_crash_guard_armed && ++fg_crash_guard_good_frames >= 120) {
+            QFile::remove(frameGenCrashGuardPath());
+            fg_crash_guard_armed = false;
+        }
+        fg_status_backend.storeRelaxed(stream_active ? fg_run_backend : 0);
+        fg_status_multiplier.storeRelaxed(fg_pipe_multiplier);
+        fg_status_reason.storeRelaxed(0);
     }
     if (direct_frame_fresh || !bypass_frame_queue) {
         fg_status_backend.storeRelaxed(stream_active ? fg_run_backend : 0);
@@ -8235,9 +8365,64 @@ void QmlMainWindow::render()
     if (!scheduled_pending)
         schedulePostRenderWork();
     schedulePostSwapchainRecreateRefresh();
-    // Frames left over from frame generation are presented by the next renders.
-    if (!fg_pending_frames.empty())
+    // Frames left over from frame generation (and a pipelined stream frame's) are presented
+    // by the next renders.
+    if (!fg_pending_frames.empty() || fg_pipe_stage != FgPipeStage::Idle)
         scheduleUpdate(false, UpdateRequestReason::PendingFrame);
+}
+
+bool QmlMainWindow::fgPipeEnabled()
+{
+    // CHIAKI_FG_PIPELINE=0 turns it off (for A/B tests).
+    static const bool enabled = qgetenv("CHIAKI_FG_PIPELINE") != "0";
+    return enabled;
+}
+
+void QmlMainWindow::fgPipeCancel()
+{
+    // A begun DLSS 5 / DLSS FG call nobody collects is dropped by their next call.
+    fg_pipe_stage = FgPipeStage::Idle;
+    fg_pipe_outputs.clear();
+    fg_pipe_fg_src = {};
+}
+
+void QmlMainWindow::fgPipeAdvance(bool drain)
+{
+    if (fg_pipe_stage == FgPipeStage::NeuralRender && (drain || !neural_render || neural_render->beginDone())) {
+        struct pl_frame rendered = {};
+        uint64_t rendered_signature = 0;
+        const bool nr_ok = neural_render && direct_frame.num_planes > 0 &&
+            neural_render->process(&direct_frame, direct_frame_serial, fg_pipe_nr_options, &rendered, &rendered_signature);
+        // What the normal path does with the result (status, log), see render().
+        if (nr_ok != neural_render_active) {
+            neural_render_active = nr_ok;
+            qCInfo(chiakiGui) << "DLSS neural rendering" << (nr_ok ? "active" : "inactive");
+        }
+        const bool upscaled = nr_ok && fabsf(pl_rect_w(rendered.crop)) > fabsf(pl_rect_w(direct_frame.crop)) + 0.5f;
+        nr_status_state.storeRelaxed(nr_ok ? 1 : neural_render && neural_render->failed() ? 3 : 2);
+        nr_status_gpu_cms.storeRelaxed(nr_ok ? static_cast<int>(neural_render->gpuTimeMs() * 100.0f) : 0);
+        nr_status_out_h.storeRelaxed(upscaled ? static_cast<int>(lroundf(fabsf(pl_rect_h(rendered.crop)))) : 0);
+        nr_status_hdr.storeRelaxed(nr_ok && pl_color_space_is_hdr(&rendered.color) ? 1 : 0);
+        if (!nr_ok) {
+            // The normal path retries it (and counts the failure) with the frame as it is.
+            fg_pipe_stage = FgPipeStage::Taken;
+            return;
+        }
+        fg_pipe_fg_src = rendered;
+        fg_pipe_stage = frame_gen && frame_gen->begin(&fg_pipe_fg_src, fg_pipe_out_w, fg_pipe_out_h,
+                                                      fg_pipe_multiplier, fg_pipe_interval_ms)
+            ? FgPipeStage::FrameGen
+            : FgPipeStage::Taken;
+    }
+    if (fg_pipe_stage == FgPipeStage::FrameGen && (drain || !frame_gen || frame_gen->beginDone())) {
+        std::vector<struct pl_frame> outputs;
+        if (frame_gen && frame_gen->finish(outputs) && !outputs.empty()) {
+            fg_pipe_outputs = std::move(outputs);
+            fg_pipe_stage = FgPipeStage::Ready;
+        } else {
+            fg_pipe_stage = FgPipeStage::Taken;
+        }
+    }
 }
 
 bool QmlMainWindow::handleShortcut(QKeyEvent *event)

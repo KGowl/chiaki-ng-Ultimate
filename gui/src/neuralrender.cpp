@@ -52,6 +52,9 @@ struct NeuralRender::Impl
         uint64_t key = 0;
         uint64_t last_use = 0;
         uint64_t done_value = 0;
+        // begin(): the D3D12 value its result is signalled with; the copy back into `image`
+        // is not queued yet (0 = the image holds the result).
+        uint64_t pending_output = 0;
     };
 
     struct CommandSlot
@@ -95,6 +98,8 @@ struct NeuralRender::Impl
     Image input;
     std::vector<CacheEntry> cache;
     uint64_t use_counter = 0;
+    // D3D12 value of the latest begin() whose result nobody collected yet (0 = none).
+    uint64_t begun_value = 0;
 
     PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = nullptr;
     PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
@@ -117,8 +122,15 @@ struct NeuralRender::Impl
     bool ensureImage(Image &img, int w, int h, bool hdr);
     void destroyImage(Image &img);
     CacheEntry &acquireCacheEntry(uint64_t key);
-    bool run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed);
+    // Steps (1) and (2) of a frame, then (3) unless `pending_output` is given: it then gets
+    // the D3D12 value to pass to copyBack() later.
+    bool run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed,
+             uint64_t *pending_output = nullptr);
+    bool copyBack(Image &out, uint64_t output_value);
     void abandonRunner();
+    bool processImpl(const struct pl_frame *src, uint64_t signature, const NeuralRender::Options &options,
+                     struct pl_frame *out_frame, uint64_t *out_signature, bool defer);
+    void noteFailure(bool crashed);
 };
 
 bool NeuralRender::Impl::loadFunctions()
@@ -354,7 +366,8 @@ void NeuralRender::Impl::abandonRunner()
 // (1) Vulkan copies `input` into the shared buffer and signals the D3D12 timeline, (2) the
 // D3D12 queue waits for it, runs the feature and signals the next value, (3) Vulkan waits for
 // that and copies the shared output buffer into `out`.
-bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed)
+bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed,
+                             uint64_t *pending_output)
 {
     *crashed = false;
     if (!runner->nrMatches(config)) {
@@ -422,12 +435,24 @@ bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool re
     }
     if (!rendered)
         return false;
+    if (pending_output) {
+        *pending_output = output_value;
+        return true;
+    }
+    return copyBack(out, output_value);
+}
 
-    // (3)
-    slot = beginSlot();
+// (3) Vulkan waits for `output_value` on the D3D12 timeline and copies the shared output
+// buffer into `out`.
+bool NeuralRender::Impl::copyBack(Image &out, uint64_t output_value)
+{
+    CommandSlot *slot = beginSlot();
     if (!slot)
         return false;
+    struct pl_vulkan_hold_params hold = {};
     hold.tex = out.tex;
+    hold.layout = kLayout;
+    hold.qf = VK_QUEUE_FAMILY_IGNORED;
     hold.semaphore = { sem_out, out_value + 1 };
     if (!pl_vulkan_hold_ex(gpu, &hold)) {
         vkEndCommandBuffer(slot->cmd);
@@ -435,8 +460,11 @@ bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool re
     }
     out_value++;
     runner->recordNrOutput(slot->cmd, out.image);
-    ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS && submit(slot->cmd, sem_out, out_value, output_value, 0);
+    const bool ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS && submit(slot->cmd, sem_out, out_value, output_value, 0);
+    struct pl_vulkan_release_params release = {};
     release.tex = out.tex;
+    release.layout = kLayout;
+    release.qf = VK_QUEUE_FAMILY_IGNORED;
     release.semaphore = ok ? pl_vulkan_sem{ sem_done, done_value } : pl_vulkan_sem{ sem_out, out_value };
     pl_vulkan_release_ex(gpu, &release);
     if (ok)
@@ -561,7 +589,40 @@ void NeuralRender::hidePanel()
 bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, const Options &options,
                            struct pl_frame *out_frame, uint64_t *out_signature)
 {
-    Impl &d = *impl;
+    return impl->processImpl(src, signature, options, out_frame, out_signature, false);
+}
+
+bool NeuralRender::begin(const struct pl_frame *src, uint64_t signature, const Options &options)
+{
+    struct pl_frame unused_frame = {};
+    uint64_t unused_signature = 0;
+    return impl->processImpl(src, signature, options, &unused_frame, &unused_signature, true);
+}
+
+bool NeuralRender::beginDone() const
+{
+    const Impl &d = *impl;
+    return d.begun_value == 0 || !d.runner || d.runner->completedValue() >= d.begun_value;
+}
+
+void NeuralRender::Impl::noteFailure(bool crashed)
+{
+    reset_pending = true;
+    if (crashed || ++failures >= kMaxFailures) {
+        qCWarning(chiakiGui) << "[neural-render] Disabling DLSS neural rendering for this session"
+                             << (crashed ? "(its runtime crashed)" : "(repeated failures)");
+        if (crashed)
+            abandonRunner();
+        shutdown();
+        init_failed = true;
+    }
+}
+
+bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signature,
+                                     const NeuralRender::Options &options, struct pl_frame *out_frame,
+                                     uint64_t *out_signature, bool defer)
+{
+    Impl &d = *this;
     if (!d.initialized || !src || src->num_planes <= 0)
         return false;
     const bool hdr = pl_color_space_is_hdr(&src->color);
@@ -651,11 +712,34 @@ bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, const
         *out_signature = entry.key;
     };
     for (auto &entry : d.cache) {
-        if (entry.key == key && entry.image.tex) {
-            fill_frame(entry);
-            return true;
+        if (entry.key != key || !entry.image.tex)
+            continue;
+        if (defer)
+            return true; // already rendered or begun
+        if (entry.pending_output) {
+            // begin() ran this frame: queue its copy back now.
+            const uint64_t output_value = entry.pending_output;
+            entry.pending_output = 0;
+            if (d.begun_value == output_value)
+                d.begun_value = 0;
+            if (!d.copyBack(entry.image, output_value)) {
+                entry.key = 0;
+                d.noteFailure(false);
+                return false;
+            }
+            entry.done_value = d.done_value;
+        }
+        fill_frame(entry);
+        return true;
+    }
+    // A begun frame nobody collected: the next run overwrites the shared output buffer.
+    for (auto &entry : d.cache) {
+        if (entry.pending_output) {
+            entry.pending_output = 0;
+            entry.key = 0;
         }
     }
+    d.begun_value = 0;
 
     // Resizing destroys the texture, so pending copies must not use it anymore.
     if (d.input.tex && (d.input.w != config.width || d.input.h != config.height || d.input.hdr != hdr)
@@ -687,22 +771,21 @@ bool NeuralRender::process(const struct pl_frame *src, uint64_t signature, const
         return false;
     }
     bool crashed = false;
-    const bool ok = d.run(entry.image, config, d.reset_pending, &crashed);
+    uint64_t pending_output = 0;
+    const bool ok = d.run(entry.image, config, d.reset_pending, &crashed, defer ? &pending_output : nullptr);
     if (!ok) {
         entry.key = 0;
-        d.reset_pending = true;
-        if (crashed || ++d.failures >= kMaxFailures) {
-            qCWarning(chiakiGui) << "[neural-render] Disabling DLSS neural rendering for this session"
-                                 << (crashed ? "(its runtime crashed)" : "(repeated failures)");
-            if (crashed)
-                d.abandonRunner();
-            d.shutdown();
-            d.init_failed = true;
-        }
+        d.noteFailure(crashed);
         return false;
     }
     d.failures = 0;
     d.reset_pending = false;
+    if (defer) {
+        entry.pending_output = pending_output;
+        entry.last_use = ++d.use_counter;
+        d.begun_value = pending_output;
+        return true;
+    }
     entry.done_value = d.done_value;
     fill_frame(entry);
     return true;
@@ -729,5 +812,7 @@ bool NeuralRender::process(const struct pl_frame *, uint64_t, const Options &, s
 {
     return false;
 }
+bool NeuralRender::begin(const struct pl_frame *, uint64_t, const Options &) { return false; }
+bool NeuralRender::beginDone() const { return true; }
 
 #endif // CHIAKI_HAVE_DX12FG

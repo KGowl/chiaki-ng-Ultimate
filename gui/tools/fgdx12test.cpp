@@ -12,6 +12,8 @@
 //              also runs DLSS Frame Generation through D3D12 on the output (shared runtime),
 //              --scale upscales after it, --hdr feeds a linear-light HDR frame, --model picks
 //              NVIDIA's feature 18 model (0 CC, 1 HT).
+//   --pipeline drives backend 5 and --nr (with --with-fg) the way the renderer pipelines them:
+//              begin(), poll beginDone(), then process() / finish(), with the same checks.
 // For backend 5 and --nr on a GPU without NVIDIA's runtime, NeuralHub's dxgi.dll and
 // neuralhub.ini must sit next to the executable.
 
@@ -30,17 +32,32 @@
 #include <QLoggingCategory>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 Q_LOGGING_CATEGORY(chiakiGui, "chiaki.gui", QtInfoMsg)
 
 namespace {
+
+// --pipeline: waits (up to 5 s) for a begun call's D3D12 side, returns the wait in ms or -1.
+template <typename Done> double waitBegun(Done done)
+{
+    QElapsedTimer wait;
+    wait.start();
+    while (!done()) {
+        if (wait.elapsed() > 5000)
+            return -1.0;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    return wait.nsecsElapsed() / 1e6;
+}
 
 void placeboLog(void *, pl_log_level level, const char *msg)
 {
@@ -399,7 +416,7 @@ HdrStats hdrStats(const std::vector<float> &f)
 // working when frame generation through D3D12 shares it. --scale upscales after it, --hdr
 // feeds a linear-light HDR frame (highlights to 8x SDR white) and checks they stay HDR.
 int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &out_path, int frames, int mvx, int w,
-                    int h, bool with_fg, float scale, bool hdr, int model, int passes, int tune_at)
+                    int h, bool with_fg, float scale, bool hdr, int model, int passes, int tune_at, bool pipeline)
 {
     std::vector<uint8_t> base;
     if (!image_path.empty()) {
@@ -426,6 +443,8 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
                 options.out_width ? options.out_width : w, options.out_height ? options.out_height : h,
                 hdr ? "HDR" : "SDR", base.empty() ? "pattern" : image_path.c_str(), model == 1 ? "HT" : "CC", frames,
                 mvx, with_fg ? ", with DLSS FG D3D12" : "");
+    if (pipeline)
+        std::printf("pipelined: begin(), beginDone(), then process()%s\n", with_fg ? " / FG begin(), finish()" : "");
     if (passes > 1 || tune_at >= 0)
         std::printf("%d pass(es)%s\n", passes, tune_at >= 0 ? ", controls changed live (Cinematic, local tone 2) from frame --tune-at on" : "");
     if (!rig.resize(w, h) || (hdr && !rig.ensureHdrSource())) {
@@ -492,7 +511,19 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
         struct pl_frame out = {};
         uint64_t signature = 0;
         timer.restart();
-        const bool ok = nr.process(&src, static_cast<uint64_t>(k + 1), options, &out, &signature);
+        bool ok;
+        std::string pipe_note;
+        if (pipeline) {
+            ok = nr.begin(&src, static_cast<uint64_t>(k + 1), options);
+            const double begin_ms = timer.nsecsElapsed() / 1e6;
+            const double wait_ms = ok ? waitBegun([&]() { return nr.beginDone(); }) : -1.0;
+            ok = ok && wait_ms >= 0.0 && nr.process(&src, static_cast<uint64_t>(k + 1), options, &out, &signature);
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " | begin %.1f ms, D3D12 done after %.1f ms", begin_ms, wait_ms);
+            pipe_note = buf;
+        } else {
+            ok = nr.process(&src, static_cast<uint64_t>(k + 1), options, &out, &signature);
+        }
         const double ms = timer.nsecsElapsed() / 1e6;
         if (!ok) {
             std::printf("frame %2d: process() failed (%.1f ms)\n", k, ms);
@@ -545,14 +576,20 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
         std::string fg_note;
         if (with_fg) {
             std::vector<struct pl_frame> fg_out;
-            const bool fg_ok = fg.process(&out, out_w, out_h, 2, 16.7f, fg_out);
+            bool fg_ok;
+            if (pipeline) {
+                fg_ok = fg.begin(&out, out_w, out_h, 2, 16.7f) && waitBegun([&]() { return fg.beginDone(); }) >= 0.0 &&
+                        fg.finish(fg_out);
+            } else {
+                fg_ok = fg.process(&out, out_w, out_h, 2, 16.7f, fg_out);
+            }
             fg_note = fg_ok ? " | FG " + std::to_string(fg_out.size()) + " frame(s)" : " | FG failed";
             if (!fg_ok && k > 0)
                 failures++;
         }
-        std::printf("frame %2d: %dx%d, process %.1f ms, NR GPU %.2f ms, mean diff to input %.2f, output mean %.1f%s%s %s\n",
-                    k, out_w, out_h, ms, nr.gpuTimeMs(), diff, mean, hdr_note.c_str(), fg_note.c_str(),
-                    frame_good ? "OK" : "BAD");
+        std::printf("frame %2d: %dx%d, process %.1f ms, NR GPU %.2f ms, mean diff to input %.2f, output mean %.1f%s%s%s %s\n",
+                    k, out_w, out_h, ms, nr.gpuTimeMs(), diff, mean, pipe_note.c_str(), hdr_note.c_str(),
+                    fg_note.c_str(), frame_good ? "OK" : "BAD");
         if (frame_good)
             good++;
         else
@@ -585,7 +622,7 @@ int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
     int backend_value = 5, frames = 20, mvx = 8, w = 1920, h = 1080, model = 0, passes = 1, tune_at = -1;
-    bool nr_mode = false, with_fg = false, hdr = false;
+    bool nr_mode = false, with_fg = false, hdr = false, pipeline = false;
     float scale = 1.0f;
     std::string image_path, out_path;
     for (int i = 1; i < argc; i++) {
@@ -604,6 +641,7 @@ int main(int argc, char **argv)
         else if (a == "--model" && i + 1 < argc) model = std::atoi(argv[++i]);
         else if (a == "--passes" && i + 1 < argc) passes = std::atoi(argv[++i]);
         else if (a == "--tune-at" && i + 1 < argc) tune_at = std::atoi(argv[++i]);
+        else if (a == "--pipeline") pipeline = true;
     }
     if (nr_mode) {
         if (!NeuralRender::compiledIn()) {
@@ -617,12 +655,14 @@ int main(int argc, char **argv)
             return 3;
         }
         const int result =
-            runNeuralRender(rig, image_path, out_path, frames, mvx, w, h, with_fg, scale, hdr, model, passes, tune_at);
+            runNeuralRender(rig, image_path, out_path, frames, mvx, w, h, with_fg, scale, hdr, model, passes, tune_at,
+                            pipeline);
         rig.destroy();
         return result;
     }
     const auto backend = static_cast<FrameGen::Backend>(backend_value);
-    std::printf("chiaki-fgdx12test: backend %s, %d frames, %d px/frame motion\n", FrameGen::backendName(backend), frames, mvx);
+    std::printf("chiaki-fgdx12test: backend %s, %d frames, %d px/frame motion%s\n", FrameGen::backendName(backend), frames,
+                mvx, pipeline ? ", pipelined (begin / beginDone / finish)" : "");
     if (!FrameGen::backendCompiledIn(backend)) {
         std::printf("VERDICT: backend not compiled in\n");
         return 2;
@@ -679,7 +719,13 @@ int main(int argc, char **argv)
             std::vector<struct pl_frame> outputs;
             QElapsedTimer timer;
             timer.start();
-            const bool ok = fg.process(&src, phase.w, phase.h, phase.multiplier, 33.3f, outputs);
+            bool ok;
+            if (pipeline) {
+                ok = fg.begin(&src, phase.w, phase.h, phase.multiplier, 33.3f) &&
+                     waitBegun([&]() { return fg.beginDone(); }) >= 0.0 && fg.finish(outputs);
+            } else {
+                ok = fg.process(&src, phase.w, phase.h, phase.multiplier, 33.3f, outputs);
+            }
             const double ms = timer.nsecsElapsed() / 1e6;
             if (k >= 2) {
                 sum_ms += ms;

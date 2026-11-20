@@ -65,6 +65,9 @@ public:
     VkSemaphore semaphore() const;
     uint64_t lastValue() const;
     void setLastValue(uint64_t value);
+    // The value the GPU has reached on that timeline (never waits). Vulkan work that waits
+    // for a higher value would hold up everything queued after it on the same queue.
+    uint64_t completedValue() const;
 
     // Record copies between a Vulkan image (VK_IMAGE_LAYOUT_GENERAL) and the shared
     // buffers. The color image is RGBA8 (VK_FORMAT_R8G8B8A8_UNORM), the motion image
