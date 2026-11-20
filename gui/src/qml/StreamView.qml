@@ -382,9 +382,13 @@ Item {
         focusPolicy: Qt.NoFocus
         font.pixelSize: 15
         Material.foreground: Material.accent
+        // The panel's own dark glass, so the button reads on bright scenes too.
         background: Rectangle {
-            radius: 6
-            color: panelButton.hovered ? "#60000000" : "#30000000"
+            implicitHeight: 36
+            radius: 8
+            color: panelButton.hovered ? "#e6121418" : "#b3121418"
+            border.color: "#40ffffff"
+            border.width: 1
         }
         onClicked: view.toggleNeuralRenderPanel()
         function publish() {

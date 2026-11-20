@@ -125,12 +125,14 @@ class StandInWindow : public QObject
     Q_PROPERTY(QString videoEnhancementStatus READ status CONSTANT)
     Q_PROPERTY(bool neuralRenderPaused READ paused WRITE setPaused NOTIFY neuralRenderToggled)
     Q_PROPERTY(bool neuralRenderTunable READ tunable CONSTANT)
-    Q_PROPERTY(bool nvidiaCard READ nvidia CONSTANT)
-    Q_PROPERTY(QString gpuName READ gpu CONSTANT)
+    Q_PROPERTY(bool nvidiaCard READ nvidia NOTIFY gpuInfoChanged)
+    Q_PROPERTY(QString gpuName READ gpu NOTIFY gpuInfoChanged)
 
 public:
-    bool nvidia() const { return true; }
-    QString gpu() const { return QStringLiteral("NVIDIA GeForce RTX 5090"); }
+    bool nvidia() const { return nvidia_; }
+    QString gpu() const { return nvidia_ ? QStringLiteral("NVIDIA GeForce RTX 5090") : QStringLiteral("AMD Radeon RX 9070 XT"); }
+    void setNvidia(bool n) { nvidia_ = n; emit gpuInfoChanged(); }
+    bool nvidia_ = true;
     QString status() const { return QStringLiteral("DLSS NR → 2160p 4.0 ms"); }
     bool paused() const { return paused_; }
     void setPaused(bool p) { paused_ = p; emit neuralRenderToggled(!p); }
@@ -139,6 +141,7 @@ public:
 
 signals:
     void neuralRenderToggled(bool enabled);
+    void gpuInfoChanged();
 };
 
 class StandInBackend : public QObject
@@ -395,6 +398,16 @@ int main(int argc, char **argv)
     closes_before = closes.count;
     key(Qt::Key_Escape);
     check(closes.count == closes_before + 1, "Esc sends closeRequested");
+    // An AMD card: no NVIDIA-only rows, no RTX VSR, and the Eye Candy tab starts at the clean-up row.
+    backend.window_.setNvidia(false);
+    settle();
+    key(Qt::Key_Tab); // back to RTX settings
+    key(Qt::Key_Down);
+    check(panel->property("tab").toInt() == 0 && row() == 11, "AMD: Down from Neural Rendering skips the NVIDIA rows (DLSS upscaling)");
+    key(Qt::Key_Tab);
+    check(panel->property("tab").toInt() == 1 && row() == 1, "AMD: Eye Candy starts at the clean-up row (no RTX VSR)");
+    key(Qt::Key_Up);
+    check(row() == 4, "AMD: Up from the first row wraps past RTX VSR to Border fill");
     std::printf("-- %d failed\n", g_failed);
     std::printf(g_failed ? "VERDICT: panel checks FAILED\n" : "VERDICT: panel checks passed\n");
     return g_failed ? 1 : 0;

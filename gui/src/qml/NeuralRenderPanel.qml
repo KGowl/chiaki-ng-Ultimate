@@ -65,7 +65,8 @@ Rectangle {
                 currentRow = firstRow();
         }
     }
-    onTabChanged: currentRow = firstRow()
+    // After the rows' visibility has followed the new tab (an AMD card has no RTX VSR row).
+    onTabChanged: Qt.callLater(() => { currentRow = firstRow(); })
 
     Connections {
         target: Chiaki.settings
@@ -592,7 +593,8 @@ Rectangle {
         // ---- Eye Candy
         PanelRow {
             id: rowVsr
-            visible: panel.tab === 1 && Chiaki.settings.rtxVsrSupported
+            // RTX VSR runs on NVIDIA cards only (the build may carry it on any GPU).
+            visible: panel.tab === 1 && Chiaki.settings.rtxVsrSupported && panel.nvidia
             selected: panel.tab === 1 && panel.currentRow === 0
             onActivated: panel.select(rowVsr)
             label: qsTr("RTX Video Super Resolution")
