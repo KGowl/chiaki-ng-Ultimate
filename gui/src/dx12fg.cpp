@@ -14,6 +14,14 @@
 #include "nvsdk_ngx.h"
 #include "nvsdk_ngx_helpers.h"
 #include "nvsdk_ngx_helpers_dlssg_d3d.h"
+#if defined(CHIAKI_HAVE_STREAMLINE)
+#include <dxgi1_5.h>
+#include <sl.h>
+#include <sl_consts.h>
+#include <sl_dlss_g.h>
+#include <sl_pcl.h>
+#include <sl_reflex.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -23,11 +31,44 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
+
+#if defined(CHIAKI_HAVE_STREAMLINE)
+// Streamline's API, forwarded to the sl.interposer.dll next to chiaki.exe, loaded at run time.
+// sl.interposer.lib is not linked: it also exports D3D12CreateDevice / CreateDXGIFactory*, and
+// linking it would hand out Streamline proxies where native interfaces are expected.
+static HMODULE g_sl_dll = nullptr;
+#define DX12FG_SL_FORWARD(name, params, args)                                                       \
+    extern "C" sl::Result name params                                                               \
+    {                                                                                               \
+        static PFun_##name *fn = nullptr;                                                           \
+        if (!fn && g_sl_dll)                                                                        \
+            fn = reinterpret_cast<PFun_##name *>(GetProcAddress(g_sl_dll, #name));                  \
+        return fn ? fn args : sl::Result::eErrorInitNotCalled;                                      \
+    }
+DX12FG_SL_FORWARD(slInit, (const sl::Preferences &pref, uint64_t sdkVersion), (pref, sdkVersion))
+DX12FG_SL_FORWARD(slIsFeatureSupported, (sl::Feature feature, const sl::AdapterInfo &adapterInfo), (feature, adapterInfo))
+DX12FG_SL_FORWARD(slSetTagForFrame,
+                  (const sl::FrameToken &frame, const sl::ViewportHandle &viewport, const sl::ResourceTag *resources,
+                   uint32_t numResources, sl::CommandBuffer *cmdBuffer),
+                  (frame, viewport, resources, numResources, cmdBuffer))
+DX12FG_SL_FORWARD(slSetConstants, (const sl::Constants &values, const sl::FrameToken &frame, const sl::ViewportHandle &viewport),
+                  (values, frame, viewport))
+DX12FG_SL_FORWARD(slGetFeatureRequirements, (sl::Feature feature, sl::FeatureRequirements &requirements),
+                  (feature, requirements))
+DX12FG_SL_FORWARD(slUpgradeInterface, (void **baseInterface), (baseInterface))
+DX12FG_SL_FORWARD(slGetNativeInterface, (void *proxyInterface, void **baseInterface), (proxyInterface, baseInterface))
+DX12FG_SL_FORWARD(slGetFeatureFunction, (sl::Feature feature, const char *functionName, void *&function),
+                  (feature, functionName, function))
+DX12FG_SL_FORWARD(slGetNewFrameToken, (sl::FrameToken * &token, const uint32_t *frameIndex), (token, frameIndex))
+DX12FG_SL_FORWARD(slSetD3DDevice, (void *d3dDevice), (d3dDevice))
+#undef DX12FG_SL_FORWARD
+#endif
 
 namespace {
 
@@ -44,6 +85,112 @@ constexpr UINT kVendorNvidia = 0x10DE;
 constexpr int kFeatureNeuralRendering = 18;
 // NGX's generic application id, for the snippet's own Init_Ext.
 constexpr unsigned long long kNrApplicationId = 0x24480451ull;
+
+double nowMs()
+{
+    static const LARGE_INTEGER freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return 1000.0 * static_cast<double>(c.QuadPart) / static_cast<double>(freq.QuadPart);
+}
+
+#if defined(CHIAKI_HAVE_STREAMLINE)
+// A QueryPerformanceCounter value on nowMs()'s scale.
+double qpcMs(uint64_t qpc)
+{
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return 1000.0 * static_cast<double>(qpc) / static_cast<double>(f.QuadPart);
+}
+
+// ---- DLSS Frame Generation through NVIDIA Streamline (Dx12Fg::Impl::sl_route) ----
+// MFG Unlocker (github.com/dashdogy/MFG-Unlocker) opens DLSS Frame Generation on RTX 20 / RTX 30
+// for Streamline only, not for NGX called directly. Streamline (manual hooking) owns a hidden
+// window's swapchain: each real frame is copied into its back buffer and presented, and
+// Streamline presents the generated frames on that swapchain itself, paced over the next frame
+// interval. A hook on DXGI's Present copies every frame presented on that window back (real and
+// generated alike) and the real ones are told apart by a marker row under the frame (alpha 0;
+// DLSS-G writes alpha 255 into the frames it generates).
+constexpr size_t kSlBackBuffers = 3;
+constexpr size_t kSlRing = 2 * Dx12Fg::kMaxOutputs + 2; // frame copies: up to 2 frames' generated + real
+constexpr size_t kSlCapLists = 8;
+constexpr uint64_t kSlReadback = 64;      // marker pixels read back, one per presented frame
+constexpr UINT64 kSlReadbackStride = 512; // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
+constexpr UINT64 kSlTimestampOffset = 256; // each copy's GPU timestamp, in its readback entry
+constexpr uint32_t kSlIdMask = 0xffffff;  // frame id in the marker's RGB
+enum SlSlotState { kSlFree, kSlCaptured, kSlTaken };
+
+std::mutex g_sl_mutex; // start-up and hooks, once per process
+bool g_sl_tried = false;
+bool g_sl_started = false;
+bool g_sl_hooked = false;
+// The window Streamline generates frames on, and the queue Streamline presents it with (its
+// own, seen when it creates its swapchain for that window).
+std::atomic<HWND> g_sl_hwnd{nullptr};
+std::atomic<ID3D12CommandQueue *> g_sl_present_queue{nullptr};
+// The instance the frames presented on that window are copied for; the Present hook holds the
+// mutex while it records a copy.
+std::mutex g_sl_capture_mutex;
+Dx12Fg::Impl *g_sl_capture_owner = nullptr;
+// CHIAKI_DLSSG_SL_ALWAYS=1: what GetForegroundWindow returns inside Streamline (DLSS-G pauses
+// while no window of the process has the focus).
+HWND g_sl_focus_window = nullptr;
+// CHIAKI_DLSSG_SL_TRACE=1: logs when each of Streamline's presents came and how long it took.
+bool g_sl_trace = false;
+using PresentFn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT);
+using Present1Fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
+using CreateForHwndFn = HRESULT(STDMETHODCALLTYPE *)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *,
+                                                       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *,
+                                                       IDXGISwapChain1 **);
+using CreateFn = HRESULT(STDMETHODCALLTYPE *)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
+PresentFn g_orig_present = nullptr;
+Present1Fn g_orig_present1 = nullptr;
+CreateForHwndFn g_orig_create_hwnd = nullptr;
+CreateFn g_orig_create = nullptr;
+
+std::wstring exeDir()
+{
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir = exe;
+    return dir.substr(0, dir.find_last_of(L'\\'));
+}
+
+bool fileExists(const std::wstring &path)
+{
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Whether DLSS Frame Generation goes through Streamline: when MFG Unlocker (its version.dll)
+// is next to chiaki.exe; CHIAKI_DLSSG_ROUTE=sl / ngx decides otherwise. Needs sl.interposer.dll.
+// Why DLSS Frame Generation goes through Streamline on this adapter, or nullptr for NGX directly.
+// RTX 50 cards generate up to 4x through NGX themselves; through Streamline on the hidden window
+// an RTX 5090 gave its frames only every 14-20 ms. `note` says why version.dll is not followed.
+const char *slRouteReason(const char *adapter_name, const char **note)
+{
+    *note = nullptr;
+    const std::wstring dir = exeDir();
+    if (!fileExists(dir + L"\\sl.interposer.dll"))
+        return nullptr;
+    const char *route = std::getenv("CHIAKI_DLSSG_ROUTE");
+    if (route && _stricmp(route, "sl") == 0)
+        return "CHIAKI_DLSSG_ROUTE=sl";
+    if (route && _stricmp(route, "ngx") == 0)
+        return nullptr;
+    if (!fileExists(dir + L"\\version.dll"))
+        return nullptr;
+    if (strstr(adapter_name, "RTX 50") || strstr(adapter_name, "Blackwell")) {
+        *note = "MFG Unlocker's version.dll is next to chiaki.exe, but RTX 50 cards run DLSS Frame Generation "
+                "through NGX directly (CHIAKI_DLSSG_ROUTE=sl for Streamline)";
+        return nullptr;
+    }
+    return "MFG Unlocker's version.dll is next to chiaki.exe";
+}
+#endif
 
 // NVIDIA's DLSS Neural Rendering snippet (nvngx_dlssnr.dll) only serves callers inside a
 // module named like nvngx.dll; nvngx.dll_dlssnr.dll (src/nrgate.cpp) is that pass-through.
@@ -573,6 +720,122 @@ struct Dx12Fg::Impl
     void panelHide();
     bool panelResize(UINT w, UINT h, DXGI_FORMAT format);
 
+    // ---- DLSS Frame Generation through Streamline (see kSlRing) ----
+    bool sl_route = false;
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    int sl_max_generated = 1;
+    ID3D12Device *sl_device = nullptr;   // Streamline's proxy of `device`
+    ComPtr<ID3D12CommandQueue> sl_queue; // proxy; `queue` is its native queue
+    IDXGIFactory4 *sl_factory = nullptr; // Streamline's proxy of `factory`
+    HWND sl_hwnd = nullptr;
+    bool sl_tearing = false;
+    ComPtr<IDXGISwapChain3> sl_swapchain; // proxy, width x (height + 1): the marker row at the bottom
+    std::array<ComPtr<ID3D12Resource>, kSlBackBuffers> sl_buffers;
+    int sl_count_set = 0;   // numFramesToGenerate Streamline has
+    uint32_t sl_frame = 0;  // id of the last frame handed to Streamline (in its marker)
+    ComPtr<ID3D12Resource> sl_marker; // upload: a marker row per command allocator slot
+    uint8_t *sl_marker_ptr = nullptr;
+    UINT64 sl_marker_stride = 0;
+    // Copies of the frames presented on sl_hwnd, recorded by the Present hook under
+    // g_sl_capture_mutex: a frame slot each (kSlTaken: until the shared timeline passes
+    // free_after, when Vulkan has copied it out) and its marker pixel in sl_readback.
+    struct SlSlot
+    {
+        Shared buf;
+        int state = kSlFree;
+        uint64_t free_after = 0;
+    };
+    std::array<SlSlot, kSlRing> sl_ring;
+    ComPtr<ID3D12Resource> sl_readback;
+    const uint8_t *sl_readback_ptr = nullptr;
+    // GPU timestamps of the copies (when each frame was there) and the clocks' calibration.
+    ComPtr<ID3D12QueryHeap> sl_ts_heap;
+    UINT64 sl_ts_freq = 0, sl_ts_gpu0 = 0, sl_ts_cpu0 = 0;
+    double sl_ts_calibrated = -1.0e9;
+    ComPtr<ID3D12Fence> sl_cap_fence; // value = presents copied so far
+    HANDLE sl_cap_event = nullptr;
+    struct SlCapList
+    {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        uint64_t value = 0;
+    };
+    std::array<SlCapList, kSlCapLists> sl_cap_lists;
+    uint64_t sl_cap_seq = 0;
+    size_t sl_slot_next = 0;
+    struct SlRecord
+    {
+        uint64_t seq;
+        int slot; // -1: no free slot, only the marker was read
+    };
+    std::deque<SlRecord> sl_records;
+    bool sl_capture_on = false;
+    bool sl_format_warned = false;
+    // Sorting the copies (main thread, under g_sl_capture_mutex).
+    int64_t sl_last_real = -1;    // id of the last real frame seen presented
+    std::vector<int> sl_gens;     // generated frames presented after it
+    std::vector<int> sl_ready;    // the waiting frame's generated frames, complete
+    bool sl_ready_valid = false;
+    bool sl_waiting = false;      // the last generate()'s frames are not taken yet
+    int sl_count = 1;             // generated frames asked for it
+    std::array<int, kMaxOutputs> sl_taken = {};
+    double sl_t_generate = 0.0;   // when it was handed over
+    double sl_interval = 16.7;    // between generate() calls, smoothed
+    float sl_stream_interval = 0.0f; // the stream's frame interval (setFrameInterval), 0 unknown
+    // When each copy was recorded (Streamline's present call, the GPU may still be generating the
+    // frame then) and, for the generated frames being sorted and ready, also when their copy was
+    // seen done (when they are there for chiaki).
+    std::array<double, kSlReadback> sl_cap_time = {};
+    struct SlTimes
+    {
+        double first_cap = 0.0, last_cap = 0.0, first_seen = 0.0, last_seen = 0.0;
+    };
+    SlTimes sl_gens_times, sl_ready_times;
+    // Generated frames per real frame the GPU keeps up with. DLSS-G presents them one after the
+    // other as each is done (on RTX 20 / RTX 30 about 8 ms each at 1080p), so all of them have to
+    // be in before the next stream frame is due, or every frame after it comes later.
+    int sl_cap = kMaxOutputs;
+    double sl_first_ms = 0.0;   // generate() -> first generated frame presented, smoothed
+    double sl_spacing_ms = 0.0; // between the generated frames of one real frame, smoothed
+    uint32_t sl_late_bits = 0;  // the last frames, newest in bit 0: late or not
+    int sl_room_frames = 0;     // frames in a row with room for one more generated frame
+    int sl_settle = 0;          // frames not judged after a change
+    int sl_probe_wait = 600;    // frames with room before one more is tried without evidence
+    bool sl_probing = false;    // such a try is on
+    int sl_probe_frames = 0;    // frames since it began
+    // Statistics, logged every 10 s.
+    uint64_t sl_stat_frames = 0, sl_stat_gens = 0, sl_stat_short = 0, sl_stat_timeouts = 0;
+    uint64_t sl_stat_dropped = 0, sl_stat_skipped = 0;
+    double sl_stat_wait_ms = 0.0;
+    double sl_stat_logged = 0.0;
+    int sl_traced = 0;
+    // CHIAKI_DLSSG_SL_TRACE: per copy, when it was made (after the last generate()), how long the
+    // present after it took, and the present's sync interval and flags.
+    std::array<double, kSlReadback> sl_trace_t = {};
+    std::array<float, kSlReadback> sl_trace_present = {};
+    std::array<uint32_t, kSlReadback> sl_trace_mode = {};
+    std::string sl_trace_line;
+    int sl_trace_lines = 0;
+
+    bool slStartRuntime();
+    bool slAttachDevice();
+    bool slSetup();
+    bool slEnsureSize(int w, int h);
+    void slDestroySized();
+    void slResetSortingLocked();
+    bool slSetOptions(int count);
+    bool slPresentFrame(int count, bool reset, bool signal, uint64_t signal_value);
+    bool slGenerate(int count, uint64_t wait_value, uint64_t signal_value, bool reset);
+    uint64_t slCapture(IDXGISwapChain *sc, UINT sync, UINT flags);
+    void slSortLocked();
+    void slFreeLocked(int slot);
+    double slFrameIntervalMs() const { return sl_stream_interval > 0.0f ? sl_stream_interval : sl_interval; }
+    double slTimeoutMs() const { return std::clamp(slFrameIntervalMs() * 1.25 + 8.0, 20.0, 100.0); }
+    void slAdaptLocked(int n, const SlTimes &times);
+    bool slFramesReady();
+    int slTakeFrames();
+#endif
+
     bool loadVulkan();
     bool signalShared(uint64_t value);
     bool createDevice();
@@ -711,14 +974,33 @@ bool Dx12Fg::Impl::createDevice()
     char name[128] = {};
     WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
     adapter_vendor = desc.VendorId;
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    // Streamline starts before the device exists (manual hooking: it hooks nothing itself).
+    bool sl_wanted = false;
+    if (adapter_vendor == kVendorNvidia) {
+        const char *note = nullptr;
+        if (const char *reason = slRouteReason(name, &note)) {
+            log(0, "DLSS Frame Generation through Streamline (%s)", reason);
+            sl_wanted = slStartRuntime();
+        } else if (note) {
+            log(0, "%s", note);
+        }
+    }
+#endif
     HRESULT hr = create_device(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
     if (FAILED(hr)) {
         log(1, "D3D12CreateDevice failed on %s (0x%08x)", name, static_cast<unsigned>(hr));
         return false;
     }
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    // On the Streamline route the queue comes from Streamline's proxy device (its swapchain is
+    // created with it); everything runs on that queue's native queue.
+    if (sl_wanted && !slAttachDevice())
+        log(1, "Streamline: DLSS Frame Generation goes through NGX instead");
+#endif
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))))
+    if (!queue && FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))))
         return false;
     for (auto &slot : slots) {
         if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator))))
@@ -734,6 +1016,1062 @@ bool Dx12Fg::Impl::createDevice()
     log(0, "D3D12 device on %s", name);
     return idle_event != nullptr;
 }
+
+#if defined(CHIAKI_HAVE_STREAMLINE)
+namespace {
+
+// Every Present of a DXGI swapchain comes through here (the hook is on the class's vtable): the
+// frames presented on Streamline's window are copied for the instance that owns it.
+// Returns 1 + the copy's sequence number with CHIAKI_DLSSG_SL_TRACE (0 otherwise).
+uint64_t slCaptureHook(IDXGISwapChain *sc, UINT sync, UINT flags)
+{
+    if (flags & DXGI_PRESENT_TEST)
+        return 0;
+    const HWND hwnd = g_sl_hwnd.load();
+    if (!hwnd)
+        return 0;
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    if (FAILED(sc->GetDesc(&desc)) || desc.OutputWindow != hwnd)
+        return 0;
+    std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+    if (!g_sl_capture_owner)
+        return 0;
+    return g_sl_capture_owner->slCapture(sc, sync, flags);
+}
+
+void slTracePresent(uint64_t traced, double ms)
+{
+    std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+    if (g_sl_capture_owner)
+        g_sl_capture_owner->sl_trace_present[(traced - 1) % kSlReadback] = static_cast<float>(ms);
+}
+
+HRESULT STDMETHODCALLTYPE hookPresent(IDXGISwapChain *sc, UINT sync, UINT flags)
+{
+    const uint64_t traced = slCaptureHook(sc, sync, flags);
+    const double t0 = traced ? nowMs() : 0.0;
+    const HRESULT hr = g_orig_present(sc, sync, flags);
+    if (traced)
+        slTracePresent(traced, nowMs() - t0);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hookPresent1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *params)
+{
+    const uint64_t traced = slCaptureHook(sc, sync, flags);
+    const double t0 = traced ? nowMs() : 0.0;
+    const HRESULT hr = g_orig_present1(sc, sync, flags, params);
+    if (traced)
+        slTracePresent(traced, nowMs() - t0);
+    return hr;
+}
+
+// IDXGISwapChain::Present is slot 8 of the vtable, IDXGISwapChain1::Present1 slot 22.
+bool swapchainHooked(IDXGISwapChain *sc)
+{
+    void **vt = *reinterpret_cast<void ***>(sc);
+    return vt[8] == reinterpret_cast<void *>(&hookPresent) && vt[22] == reinterpret_cast<void *>(&hookPresent1);
+}
+
+// -1 not seen yet, 0 Streamline's swapchain is of another kind (its presents are not seen), 1 hooked
+std::atomic<int> g_sl_swapchain_hooked{-1};
+
+// Streamline creates its own swapchain for the frame generation window, on a queue of its own:
+// the copies of what it presents go on that queue.
+void noteSwapchain(IUnknown *device, HWND hwnd, IUnknown *created)
+{
+    if (!hwnd || !device || hwnd != g_sl_hwnd.load())
+        return;
+    ComPtr<ID3D12CommandQueue> q;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&q))) && g_sl_present_queue.load() != q.Get()) {
+        q->AddRef(); // kept for the process: the Present hook may still use the one it replaces
+        g_sl_present_queue.store(q.Get());
+    }
+    ComPtr<IDXGISwapChain> sc;
+    if (created && SUCCEEDED(created->QueryInterface(IID_PPV_ARGS(&sc))))
+        g_sl_swapchain_hooked.store(swapchainHooked(sc.Get()) ? 1 : 0);
+}
+
+HRESULT STDMETHODCALLTYPE hookCreateForHwnd(IDXGIFactory2 *factory, IUnknown *device, HWND hwnd,
+                                            const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs,
+                                            IDXGIOutput *output, IDXGISwapChain1 **sc)
+{
+    const HRESULT hr = g_orig_create_hwnd(factory, device, hwnd, desc, fs, output, sc);
+    if (SUCCEEDED(hr) && sc)
+        noteSwapchain(device, hwnd, *sc);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hookCreate(IDXGIFactory *factory, IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **sc)
+{
+    const HRESULT hr = g_orig_create(factory, device, desc, sc);
+    if (SUCCEEDED(hr) && sc && desc)
+        noteSwapchain(device, desc->OutputWindow, *sc);
+    return hr;
+}
+
+bool patchSlot(void **vtable, int index, void *hook, void **orig)
+{
+    if (vtable[index] == hook)
+        return true;
+    DWORD old = 0;
+    if (!VirtualProtect(&vtable[index], sizeof(void *), PAGE_EXECUTE_READWRITE, &old))
+        return false;
+    if (!*orig)
+        *orig = vtable[index];
+    vtable[index] = hook;
+    VirtualProtect(&vtable[index], sizeof(void *), old, &old);
+    return true;
+}
+
+HWND WINAPI hookGetForegroundWindow()
+{
+    return g_sl_focus_window;
+}
+
+// Points `func` imported from `dll` by `module` at `hook`; returns how many imports changed.
+int patchImport(HMODULE module, const char *dll, const char *func, void *hook)
+{
+    if (!module)
+        return 0;
+    auto *base = reinterpret_cast<uint8_t *>(module);
+    auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress)
+        return 0;
+    int patched = 0;
+    for (auto *imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress); imp->Name; imp++) {
+        if (_stricmp(reinterpret_cast<const char *>(base + imp->Name), dll) != 0)
+            continue;
+        auto *names = reinterpret_cast<IMAGE_THUNK_DATA *>(
+            base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        auto *addrs = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; names++, addrs++) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal))
+                continue;
+            auto *ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(base + names->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char *>(ibn->Name), func) != 0)
+                continue;
+            DWORD old = 0;
+            VirtualProtect(&addrs->u1.Function, sizeof(void *), PAGE_READWRITE, &old);
+            addrs->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
+            VirtualProtect(&addrs->u1.Function, sizeof(void *), old, &old);
+            patched++;
+        }
+    }
+    return patched;
+}
+
+constexpr D3D12_RESOURCE_STATES kSlShaderRead =
+    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+void transition(ID3D12GraphicsCommandList *list, ID3D12Resource *res, D3D12_RESOURCE_STATES from,
+                D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = res;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    list->ResourceBarrier(1, &b);
+}
+
+D3D12_RESOURCE_DESC bufferDesc(UINT64 size)
+{
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return rd;
+}
+
+} // namespace
+
+bool Dx12Fg::Impl::slStartRuntime()
+{
+    std::lock_guard<std::mutex> lock(g_sl_mutex);
+    if (g_sl_tried)
+        return g_sl_started; // once per process
+    g_sl_tried = true;
+    static std::wstring dir; // Streamline keeps the paths it is given
+    dir = exeDir();
+    g_sl_dll = LoadLibraryW((dir + L"\\sl.interposer.dll").c_str());
+    if (!g_sl_dll) {
+        log(1, "Streamline: sl.interposer.dll could not be loaded (error %lu)", GetLastError());
+        return false;
+    }
+    static const sl::Feature features[] = { sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
+    static const wchar_t *paths[1];
+    paths[0] = dir.c_str();
+    static std::wstring data;
+    wchar_t tmp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmp);
+    data = std::wstring(tmp) + L"chiaki-ng-streamline";
+    CreateDirectoryW(data.c_str(), nullptr);
+    sl::Preferences pref;
+    pref.showConsole = false;
+    pref.logLevel = sl::LogLevel::eDefault;
+    pref.pathsToPlugins = paths;
+    pref.numPathsToPlugins = 1;
+    pref.pathToLogsAndData = data.c_str();
+    // Manual hooking: Streamline hooks nothing, its proxies are asked for where they are needed.
+    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eDisableDebugText
+        | sl::PreferenceFlags::eUseManualHooking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+    pref.featuresToLoad = features;
+    pref.numFeaturesToLoad = static_cast<uint32_t>(std::size(features));
+    pref.engine = sl::EngineType::eCustom;
+    pref.engineVersion = "1.0";
+    pref.projectId = kProjectId;
+    pref.renderAPI = sl::RenderAPI::eD3D12;
+    const sl::Result r = slInit(pref, sl::kSDKVersion);
+    if (r != sl::Result::eOk) {
+        log(1, "Streamline: slInit failed (%d)", static_cast<int>(r));
+        return false;
+    }
+    g_sl_started = true;
+    return true;
+}
+
+// Called right after the device is created: gives it to Streamline and, when Streamline offers
+// DLSS Frame Generation on it, makes `queue` the native queue of a queue from its proxy device.
+bool Dx12Fg::Impl::slAttachDevice()
+{
+    sl::Result r = slSetD3DDevice(device.Get());
+    if (r != sl::Result::eOk) {
+        log(1, "Streamline: slSetD3DDevice failed (%d)", static_cast<int>(r));
+        return false;
+    }
+    sl::AdapterInfo adapter_info;
+    adapter_info.deviceLUID = reinterpret_cast<uint8_t *>(&luid);
+    adapter_info.deviceLUIDSizeInBytes = sizeof(luid);
+    r = slIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info);
+    if (r != sl::Result::eOk) {
+        sl::FeatureRequirements req;
+        if (slGetFeatureRequirements(sl::kFeatureDLSS_G, req) == sl::Result::eOk)
+            log(1, "Streamline: DLSS Frame Generation needs %sdriver %u.%u (this one %u.%u) and Windows build %u (this one %u)",
+                (req.flags & sl::FeatureRequirementFlags::eHardwareSchedulingRequired)
+                    ? "hardware-accelerated GPU scheduling, " : "",
+                req.driverVersionRequired.major, req.driverVersionRequired.minor, req.driverVersionDetected.major,
+                req.driverVersionDetected.minor, req.osVersionRequired.build, req.osVersionDetected.build);
+        log(1, "Streamline: DLSS Frame Generation is not offered on this GPU (%d; RTX 20 / RTX 30 need MFG Unlocker)",
+            static_cast<int>(r));
+        return false;
+    }
+    ID3D12Device *proxy = device.Get();
+    if (slUpgradeInterface(reinterpret_cast<void **>(&proxy)) != sl::Result::eOk || !proxy || proxy == device.Get()) {
+        log(1, "Streamline: no proxy for the D3D12 device");
+        return false;
+    }
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(proxy->CreateCommandQueue(&qd, IID_PPV_ARGS(&sl_queue)))) {
+        log(1, "Streamline: its proxy device could not create a queue");
+        return false;
+    }
+    ID3D12CommandQueue *native = nullptr;
+    if (slGetNativeInterface(sl_queue.Get(), reinterpret_cast<void **>(&native)) != sl::Result::eOk || !native) {
+        log(1, "Streamline: no native queue behind its proxy queue");
+        sl_queue.Reset();
+        return false;
+    }
+    queue = native; // a reference of our own
+    sl_device = proxy;
+    sl_route = true;
+    sl::DLSSGState state;
+    if (slDLSSGGetState(sl::ViewportHandle(0), state, nullptr) == sl::Result::eOk && state.numFramesToGenerateMax > 0)
+        sl_max_generated = std::min(static_cast<int>(state.numFramesToGenerateMax), static_cast<int>(kMaxOutputs));
+    log(0, "Streamline: DLSS Frame Generation offered, up to %u generated frames per real frame (%d used)",
+        state.numFramesToGenerateMax, sl_max_generated);
+    return true;
+}
+
+// After init: the hooks, the frame generation window, the proxy factory and what the copies need.
+bool Dx12Fg::Impl::slSetup()
+{
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = hiddenWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"chiaki_dx12fg_sl_window";
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        log(1, "Streamline: could not register its window class");
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sl_mutex);
+        if (!g_sl_hooked) {
+            // The factory hooks tell which queue Streamline presents the frame generation window
+            // with. The Present hook goes on DXGI's swapchain class (one vtable for all of its
+            // swapchains), reached through a throwaway swapchain before Streamline makes its own.
+            void **fvt = *reinterpret_cast<void ***>(factory.Get());
+            bool ok = patchSlot(fvt, 15, reinterpret_cast<void *>(&hookCreateForHwnd),
+                                reinterpret_cast<void **>(&g_orig_create_hwnd))
+                && patchSlot(fvt, 10, reinterpret_cast<void *>(&hookCreate), reinterpret_cast<void **>(&g_orig_create));
+            HWND tmp = CreateWindowExW(0, wc.lpszClassName, L"chiaki DXGI hook", WS_POPUP, 0, 0, 64, 64, nullptr, nullptr,
+                                       wc.hInstance, nullptr);
+            ComPtr<IDXGIFactory2> factory2;
+            ComPtr<IDXGISwapChain1> sc;
+            DXGI_SWAP_CHAIN_DESC1 sd = {};
+            sd.Width = 64;
+            sd.Height = 64;
+            sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            sd.SampleDesc.Count = 1;
+            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            sd.BufferCount = 2;
+            sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            ok = ok && tmp && SUCCEEDED(factory.As(&factory2))
+                && SUCCEEDED(factory2->CreateSwapChainForHwnd(queue.Get(), tmp, &sd, nullptr, nullptr, &sc));
+            if (ok) {
+                void **vt = *reinterpret_cast<void ***>(sc.Get());
+                ok = patchSlot(vt, 8, reinterpret_cast<void *>(&hookPresent), reinterpret_cast<void **>(&g_orig_present))
+                    && patchSlot(vt, 22, reinterpret_cast<void *>(&hookPresent1), reinterpret_cast<void **>(&g_orig_present1));
+            }
+            sc.Reset();
+            if (tmp)
+                DestroyWindow(tmp);
+            g_sl_hooked = ok;
+        }
+        if (!g_sl_hooked) {
+            log(1, "Streamline: DXGI's Present could not be hooked");
+            return false;
+        }
+    }
+    sl_hwnd = CreateWindowExW(0, wc.lpszClassName, L"chiaki DLSS Frame Generation (Streamline)", WS_OVERLAPPEDWINDOW, 0, 0,
+                              kHiddenWindowSize, kHiddenWindowSize * 9 / 16, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!sl_hwnd) {
+        log(1, "Streamline: could not create its hidden window");
+        return false;
+    }
+    g_sl_hwnd.store(sl_hwnd);
+    IDXGIFactory4 *proxy = factory.Get();
+    if (slUpgradeInterface(reinterpret_cast<void **>(&proxy)) != sl::Result::eOk || !proxy || proxy == factory.Get()) {
+        log(1, "Streamline: no proxy for the DXGI factory");
+        return false;
+    }
+    sl_factory = proxy;
+    ComPtr<IDXGIFactory5> factory5;
+    BOOL tearing = FALSE;
+    if (SUCCEEDED(factory.As(&factory5)))
+        factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
+    sl_tearing = tearing != FALSE;
+
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&sl_cap_fence))))
+        return false;
+    sl_cap_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    for (auto &cl : sl_cap_lists) {
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cl.allocator)))
+            || FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cl.allocator.Get(), nullptr,
+                                                IID_PPV_ARGS(&cl.list))))
+            return false;
+        cl.list->Close();
+    }
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    const D3D12_RESOURCE_DESC rd = bufferDesc(kSlReadback * kSlReadbackStride);
+    void *mapped = nullptr;
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&sl_readback)))
+        || FAILED(sl_readback->Map(0, nullptr, &mapped)))
+        return false;
+    sl_readback_ptr = static_cast<const uint8_t *>(mapped);
+    // A GPU timestamp with each copy tells when the frame was there: Streamline's present call
+    // comes before the GPU has generated the frame.
+    D3D12_QUERY_HEAP_DESC qd = {};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = static_cast<UINT>(kSlReadback);
+    if (FAILED(device->CreateQueryHeap(&qd, IID_PPV_ARGS(&sl_ts_heap))))
+        sl_ts_heap.Reset(); // then it is when the copy is seen done
+
+    // Reflex has to be on while DLSS-G runs; no Reflex sleep, chiaki paces its frames itself.
+    sl::ReflexOptions reflex;
+    reflex.mode = sl::ReflexMode::eLowLatency;
+    const sl::Result rr = slReflexSetOptions(reflex);
+    if (rr != sl::Result::eOk)
+        log(1, "Streamline: slReflexSetOptions failed (%d)", static_cast<int>(rr));
+    g_sl_trace = std::getenv("CHIAKI_DLSSG_SL_TRACE") != nullptr;
+    const char *always = std::getenv("CHIAKI_DLSSG_SL_ALWAYS");
+    if (always && always[0] == '1') {
+        std::lock_guard<std::mutex> lock(g_sl_mutex);
+        if (!g_sl_focus_window) {
+            g_sl_focus_window = CreateWindowExW(0, wc.lpszClassName, L"chiaki DLSS-G focus", WS_POPUP, 0, 0, 64, 64,
+                                                nullptr, nullptr, wc.hInstance, nullptr);
+            int patched = 0;
+            for (const wchar_t *m : { L"sl.common.dll", L"sl.dlss_g.dll", L"sl.pcl.dll", L"sl.reflex.dll", L"sl.interposer.dll" })
+                patched += patchImport(GetModuleHandleW(m), "user32.dll", "GetForegroundWindow",
+                                       reinterpret_cast<void *>(&hookGetForegroundWindow));
+            log(0, "Streamline: CHIAKI_DLSSG_SL_ALWAYS=1, frames are generated also while chiaki has no focus (%d imports)",
+                patched);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+        g_sl_capture_owner = this;
+    }
+    log(0, "Streamline ready (tearing %s); its log is in %%TEMP%%\\chiaki-ng-streamline", sl_tearing ? "allowed" : "off");
+    return true;
+}
+
+bool Dx12Fg::Impl::slSetOptions(int count)
+{
+    sl::DLSSGOptions o;
+    o.mode = sl::DLSSGMode::eOn;
+    o.numFramesToGenerate = static_cast<uint32_t>(count);
+    o.numBackBuffers = static_cast<uint32_t>(kSlBackBuffers);
+    o.colorWidth = o.mvecDepthWidth = static_cast<uint32_t>(width);
+    o.colorHeight = o.mvecDepthHeight = static_cast<uint32_t>(height + 1);
+    o.colorBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    o.mvecBufferFormat = DXGI_FORMAT_R16G16_FLOAT;
+    o.depthBufferFormat = DXGI_FORMAT_R32_FLOAT;
+    const sl::Result r = slDLSSGSetOptions(sl::ViewportHandle(0), o);
+    if (r != sl::Result::eOk) {
+        log(1, "Streamline: slDLSSGSetOptions failed (%d)", static_cast<int>(r));
+        return false;
+    }
+    sl_count_set = count;
+    return true;
+}
+
+// Frame copies not handed out yet are dropped; the ones Vulkan may still read stay taken.
+void Dx12Fg::Impl::slResetSortingLocked()
+{
+    for (auto &s : sl_ring) {
+        if (s.state == kSlCaptured)
+            s.state = kSlFree;
+    }
+    sl_records.clear();
+    sl_gens.clear();
+    sl_ready.clear();
+    sl_ready_valid = false;
+    sl_waiting = false;
+    sl_last_real = -1;
+}
+
+bool Dx12Fg::Impl::slEnsureSize(int w, int h)
+{
+    stage = "Streamline buffers";
+    // The frame in the shared buffers: w x h RGBA8, rows as D3D12 lays them out (no texture).
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = static_cast<UINT64>(w);
+    td.Height = static_cast<UINT>(h);
+    td.DepthOrArraySize = 1;
+    td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    device->GetCopyableFootprints(&td, 0, 1, 0, &color.footprint, nullptr, nullptr, &color.total);
+    color.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    color.bytes_per_texel = 4;
+    // Depth and motion as DLSS-G wants them, constant: mid-range depth, zero motion (it finds
+    // the motion itself with its optical flow).
+    bool ok = makeShared(color_buf, color.total) && makeTex(depth, w, h + 1, DXGI_FORMAT_R32_FLOAT, 4)
+        && makeTex(motion, w, h + 1, DXGI_FORMAT_R16G16_FLOAT, 4);
+    for (auto &s : sl_ring)
+        ok = ok && makeShared(s.buf, color.total);
+    ok = ok && fill({ &motion }, &depth);
+    if (ok) {
+        sl_marker_stride = ((static_cast<UINT64>(w) * 4 + kSlReadbackStride - 1) / kSlReadbackStride) * kSlReadbackStride;
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        const D3D12_RESOURCE_DESC rd = bufferDesc(sl_marker_stride * kSlots);
+        void *mapped = nullptr;
+        ok = SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                       nullptr, IID_PPV_ARGS(&sl_marker)))
+            && SUCCEEDED(sl_marker->Map(0, nullptr, &mapped));
+        if (ok) {
+            sl_marker_ptr = static_cast<uint8_t *>(mapped);
+            std::memset(sl_marker_ptr, 0, static_cast<size_t>(sl_marker_stride * kSlots));
+        }
+    }
+    if (!ok)
+        return false;
+
+    // The swapchain: the frame with the marker row under it.
+    stage = "Streamline swapchain";
+    const UINT sw = static_cast<UINT>(w), sh = static_cast<UINT>(h + 1);
+    SetWindowPos(sl_hwnd, nullptr, 0, 0, static_cast<int>(sw), static_cast<int>(sh),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    DXGI_SWAP_CHAIN_DESC1 sd = {};
+    sd.Width = sw;
+    sd.Height = sh;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = static_cast<UINT>(kSlBackBuffers);
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.Flags = sl_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    g_sl_swapchain_hooked.store(-1);
+    ComPtr<IDXGISwapChain1> sc1;
+    const HRESULT hr = sl_factory->CreateSwapChainForHwnd(sl_queue.Get(), sl_hwnd, &sd, nullptr, nullptr, &sc1);
+    if (FAILED(hr) || FAILED(sc1.As(&sl_swapchain))) {
+        log(1, "Streamline: the frame generation swapchain could not be created (0x%08x)", static_cast<unsigned>(hr));
+        return false;
+    }
+    factory->MakeWindowAssociation(sl_hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+    if (g_sl_swapchain_hooked.load() == 0) {
+        log(1, "Streamline's swapchain is not one of DXGI's usual swapchains: its frames cannot be copied back");
+        return false;
+    }
+    if (!g_sl_present_queue.load())
+        log(1, "Streamline: the queue it presents with was not seen yet");
+    for (size_t i = 0; i < kSlBackBuffers; i++) {
+        if (FAILED(sl_swapchain->GetBuffer(static_cast<UINT>(i), IID_PPV_ARGS(&sl_buffers[i])))) {
+            log(1, "Streamline: the swapchain's buffers are not available");
+            return false;
+        }
+    }
+    if (!slSetOptions(1))
+        return false;
+    sl::DLSSGState state;
+    if (slDLSSGGetState(sl::ViewportHandle(0), state, nullptr) == sl::Result::eOk) {
+        if (state.numFramesToGenerateMax > 0)
+            sl_max_generated = max_generated =
+                std::min(static_cast<int>(state.numFramesToGenerateMax), static_cast<int>(kMaxOutputs));
+        log(0, "Streamline: DLSS Frame Generation on %ux%u (frame + marker row), up to %d generated frames, about %.0f MB",
+            sw, sh, max_generated, static_cast<double>(state.estimatedVRAMUsageInBytes) / 1048576.0);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+        slResetSortingLocked();
+        sl_capture_on = true;
+    }
+    // Streamline sets DLSS-G up with the first frames it gets: a few now (whatever the buffers
+    // hold), dropped, rather than a stall at the start of the stream.
+    stage = "Streamline warm-up";
+    for (int i = 0; i < 4 && ok; i++) {
+        sl_frame = (sl_frame + 1) & kSlIdMask;
+        ok = slPresentFrame(1, i == 0, false, 0);
+        Sleep(16);
+    }
+    Sleep(100);
+    ok = waitIdle() && ok;
+    {
+        std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+        slSortLocked();
+        slResetSortingLocked();
+        // What the GPU keeps up with is measured again at this size.
+        sl_cap = max_generated;
+        sl_first_ms = sl_spacing_ms = 0.0;
+        sl_late_bits = 0;
+        sl_room_frames = 0;
+        sl_settle = 30;
+        sl_probe_wait = 600;
+        sl_probing = false;
+    }
+    if (!ok)
+        log(1, "Streamline: the warm-up frames failed");
+    return ok;
+}
+
+void Dx12Fg::Impl::slDestroySized()
+{
+    uint64_t recorded = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+        sl_capture_on = false;
+        recorded = sl_cap_seq;
+    }
+    // The copies already recorded finish before their buffers go.
+    for (int i = 0; i < 200 && sl_cap_fence && sl_cap_fence->GetCompletedValue() < recorded; i++)
+        Sleep(10);
+    if (sl_swapchain) {
+        sl::DLSSGOptions off;
+        off.mode = sl::DLSSGMode::eOff;
+        slDLSSGSetOptions(sl::ViewportHandle(0), off);
+    }
+    sl_count_set = 0;
+    for (auto &b : sl_buffers)
+        b.Reset();
+    sl_swapchain.Reset();
+    {
+        std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+        slResetSortingLocked();
+        for (auto &s : sl_ring) {
+            freeShared(s.buf);
+            s.state = kSlFree;
+            s.free_after = 0;
+        }
+    }
+    if (sl_marker)
+        sl_marker->Unmap(0, nullptr);
+    sl_marker.Reset();
+    sl_marker_ptr = nullptr;
+}
+
+// One real frame into Streamline: frame token, constants, the frame copied into the back buffer
+// with the marker row under it (the frame id in RGB, alpha 0), the tags, Present. With `signal`
+// the shared timeline gets `signal_value` once the copy is queued, on every path.
+bool Dx12Fg::Impl::slPresentFrame(int count, bool reset, bool signal, uint64_t signal_value)
+{
+    const sl::ViewportHandle viewport(0);
+    bool ok = true;
+    if (count != sl_count_set) {
+        stage = "slDLSSGSetOptions";
+        ok = slSetOptions(count);
+    }
+    sl::FrameToken *token = nullptr;
+    if (ok) {
+        stage = "slGetNewFrameToken";
+        const uint32_t index = sl_frame;
+        ok = slGetNewFrameToken(token, &index) == sl::Result::eOk && token;
+    }
+    if (ok) {
+        slPCLSetMarker(sl::PCLMarker::eSimulationStart, *token);
+        slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *token);
+        slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *token);
+        // A stationary camera, as for NGX (video carries no camera).
+        sl::Constants c = {};
+        sl::float4x4 identity;
+        identity.setRow(0, { 1, 0, 0, 0 });
+        identity.setRow(1, { 0, 1, 0, 0 });
+        identity.setRow(2, { 0, 0, 1, 0 });
+        identity.setRow(3, { 0, 0, 0, 1 });
+        c.cameraViewToClip = c.clipToCameraView = c.clipToLensClip = c.clipToPrevClip = c.prevClipToClip = identity;
+        c.jitterOffset = { 0, 0 };
+        c.mvecScale = { 1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height + 1) };
+        c.cameraPinholeOffset = { 0, 0 };
+        c.cameraPos = { 0, 0, 0 };
+        c.cameraUp = { 0, 1, 0 };
+        c.cameraRight = { 1, 0, 0 };
+        c.cameraFwd = { 0, 0, 1 };
+        c.cameraNear = 0.1f;
+        c.cameraFar = 1000.0f;
+        c.cameraFOV = 1.0f;
+        c.cameraAspectRatio = static_cast<float>(width) / static_cast<float>(height + 1);
+        c.depthInverted = sl::Boolean::eFalse;
+        c.cameraMotionIncluded = sl::Boolean::eTrue;
+        c.motionVectors3D = sl::Boolean::eFalse;
+        c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        c.orthographicProjection = sl::Boolean::eFalse;
+        c.motionVectorsDilated = sl::Boolean::eFalse;
+        c.motionVectorsJittered = sl::Boolean::eFalse;
+        stage = "slSetConstants";
+        ok = slSetConstants(c, *token, viewport) == sl::Result::eOk;
+    }
+    Slot *slot = nullptr;
+    const bool begun = ok && beginList(&slot);
+    ok = ok && begun;
+    const D3D12_RESOURCE_STATES saved_depth = depth.state, saved_motion = motion.state;
+    if (ok) {
+        const size_t slot_index = static_cast<size_t>(slot - slots.data());
+        uint8_t *marker = sl_marker_ptr + slot_index * sl_marker_stride;
+        marker[0] = static_cast<uint8_t>(sl_frame & 0xff);
+        marker[1] = static_cast<uint8_t>((sl_frame >> 8) & 0xff);
+        marker[2] = static_cast<uint8_t>((sl_frame >> 16) & 0xff);
+        marker[3] = 0;
+        stage = "copy into Streamline's back buffer";
+        // Through the proxy: DLSS-G wants GetCurrentBackBufferIndex called.
+        ID3D12Resource *bb = sl_buffers[sl_swapchain->GetCurrentBackBufferIndex() % kSlBackBuffers].Get();
+        transition(list.Get(), bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+        dst.pResource = bb;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = color_buf.res.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = color.footprint;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        src.pResource = sl_marker.Get();
+        src.PlacedFootprint.Offset = slot_index * sl_marker_stride;
+        src.PlacedFootprint.Footprint.Height = 1;
+        list->CopyTextureRegion(&dst, 0, static_cast<UINT>(height), 0, &src, nullptr);
+        transition(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+        barrier(depth, kSlShaderRead);
+        barrier(motion, kSlShaderRead);
+        sl::Resource depth_res(sl::ResourceType::eTex2d, depth.res.Get(), nullptr, nullptr, kSlShaderRead);
+        sl::Resource motion_res(sl::ResourceType::eTex2d, motion.res.Get(), nullptr, nullptr, kSlShaderRead);
+        sl::Extent extent{ 0, 0, static_cast<uint32_t>(width), static_cast<uint32_t>(height + 1) };
+        sl::ResourceTag tags[] = {
+            sl::ResourceTag(&depth_res, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent),
+            sl::ResourceTag(&motion_res, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &extent),
+        };
+        stage = "slSetTagForFrame";
+        ok = slSetTagForFrame(*token, viewport, tags, 2, reinterpret_cast<sl::CommandBuffer *>(list.Get()))
+            == sl::Result::eOk;
+    }
+    if (ok) {
+        stage = "ExecuteCommandLists";
+        ok = endList(*slot);
+    } else if (begun) {
+        // Nothing of this list runs.
+        list->Close();
+        depth.state = saved_depth;
+        motion.state = saved_motion;
+    }
+    if (signal && !signalShared(signal_value))
+        ok = false;
+    if (ok) {
+        slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *token);
+        slPCLSetMarker(sl::PCLMarker::ePresentStart, *token);
+        stage = "Present (Streamline)";
+        const HRESULT hr = sl_swapchain->Present(0, sl_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        slPCLSetMarker(sl::PCLMarker::ePresentEnd, *token);
+        if (FAILED(hr)) {
+            log(1, "Streamline: Present failed (0x%08x)", static_cast<unsigned>(hr));
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool Dx12Fg::Impl::slGenerate(int count, uint64_t wait_value, uint64_t signal_value, bool reset)
+{
+    count = std::clamp(count, 1, max_generated);
+    const double now = nowMs();
+    if (sl_t_generate > 0.0) {
+        const double dt = now - sl_t_generate;
+        if (dt > 2.0 && dt < 100.0)
+            sl_interval += (dt - sl_interval) * 0.1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+        // The frame before's generated frames that nobody took are not wanted anymore.
+        for (int s : sl_ready)
+            slFreeLocked(s);
+        sl_ready.clear();
+        sl_ready_valid = false;
+        sl_frame = (sl_frame + 1) & kSlIdMask;
+        sl_count = count;
+        sl_waiting = true;
+        sl_t_generate = now;
+    }
+    stage = "queue wait";
+    // GPU side wait for the Vulkan copy into the shared buffer.
+    if (!sized || !sl_swapchain || FAILED(queue->Wait(shared_fence.Get(), wait_value))) {
+        signalShared(signal_value);
+        return false;
+    }
+    return slPresentFrame(count, reset, true, signal_value);
+}
+
+// The Present hook, with g_sl_capture_mutex held: copies the frame being presented on
+// Streamline's window into a free slot and its marker pixel into the readback ring, on
+// Streamline's queue, ahead of the present.
+uint64_t Dx12Fg::Impl::slCapture(IDXGISwapChain *sc, UINT sync, UINT flags)
+{
+    if (!sl_capture_on)
+        return 0;
+    ID3D12CommandQueue *present_queue = g_sl_present_queue.load();
+    ComPtr<IDXGISwapChain3> sc3;
+    ComPtr<ID3D12Resource> bb;
+    if (!present_queue || FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))
+        || FAILED(sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb)))) {
+        sl_stat_skipped++;
+        return 0;
+    }
+    const D3D12_RESOURCE_DESC bd = bb->GetDesc();
+    if (bd.Width != static_cast<UINT64>(width) || bd.Height != static_cast<UINT>(height + 1)) {
+        sl_stat_skipped++; // a frame of the size before
+        return 0;
+    }
+    if (bd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && bd.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS
+        && bd.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        if (!sl_format_warned) {
+            sl_format_warned = true;
+            log(1, "Streamline presents in format %d, not RGBA8: its frames cannot be copied back", static_cast<int>(bd.Format));
+        }
+        sl_stat_skipped++;
+        return 0;
+    }
+    const uint64_t seq = sl_cap_seq;
+    SlCapList &cl = sl_cap_lists[seq % kSlCapLists];
+    if (cl.value && sl_cap_fence->GetCompletedValue() < cl.value) {
+        if (FAILED(sl_cap_fence->SetEventOnCompletion(cl.value, sl_cap_event))
+            || WaitForSingleObject(sl_cap_event, 100) != WAIT_OBJECT_0) {
+            sl_stat_skipped++;
+            return 0;
+        }
+    }
+    if (FAILED(cl.allocator->Reset()) || FAILED(cl.list->Reset(cl.allocator.Get(), nullptr))) {
+        sl_stat_skipped++;
+        return 0;
+    }
+    int slot = -1;
+    const uint64_t shared_done = shared_fence->GetCompletedValue();
+    for (size_t i = 0; i < kSlRing && slot < 0; i++) {
+        const size_t k = (sl_slot_next + i) % kSlRing;
+        const SlSlot &s = sl_ring[k];
+        if (s.state == kSlFree || (s.state == kSlTaken && shared_done >= s.free_after))
+            slot = static_cast<int>(k);
+    }
+    if (slot >= 0) {
+        sl_slot_next = (static_cast<size_t>(slot) + 1) % kSlRing;
+        sl_ring[static_cast<size_t>(slot)].state = kSlCaptured;
+    } else {
+        sl_stat_dropped++;
+    }
+    ID3D12GraphicsCommandList *l = cl.list.Get();
+    transition(l, bb.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+    src.pResource = bb.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    if (slot >= 0) {
+        dst.pResource = sl_ring[static_cast<size_t>(slot)].buf.res.Get();
+        dst.PlacedFootprint = color.footprint;
+        dst.PlacedFootprint.Footprint.Format = bd.Format;
+        const D3D12_BOX frame = { 0, 0, 0, static_cast<UINT>(width), static_cast<UINT>(height), 1 };
+        l->CopyTextureRegion(&dst, 0, 0, 0, &src, &frame);
+    }
+    dst.pResource = sl_readback.Get();
+    dst.PlacedFootprint = {};
+    dst.PlacedFootprint.Offset = (seq % kSlReadback) * kSlReadbackStride;
+    dst.PlacedFootprint.Footprint = { bd.Format, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT };
+    const D3D12_BOX marker = { 0, static_cast<UINT>(height), 0, 1, static_cast<UINT>(height + 1), 1 };
+    l->CopyTextureRegion(&dst, 0, 0, 0, &src, &marker);
+    transition(l, bb.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    if (sl_ts_heap) {
+        if (!sl_ts_freq && FAILED(present_queue->GetTimestampFrequency(&sl_ts_freq)))
+            sl_ts_freq = 0;
+        if (sl_ts_freq && nowMs() - sl_ts_calibrated > 1000.0
+            && SUCCEEDED(present_queue->GetClockCalibration(&sl_ts_gpu0, &sl_ts_cpu0)))
+            sl_ts_calibrated = nowMs();
+        const UINT q = static_cast<UINT>(seq % kSlReadback);
+        l->EndQuery(sl_ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q);
+        l->ResolveQueryData(sl_ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q, 1, sl_readback.Get(),
+                            q * kSlReadbackStride + kSlTimestampOffset);
+    }
+    if (FAILED(l->Close())) {
+        if (slot >= 0)
+            sl_ring[static_cast<size_t>(slot)].state = kSlFree;
+        sl_stat_skipped++;
+        return 0;
+    }
+    ID3D12CommandList *lists[] = { l };
+    present_queue->ExecuteCommandLists(1, lists);
+    cl.value = seq + 1;
+    present_queue->Signal(sl_cap_fence.Get(), cl.value);
+    sl_cap_seq = seq + 1;
+    sl_records.push_back({ seq, slot });
+    sl_cap_time[seq % kSlReadback] = nowMs();
+    if (!g_sl_trace)
+        return 0;
+    sl_trace_t[seq % kSlReadback] = nowMs() - sl_t_generate;
+    sl_trace_present[seq % kSlReadback] = -1.0f;
+    sl_trace_mode[seq % kSlReadback] = (sync << 16) | (flags & 0xffff);
+    return seq + 1;
+}
+
+void Dx12Fg::Impl::slFreeLocked(int slot)
+{
+    if (slot >= 0 && sl_ring[static_cast<size_t>(slot)].state == kSlCaptured)
+        sl_ring[static_cast<size_t>(slot)].state = kSlFree;
+}
+
+// Sorts the copies the GPU has finished, in presentation order: a marker with alpha 0 is a real
+// frame (its id in RGB), anything else a generated one. The generated frames presented before
+// real frame N lead up to N.
+void Dx12Fg::Impl::slSortLocked()
+{
+    if (!sl_cap_fence)
+        return;
+    const uint64_t done = sl_cap_fence->GetCompletedValue();
+    const double seen = nowMs();
+    while (!sl_records.empty() && sl_records.front().seq < done) {
+        const SlRecord rec = sl_records.front();
+        sl_records.pop_front();
+        if (sl_cap_seq - rec.seq >= kSlReadback) {
+            slFreeLocked(rec.slot); // its marker pixel has been overwritten
+            continue;
+        }
+        const uint8_t *px = sl_readback_ptr + (rec.seq % kSlReadback) * kSlReadbackStride;
+        if (g_sl_trace && sl_trace_lines < 400) {
+            const size_t k = rec.seq % kSlReadback;
+            char item[96];
+            snprintf(item, sizeof(item), " %s@%.1f(p%.1f s%u f%x)", px[3] != 0 ? "G" : "R", sl_trace_t[k],
+                     static_cast<double>(sl_trace_present[k]), sl_trace_mode[k] >> 16, sl_trace_mode[k] & 0xffff);
+            sl_trace_line += item;
+        }
+        if (px[3] != 0) {
+            const double t = sl_cap_time[rec.seq % kSlReadback];
+            // When it was there: its GPU timestamp (between the present call and now), or now.
+            double there = seen;
+            if (sl_ts_heap && sl_ts_freq) {
+                uint64_t ts = 0;
+                memcpy(&ts, px + kSlTimestampOffset, sizeof(ts));
+                const double gpu = qpcMs(sl_ts_cpu0)
+                    + (static_cast<double>(ts) - static_cast<double>(sl_ts_gpu0)) * 1000.0 / static_cast<double>(sl_ts_freq);
+                if (ts && gpu > t - 1.0 && gpu <= seen)
+                    there = gpu;
+            }
+            if (sl_gens.empty()) {
+                sl_gens_times.first_cap = t;
+                sl_gens_times.first_seen = there;
+            }
+            sl_gens_times.last_cap = t;
+            sl_gens_times.last_seen = there;
+            sl_gens.push_back(rec.slot);
+            continue;
+        }
+        slFreeLocked(rec.slot); // a real frame: chiaki has it already
+        const int64_t id = static_cast<int64_t>(px[0]) | (static_cast<int64_t>(px[1]) << 8)
+            | (static_cast<int64_t>(px[2]) << 16);
+        if (sl_waiting && id == static_cast<int64_t>(sl_frame) && !sl_ready_valid) {
+            sl_ready.swap(sl_gens);
+            sl_ready_valid = true;
+            sl_ready_times = sl_gens_times;
+        }
+        for (int s : sl_gens)
+            slFreeLocked(s);
+        sl_gens.clear();
+        sl_last_real = id;
+    }
+}
+
+bool Dx12Fg::Impl::slFramesReady()
+{
+    std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+    if (!sl_waiting)
+        return true;
+    slSortLocked();
+    if (sl_ready_valid)
+        return true;
+    const int64_t previous = static_cast<int64_t>((sl_frame - 1) & kSlIdMask);
+    if (sl_last_real == previous && static_cast<int>(sl_gens.size()) >= sl_count)
+        return true;
+    return nowMs() - sl_t_generate > slTimeoutMs();
+}
+
+// After each taken frame: whether all its generated frames were there before the next stream frame
+// was due. When most of the recent frames were late, one fewer is offered; after a while with
+// room for one more (from the times measured), one more.
+void Dx12Fg::Impl::slAdaptLocked(int n, const SlTimes &times)
+{
+    const double interval = slFrameIntervalMs();
+    const double budget = interval - 1.5; // the copy back and chiaki's own work after it
+    if (n >= 1) {
+        const double first = times.first_seen - sl_t_generate;
+        sl_first_ms = sl_first_ms > 0.0 ? sl_first_ms + (first - sl_first_ms) * 0.1 : first;
+    }
+    if (n >= 2) {
+        // From Streamline's present calls: one every frame's GPU time (or its pacing).
+        const double spacing = (times.last_cap - times.first_cap) / (n - 1);
+        sl_spacing_ms = sl_spacing_ms > 0.0 ? sl_spacing_ms + (spacing - sl_spacing_ms) * 0.1 : spacing;
+    }
+    const bool late = n < sl_count || times.last_seen - sl_t_generate > budget;
+    const int was = sl_cap;
+    if (g_sl_trace && sl_trace_lines < 400) {
+        char item[160];
+        snprintf(item, sizeof(item), " | n%d/%d seen %.1f..%.1f cap %.1f..%.1f late %d settle %d bits %x", n, sl_count,
+                 times.first_seen - sl_t_generate, times.last_seen - sl_t_generate, times.first_cap - sl_t_generate,
+                 times.last_cap - sl_t_generate, late ? 1 : 0, sl_settle, sl_late_bits & 0xffffu);
+        sl_trace_line += item;
+    }
+    if (sl_settle > 0) {
+        // After a change the frames still queued in DLSS-G come out late; not counted.
+        sl_settle--;
+        return;
+    }
+    sl_late_bits = (sl_late_bits << 1) | (late ? 1u : 0u);
+    int recent_late = 0;
+    for (uint32_t b = sl_late_bits & 0xffffu; b; b &= b - 1)
+        recent_late++;
+    if (sl_probing && ++sl_probe_frames >= 300)
+        sl_probing = false; // the one more held
+    bool probe = false;
+    if (recent_late >= 8 && sl_count > 1) {
+        // One fewer at a time: while DLSS-G is behind, the times measured are too long to go by.
+        sl_cap = sl_count - 1;
+        if (sl_probing)
+            sl_probe_wait = std::min(sl_probe_wait * 2, 18000); // tried too soon
+        sl_probing = false;
+        sl_late_bits = 0;
+        sl_room_frames = 0;
+        sl_settle = 30;
+    } else if (!late && sl_count == sl_cap && sl_cap < max_generated) {
+        // One more: soon when the times measured say it fits, otherwise now and then as a try
+        // (the times can be from a slower moment, GPU clocks still low for example).
+        const bool fits = sl_spacing_ms > 0.0 && sl_first_ms + sl_cap * sl_spacing_ms < budget - 1.5;
+        if (++sl_room_frames >= (fits ? 120 : sl_probe_wait)) {
+            sl_cap++;
+            probe = !fits;
+            sl_probing = probe;
+            sl_probe_frames = 0;
+            sl_late_bits = 0;
+            sl_room_frames = 0;
+            sl_settle = 30;
+        }
+    } else {
+        sl_room_frames = 0;
+    }
+    if (probe)
+        log(0, "Streamline: trying %d generated frames per stream frame at %dx%d again", sl_cap, width, height);
+    else if (sl_cap != was)
+        log(0, "Streamline: the GPU keeps up with %d generated frame%s per stream frame at %dx%d (the first "
+               "after %.1f ms, then one every %.1f ms, %.1f ms between stream frames), was %d",
+            sl_cap, sl_cap == 1 ? "" : "s", width, height, sl_first_ms, sl_spacing_ms, interval, was);
+}
+
+int Dx12Fg::Impl::slTakeFrames()
+{
+    std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+    if (!sl_waiting)
+        return 0;
+    slSortLocked();
+    sl_waiting = false;
+    const int64_t previous = static_cast<int64_t>((sl_frame - 1) & kSlIdMask);
+    std::vector<int> *src = sl_ready_valid ? &sl_ready : (sl_last_real == previous ? &sl_gens : nullptr);
+    const bool complete = sl_ready_valid || (src && static_cast<int>(src->size()) >= sl_count);
+    const SlTimes times = sl_ready_valid ? sl_ready_times : sl_gens_times;
+    int n = 0;
+    if (src) {
+        for (int s : *src) {
+            if (s >= 0 && n < sl_count) {
+                SlSlot &taken = sl_ring[static_cast<size_t>(s)];
+                taken.state = kSlTaken;
+                // Every value after the current one on the shared timeline comes after the Vulkan
+                // copy out of this slot (it is submitted next).
+                taken.free_after = last_value + 1;
+                sl_taken[static_cast<size_t>(n++)] = s;
+            } else {
+                slFreeLocked(s);
+            }
+        }
+        src->clear();
+    }
+    sl_ready_valid = false;
+    // A real frame presented without any generated one: DLSS-G is paused (no window of chiaki
+    // has the focus) or started over; that says nothing about what the GPU keeps up with.
+    if (n > 0 || !complete)
+        slAdaptLocked(n, times);
+
+    const double now = nowMs();
+    const double waited = now - sl_t_generate;
+    sl_stat_frames++;
+    sl_stat_gens += static_cast<uint64_t>(n);
+    if (n < sl_count)
+        sl_stat_short++;
+    if (!complete)
+        sl_stat_timeouts++;
+    sl_stat_wait_ms += waited;
+    if (g_sl_trace && sl_trace_lines < 400) {
+        sl_trace_lines++;
+        log(0, "Streamline trace, frame %u taken at %.1f ms:%s", sl_frame, waited, sl_trace_line.c_str());
+        sl_trace_line.clear();
+    }
+    if (sl_traced < 4) {
+        sl_traced++;
+        log(0, "Streamline: frame %u, %d of %d generated frames back after %.1f ms", sl_frame, n, sl_count, waited);
+    }
+    if (sl_stat_logged == 0.0)
+        sl_stat_logged = now;
+    if (now - sl_stat_logged > 10000.0) {
+        log(0, "Streamline: %llu frames, %.2f generated frames each (%d asked), %llu short, %llu not complete in time, "
+               "%.1f ms until they were in; copies dropped %llu, skipped %llu",
+            static_cast<unsigned long long>(sl_stat_frames), static_cast<double>(sl_stat_gens) / sl_stat_frames, sl_count,
+            static_cast<unsigned long long>(sl_stat_short), static_cast<unsigned long long>(sl_stat_timeouts),
+            sl_stat_wait_ms / sl_stat_frames, static_cast<unsigned long long>(sl_stat_dropped),
+            static_cast<unsigned long long>(sl_stat_skipped));
+        sl_stat_frames = sl_stat_gens = sl_stat_short = sl_stat_timeouts = sl_stat_dropped = sl_stat_skipped = 0;
+        sl_stat_wait_ms = 0.0;
+        sl_stat_logged = now;
+    }
+    return n;
+}
+#endif // CHIAKI_HAVE_STREAMLINE
 
 bool Dx12Fg::Impl::waitIdle()
 {
@@ -872,7 +2210,9 @@ bool Dx12Fg::Impl::initNgx()
         log(1, "NGX D3D12 parameter allocation failed: %s", ngxResultString(r));
         return false;
     }
-    if (fg_available)
+    if (sl_route)
+        ; // frame generation goes through Streamline
+    else if (fg_available)
         log(0, "DLSS Frame Generation (D3D12) available, up to %d generated frames", max_generated);
     else
         log(1, "DLSS Frame Generation is not available through NGX D3D12 on this GPU");
@@ -1345,6 +2685,10 @@ void Dx12Fg::Impl::destroySized()
 {
     if (queue)
         waitIdle();
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (sl_route)
+        slDestroySized();
+#endif
     releaseFeature();
     freeShared(color_buf);
     freeShared(motion_buf);
@@ -2099,6 +3443,22 @@ Dx12Fg::~Dx12Fg()
     Impl &d = *impl;
     d.destroySized();
     d.destroyNr();
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (d.sl_hwnd) {
+        {
+            std::lock_guard<std::mutex> lock(g_sl_capture_mutex);
+            if (g_sl_capture_owner == &d)
+                g_sl_capture_owner = nullptr;
+        }
+        if (g_sl_hwnd.load() == d.sl_hwnd)
+            g_sl_hwnd.store(nullptr);
+        DestroyWindow(d.sl_hwnd);
+    }
+    if (d.sl_readback)
+        d.sl_readback->Unmap(0, nullptr);
+    if (d.sl_cap_event)
+        CloseHandle(d.sl_cap_event);
+#endif
     if (d.semaphore)
         d.vkDestroySemaphore(d.vk.device, d.semaphore, nullptr);
     if (d.params)
@@ -2137,12 +3497,39 @@ bool Dx12Fg::init()
         return false;
     // Give the NGX provider time to hook the swapchain calls after the first device.
     Sleep(60);
-    return d.createSwapchain() && d.initNgx() && d.createSharedFence();
+    if (!d.createSwapchain() || !d.initNgx() || !d.createSharedFence())
+        return false;
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (d.sl_route) {
+        if (d.slSetup()) {
+            d.fg_available = true;
+            d.max_generated = d.sl_max_generated;
+        } else {
+            d.log(1, "Streamline could not be set up; DLSS Frame Generation goes through NGX");
+            d.sl_route = false;
+        }
+    }
+#endif
+    return true;
 }
 
 int Dx12Fg::maxGenerated() const
 {
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (impl->sl_route)
+        return std::max(1, std::min(impl->max_generated, impl->sl_cap));
+#endif
     return impl->max_generated;
+}
+
+void Dx12Fg::setFrameInterval(float ms)
+{
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (std::isfinite(ms) && ms > 1.0f && ms < 200.0f)
+        impl->sl_stream_interval = ms;
+#else
+    (void)ms;
+#endif
 }
 
 bool Dx12Fg::sizeMatches(int w, int h) const
@@ -2167,6 +3554,18 @@ bool Dx12Fg::ensureSize(int w, int h)
     }
     d.width = w;
     d.height = h;
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (d.sl_route) {
+        if (!d.slEnsureSize(w, h)) {
+            d.log(1, "Streamline: frame generation could not be set up for %dx%d", w, h);
+            d.destroySized();
+            return false;
+        }
+        d.sized = true;
+        d.log(0, "DLSS Frame Generation (Streamline) ready: %dx%d", w, h);
+        return true;
+    }
+#endif
     d.stage = "textures";
     bool ok = d.makeTex(d.color, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) &&
               d.makeTex(d.motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4) && d.makeTex(d.depth, w, h, DXGI_FORMAT_R32_FLOAT, 4);
@@ -2230,6 +3629,8 @@ void Dx12Fg::recordColor(VkCommandBuffer cmd, VkImage image)
 void Dx12Fg::recordMotion(VkCommandBuffer cmd, VkImage image)
 {
     Impl &d = *impl;
+    if (!d.motion_buf.buffer)
+        return; // Streamline: DLSS-G finds the motion itself
     VkBufferImageCopy region = {};
     region.bufferRowLength = d.motion.footprint.Footprint.RowPitch / d.motion.bytes_per_texel;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2241,19 +3642,54 @@ void Dx12Fg::recordMotion(VkCommandBuffer cmd, VkImage image)
 void Dx12Fg::recordDownload(VkCommandBuffer cmd, VkImage image, int index)
 {
     Impl &d = *impl;
-    const Impl::Tex &out = d.outs[static_cast<size_t>(index)];
+    const Impl::Tex *out = &d.outs[static_cast<size_t>(index)];
+    VkBuffer buffer = d.out_bufs[static_cast<size_t>(index)].buffer;
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (d.sl_route) {
+        // The index-th generated frame takeFrames() handed out, in its frame slot.
+        out = &d.color;
+        buffer = d.sl_ring[static_cast<size_t>(d.sl_taken[static_cast<size_t>(index)])].buf.buffer;
+    }
+#endif
     VkBufferImageCopy region = {};
-    region.bufferRowLength = out.footprint.Footprint.RowPitch / out.bytes_per_texel;
+    region.bufferRowLength = out->footprint.Footprint.RowPitch / out->bytes_per_texel;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1;
     region.imageExtent = { static_cast<uint32_t>(d.width), static_cast<uint32_t>(d.height), 1 };
-    d.vkCmdCopyBufferToImage(cmd, d.out_bufs[static_cast<size_t>(index)].buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    d.vkCmdCopyBufferToImage(cmd, buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+}
+
+bool Dx12Fg::asyncFrames() const
+{
+    return impl->sl_route;
+}
+
+bool Dx12Fg::framesReady()
+{
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (impl->sl_route)
+        return impl->slFramesReady();
+#endif
+    return true;
+}
+
+int Dx12Fg::takeFrames()
+{
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (impl->sl_route)
+        return impl->slTakeFrames();
+#endif
+    return 0;
 }
 
 bool Dx12Fg::generate(int count, uint64_t wait_value, uint64_t signal_value, bool reset, bool use_motion,
                       float mvec_scale_x, float mvec_scale_y)
 {
     Impl &d = *impl;
+#if defined(CHIAKI_HAVE_STREAMLINE)
+    if (d.sl_route)
+        return d.slGenerate(count, wait_value, signal_value, reset);
+#endif
     count = std::clamp(count, 1, d.max_generated);
     d.stage = "queue wait";
     // GPU side wait for the Vulkan copies; the fence value is set by Vulkan.
@@ -2608,6 +4044,12 @@ std::shared_ptr<Dx12Fg> Dx12Fg::shared(const VulkanDevice &vk, LogFn log, void *
         return nullptr;
     instance = created;
     instance_device = vk.device;
+    if (created->impl->sl_route) {
+        // Streamline is given one device for the process: this instance stays (never destroyed,
+        // also not at exit, after the Vulkan device is gone).
+        static auto *kept = new std::shared_ptr<Dx12Fg>();
+        *kept = created;
+    }
     return created;
 }
 

@@ -207,6 +207,26 @@ jobs:
           if (-not (Test-Path "lib\Windows_x86_64\rel\nvngx_dlssg.dll")) { throw "DLSS Frame Generation runtime missing" }
           if (-not (Test-Path "lib\Windows_x86_64\rel\nvngx_dlss.dll")) { throw "DLSS Super Resolution runtime missing" }
 
+      # DLSS Frame Generation through Streamline: MFG Unlocker opens DLSS-G on RTX 20 / RTX 30 for
+      # Streamline only. The release zip is checked against GitHub's digest of the asset.
+      - name: Fetch NVIDIA Streamline SDK (DLSS Frame Generation through Streamline)
+        run: |
+          $zip = "streamline-sdk-v2.14.16.zip"
+          Invoke-WebRequest -Uri "https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.16/$zip" -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "32041e51db0cab709a271b72a352281b690c2abbd669a827809401a5dd23956b") { throw "Streamline SDK digest mismatch: $hash" }
+          New-Item -ItemType Directory -Force sl-sdk | Out-Null
+          tar -xf $zip -C sl-sdk
+          if ($LASTEXITCODE -ne 0) { throw "Streamline SDK unpacking failed" }
+          Remove-Item $zip
+          $header = Get-ChildItem sl-sdk -Recurse -Filter sl.h | Where-Object { $_.Directory.Name -eq "include" } | Select-Object -First 1
+          if (-not $header) { throw "Streamline headers missing" }
+          $root = $header.Directory.Parent.FullName
+          foreach ($dll in "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll") {
+            if (-not (Test-Path "$root\bin\x64\$dll")) { throw "Streamline runtime $dll missing" }
+          }
+          "SL_SDK_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Fetch AMD FidelityFX SDK (FSR 3.1 Frame Generation)
         run: |
           git clone --depth 1 --branch v1.1.4 --filter=blob:none --no-checkout https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git ffx-sdk
@@ -232,6 +252,7 @@ jobs:
           -DCHIAKI_ENABLE_STEAMDECK_NATIVE=OFF `
           -DCHIAKI_ENABLE_NGX=ON `
           -DCHIAKI_NGX_SDK_DIR="${{ github.workspace }}\ngx-sdk" `
+          -DCHIAKI_STREAMLINE_SDK_DIR="${env:SL_SDK_DIR}" `
           -DCHIAKI_ENABLE_FFX=ON `
           -DCHIAKI_FFX_SDK_DIR="${{ github.workspace }}\ffx-sdk" `
           -DPYTHON_EXECUTABLE="${{ env.pythonLocation }}\python.exe" `
@@ -280,11 +301,16 @@ jobs:
           # DLSS Super Resolution: upscaling after DLSS 5 neural rendering on NVIDIA
           cp "${{ github.workspace }}\ngx-sdk\lib\Windows_x86_64\rel\nvngx_dlss.dll" chiaki-ng-Win
           cp "${{ github.workspace }}\ffx-sdk\PrebuiltSignedDLL\amd_fidelityfx_vk.dll" chiaki-ng-Win
+          # Streamline (MIT): DLSS Frame Generation through Streamline, only used when MFG Unlocker's
+          # version.dll is next to chiaki.exe (or CHIAKI_DLSSG_ROUTE=sl); nvngx_dlssg.dll is the one above.
+          foreach ($dll in "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll") { cp "${env:SL_SDK_DIR}\bin\x64\$dll" chiaki-ng-Win }
           # Downloads the NVIDIA VFG / RTX VSR runtime on demand (not redistributed)
           cp scripts\install-nvidia-vfx.ps1 chiaki-ng-Win
           mkdir chiaki-ng-Win\licenses
           cp "${{ github.workspace }}\ngx-sdk\LICENSE.txt" chiaki-ng-Win\licenses\NVIDIA-DLSS-SDK-LICENSE.txt
           cp "${{ github.workspace }}\ffx-sdk\LICENSE.txt" chiaki-ng-Win\licenses\AMD-FidelityFX-SDK-LICENSE.txt
+          cp "${env:SL_SDK_DIR}\license.txt" chiaki-ng-Win\licenses\NVIDIA-Streamline-SDK-LICENSE.txt
+          if (Test-Path "${env:SL_SDK_DIR}\bin\x64\reflex.license.txt") { cp "${env:SL_SDK_DIR}\bin\x64\reflex.license.txt" chiaki-ng-Win\licenses\NVIDIA-Reflex-LICENSE.txt }
           windeployqt.exe --no-translations --qmldir=gui\src\qml --release chiaki-ng-Win\chiaki.exe
 
       # Debug symbols for crash dumps (not shipped in the packages).
