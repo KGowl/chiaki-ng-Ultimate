@@ -8,7 +8,7 @@ The `d3d12-bridge` branch adds **DLSS 5 neural rendering** and **DLSS Frame Gene
 
 Everything else (setup, registration, controllers, Steam Deck usage) works as in upstream chiaki-ng – see its [documentation site](https://streetpea.github.io/chiaki-ng/).
 
-## Latest release: [1.10.0-dlss5.6](https://github.com/windystrife/chiaki-ng-Ultimate/releases/tag/1.10.0-dlss5.6) (20 November 2026)
+## Latest release: [1.10.0-dlss5.7](https://github.com/windystrife/chiaki-ng-Ultimate/releases/tag/1.10.0-dlss5.7) (21 November 2026)
 
 DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Radeon** (Windows):
 
@@ -20,6 +20,7 @@ DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Rade
 
 <sub>GTA VI © Rockstar Games. Screenshots from real PS5 Remote Play streams, for illustration.</sub>
 
+- **New in 5.7: DLSS Frame Generation on RTX 20 / RTX 30.** With [MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker) next to `chiaki.exe` as `version.dll` (the kit offers to download it), chiaki-ng runs DLSS FG through NVIDIA Streamline: on an RTX 3070, 2x at 1080p and 4x at 720p, and chiaki-ng lowers the multiplier by itself when the card cannot keep up.
 - **New in 5.6: DLSS Frame Generation next to DLSS 5 on NVIDIA** goes straight to the pipelined D3D12 path (NGX refuses Vulkan DLSS FG once DLSS 5 has its D3D12 side up), and **one setup kit for NVIDIA and AMD** (`setup.cmd`) that also gets DLSS 5's `nvngx_dlssnr.dll` and, on AMD, installs and sets up NeuralHub.
 - **4x frame generation keeps up with DLSS 5**: the next stream frame's DLSS work runs while the generated frames are shown. RX 9070 XT, GTA VI at 30 fps, DLSS 5 to 2160p, 4x on a 150 Hz screen: **118 fps** (1.10.0-dlss5.4: about 90).
 - **RTX settings panel** while streaming, on every GPU: DLSS 5 on/off, upscaling, sharpness, frame generation Off / 2x / 3x / 4x and the stats overlay; on NVIDIA also the DLSS 5 model, 1–3 passes and their controls.
@@ -27,10 +28,10 @@ DLSS 5 and DLSS Frame Generation in PS5 Remote Play on **NVIDIA RTX and AMD Rade
 
 | You have | Get | Then |
 |---|---|---|
-| AMD Radeon | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-dlss5-setup-full.zip) | Unzip the kit and run `setup.cmd`: it installs NeuralHub, imports the DLSS DLLs into it and sets up chiaki-ng |
-| NVIDIA RTX | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-dlss5-setup-full.zip), or [`setup.exe`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-ng-1.10.0-dlss5.6-win_x64-setup.exe) / the portable zip | Unzip the kit and run `setup.cmd`: it finds `nvngx_dlssnr.dll` (DLSS NR 310.9.16, not bundled) on the PC or downloads it, and copies it next to `chiaki.exe` (by hand: copy it there yourself) |
+| AMD Radeon | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.7/chiaki-dlss5-setup-full.zip) | Unzip the kit and run `setup.cmd`: it installs NeuralHub, imports the DLSS DLLs into it and sets up chiaki-ng |
+| NVIDIA RTX | [`chiaki-dlss5-setup-full.zip`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.7/chiaki-dlss5-setup-full.zip), or [`setup.exe`](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.7/chiaki-ng-1.10.0-dlss5.7-win_x64-setup.exe) / the portable zip | Unzip the kit and run `setup.cmd`: it finds `nvngx_dlssnr.dll` (DLSS NR 310.9.16, not bundled) on the PC or downloads it, and copies it next to `chiaki.exe` (by hand: copy it there yourself). On RTX 20 / RTX 30 it also offers MFG Unlocker for DLSS Frame Generation |
 
-Setup guides: [English (PDF)](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-ng-dlss5-guide-en.pdf), [Tiếng Việt (PDF)](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.6/chiaki-ng-dlss5-huong-dan.pdf). Full notes on the [release page](https://github.com/windystrife/chiaki-ng-Ultimate/releases/tag/1.10.0-dlss5.6).
+Setup guides: [English (PDF)](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.7/chiaki-ng-dlss5-guide-en.pdf), [Tiếng Việt (PDF)](https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.7/chiaki-ng-dlss5-huong-dan.pdf). Full notes on the [release page](https://github.com/windystrife/chiaki-ng-Ultimate/releases/tag/1.10.0-dlss5.7).
 
 ## Downloads
 
@@ -42,7 +43,7 @@ Releases and pre-releases are published on the [Releases](../../releases) page (
 | `chiaki-ng-*-win_x64-portable.zip` | Windows x64 portable |
 | `chiaki-ng-*-linux_x86_64.AppImage` | Linux x86_64 (`chmod +x`, then run) |
 
-DLSS 5 builds from the `d3d12-bridge` branch use tags like `1.10.0-dlss5.6` and also ship:
+DLSS 5 builds from the `d3d12-bridge` branch use tags like `1.10.0-dlss5.7` and also ship:
 
 | File | Contents |
 |---|---|
