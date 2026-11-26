@@ -8,6 +8,9 @@
 #include <deque>
 #include <vector>
 
+// (std::max) / (std::min) in parentheses: windows.h, included before this header in some files,
+// defines max and min as macros.
+
 // Tells a Remote Play stream frame that repeats the last picture from a new picture.
 //
 // The PS5 always sends 60 frames a second. A game that renders fewer (30 fps, 20 fps, or a rate
@@ -121,7 +124,7 @@ public:
         double sum = 0.0;
         for (size_t i = 0; i < cur.size(); i++) {
             const double d = std::fabs(static_cast<double>(cur[i]) - static_cast<double>(ref[i]));
-            max_diff = std::max(max_diff, d);
+            max_diff = (std::max)(max_diff, d);
             sum += d;
         }
         r.compared = true;
@@ -159,7 +162,7 @@ public:
                 means.clear();
                 means.push_back(r.mean_diff);
             } else {
-                sure = std::fabs(std::log(std::max(r.mean_diff, 1e-9) / r.line)) / std::log(hi / r.line);
+                sure = std::fabs(std::log((std::max)(r.mean_diff, 1e-9) / r.line)) / std::log(hi / r.line);
                 r.rule = "bands";
             }
         }
@@ -168,7 +171,7 @@ public:
             if (last_new_mean > 0.0) {
                 const double limit = repeats_in_row == 0
                     ? kRepeatRatio * last_new_mean
-                    : std::max(2.5 * last_repeat_mean, kChainRatio * last_new_mean);
+                    : (std::max)(2.5 * last_repeat_mean, kChainRatio * last_new_mean);
                 is_new = !(r.mean_diff < limit);
             }
         }
@@ -265,7 +268,7 @@ private:
         std::vector<double> xs(means.begin(), means.end());
         std::sort(xs.begin(), xs.end());
         const double n = static_cast<double>(xs.size() - 1);
-        lo = std::max(xs[static_cast<size_t>(std::lround(0.2 * n))], 1e-3 / 255.0);
+        lo = (std::max)(xs[static_cast<size_t>(std::lround(0.2 * n))], 1e-3 / 255.0);
         hi = xs[static_cast<size_t>(std::lround(0.8 * n))];
         return hi > kLearnRatio * lo;
     }
