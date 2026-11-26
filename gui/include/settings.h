@@ -394,6 +394,10 @@ class Settings : public QObject
 		void SetZoomFactor(float factor);
 
 		float GetPacketLossReportedMax() const;
+		// The CPU copy of every decoded D3D11 frame kept for loss recovery (snapshotLastFrame).
+		// Off by default: the frame itself is kept (as for Vulkan frames), the copy cost ~1.5 ms
+		// per 1080p 10-bit frame on the frame thread. settings/snapshot_cpu_fallback=true restores it.
+		bool GetSnapshotCpuFallback() const;
 		void SetPacketLossReportedMax(float reported_max);
 
 		RegisteredHost GetAutoConnectHost() const;

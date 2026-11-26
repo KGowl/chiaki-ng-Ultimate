@@ -2456,12 +2456,16 @@ static AVFrame *clone_frame_for_replay(const AVFrame *frame)
     return av_frame_clone(frame);
 }
 
-static AVFrame *make_fallback_snapshot_frame(const AVFrame *frame)
+static AVFrame *make_fallback_snapshot_frame(const AVFrame *frame, bool d3d11_copy)
 {
     if (!frame)
         return nullptr;
 
-    if (!frame->hw_frames_ctx || frame->format == AV_PIX_FMT_VULKAN)
+    // Vulkan frames, and D3D11 frames unless asked for: the kept frame itself is replayed (its
+    // reference keeps the decoder surface alive through a flush). The CPU copy of a D3D11 frame
+    // costs ~1.5 ms per 1080p 10-bit frame (RTX 3080), on the frame thread, for every frame.
+    if (!frame->hw_frames_ctx || frame->format == AV_PIX_FMT_VULKAN ||
+        (frame->format == AV_PIX_FMT_D3D11 && !d3d11_copy))
         return nullptr;
 
     AVFrame *copy = av_frame_alloc();
@@ -4319,7 +4323,8 @@ void QmlMainWindow::snapshotLastFrame(AVFrame *frame, double pts, float duration
         }
     }
     clone->opaque = this;
-    AVFrame *fallback_clone = make_fallback_snapshot_frame(frame);
+    static const bool d3d11_copy = settings && settings->GetSnapshotCpuFallback();
+    AVFrame *fallback_clone = make_fallback_snapshot_frame(frame, d3d11_copy);
     {
         QMutexLocker locker(&kept_frame_mutex);
         if (kept_frame)
@@ -4332,7 +4337,8 @@ void QmlMainWindow::snapshotLastFrame(AVFrame *frame, double pts, float duration
         stored = true;
         reason = "stored";
         fallback_frame = fallback_clone;
-        if (!fallback_clone && frame->hw_frames_ctx && frame->format != AV_PIX_FMT_VULKAN)
+        if (!fallback_clone && frame->hw_frames_ctx && frame->format != AV_PIX_FMT_VULKAN &&
+            (frame->format != AV_PIX_FMT_D3D11 || d3d11_copy))
             qCWarning(chiakiGui) << "snapshotLastFrame: failed to create fallback frame";
     }
     snapshot_generation.fetchAndAddRelaxed(1);

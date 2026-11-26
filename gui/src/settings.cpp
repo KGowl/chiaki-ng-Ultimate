@@ -754,6 +754,11 @@ void Settings::SetZoomFactor(float factor)
 	settings.setValue("settings/zoom_factor", QString("%1").arg(factor, 0, 'f', 2));
 }
 
+bool Settings::GetSnapshotCpuFallback() const
+{
+	return settings.value("settings/snapshot_cpu_fallback", false).toBool();
+}
+
 float Settings::GetPacketLossReportedMax() const
 {
 	if (settings.contains("settings/packet_loss_reported_max"))
