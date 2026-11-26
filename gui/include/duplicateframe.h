@@ -107,10 +107,13 @@ public:
         const int gw = luma.width / kBlock;
         const int gh = luma.height / kBlock;
         if (gw != grid_w || gh != grid_h) {
+            // No grid while ref changes size: a failed allocation must not leave the new grid
+            // with the old ref.
+            grid_w = grid_h = 0;
+            have_ref = false;
+            ref.assign(static_cast<size_t>(gw) * static_cast<size_t>(gh), 0.0f);
             grid_w = gw;
             grid_h = gh;
-            ref.assign(static_cast<size_t>(gw) * static_cast<size_t>(gh), 0.0f);
-            have_ref = false;
         }
         cur.resize(ref.size());
         blockMeans(luma, cur);
@@ -118,6 +121,7 @@ public:
             ref.swap(cur);
             have_ref = true;
             r.rule = "first";
+            r.reset = damaged; // a loss together with a change of size
             return takeNew(r, -1.0);
         }
         double max_diff = 0.0;
@@ -233,7 +237,8 @@ private:
     static bool usable(const Luma &l)
     {
         return l.data && l.width >= kBlock * 4 && l.height >= kBlock * 4 && (l.bytes == 1 || l.bytes == 2)
-            && l.max_value > 0.0 && l.linesize >= l.width * l.bytes;
+            && l.max_value >= 1.0 && std::isfinite(l.max_value)
+            && static_cast<int64_t>(l.linesize) >= static_cast<int64_t>(l.width) * l.bytes;
     }
 
     void blockMeans(const Luma &l, std::vector<float> &out) const

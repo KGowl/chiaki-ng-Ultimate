@@ -425,6 +425,16 @@ private:
     // its D3D12 GPU time in hundredths of a millisecond.
     QAtomicInteger<int> nr_status_state = 0;
     QAtomicInteger<int> nr_status_gpu_cms = 0;
+    // Frame generation's and RTX VSR's GPU time in 1/100 ms, written by the render thread (the stats timer
+    // must not reach into their objects, which the render thread may be destroying).
+    QAtomicInteger<int> fg_status_gpu_cms = 0;
+    QAtomicInteger<int> vsr_status_gpu_cms = 0;
+    // The window's screen as the GUI thread last saw it, for the render thread: a QScreen can be deleted on
+    // the GUI thread (a monitor unplugged, switched off or switched to another input) while the render
+    // thread would read it.
+    std::atomic<double> screen_refresh_hz{60.0};
+    std::atomic<double> screen_dpr{1.0};
+    void cacheScreenState();
     QAtomicInteger<int> nr_status_out_h = 0; // output height when neural rendering upscales, else 0
     QAtomicInteger<int> nr_status_hdr = 0;
     // 1 while the End key has switched neural rendering off (this run only, the setting

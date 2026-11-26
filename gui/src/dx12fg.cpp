@@ -629,6 +629,9 @@ struct Dx12Fg::Impl
     PFN_vkDestroySemaphore vkDestroySemaphore = nullptr;
     PFN_vkImportSemaphoreWin32HandleKHR vkImportSemaphoreWin32HandleKHR = nullptr;
     PFN_vkSignalSemaphore vkSignalSemaphore = nullptr;
+    // Optional (Vulkan 1.2 / VK_KHR_timeline_semaphore), for signalFromHost().
+    PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue = nullptr;
+    PFN_vkWaitSemaphores vkWaitSemaphores = nullptr;
     PFN_vkCmdCopyImageToBuffer vkCmdCopyImageToBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = nullptr;
     VkPhysicalDeviceMemoryProperties memory_props = {};
@@ -756,6 +759,8 @@ struct Dx12Fg::Impl
     double nr_gpu_ms = 0.0;
     // The runtime crashed while one of the users called it; never handed out again.
     bool crashed = false;
+    // Host waits for D3D12 GPU work that gave up (waitIdle, beginList).
+    uint32_t gpu_wait_timeouts = 0;
 
     // ---- NeuralHub's in-game panel (its key, End by default), NeuralHub route only ----
     // NeuralHub polls its keys and draws its panel when it sees its swapchain presented, so
@@ -984,6 +989,16 @@ bool Dx12Fg::Impl::loadVulkan()
     DX12FG_VK(vkCmdCopyImageToBuffer)
     DX12FG_VK(vkCmdCopyBufferToImage)
 #undef DX12FG_VK
+    // Not required: without them signalFromHost() reads the fence and does not wait.
+    vkGetSemaphoreCounterValue = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
+        vk.get_instance_proc_addr(vk.instance, "vkGetSemaphoreCounterValue"));
+    if (!vkGetSemaphoreCounterValue)
+        vkGetSemaphoreCounterValue = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
+            vk.get_instance_proc_addr(vk.instance, "vkGetSemaphoreCounterValueKHR"));
+    vkWaitSemaphores = reinterpret_cast<PFN_vkWaitSemaphores>(vk.get_instance_proc_addr(vk.instance, "vkWaitSemaphores"));
+    if (!vkWaitSemaphores)
+        vkWaitSemaphores = reinterpret_cast<PFN_vkWaitSemaphores>(
+            vk.get_instance_proc_addr(vk.instance, "vkWaitSemaphoresKHR"));
     if (!ok) {
         log(1, "the Vulkan device cannot share memory with D3D12 (VK_KHR_external_memory_win32 and "
                "VK_KHR_external_semaphore_win32 missing?)");
@@ -2169,6 +2184,7 @@ bool Dx12Fg::Impl::waitIdle()
         if (FAILED(idle_fence->SetEventOnCompletion(value, idle_event)))
             return false;
         if (WaitForSingleObject(idle_event, 15000) != WAIT_OBJECT_0) {
+            gpu_wait_timeouts++;
             log(1, "the D3D12 GPU work did not finish within 15 s");
             return false;
         }
@@ -2511,6 +2527,7 @@ bool Dx12Fg::Impl::beginList(Slot **out_slot)
     if (slot.done_value && idle_fence->GetCompletedValue() < slot.done_value) {
         if (FAILED(idle_fence->SetEventOnCompletion(slot.done_value, idle_event)) ||
             WaitForSingleObject(idle_event, 15000) != WAIT_OBJECT_0) {
+            gpu_wait_timeouts++;
             log(1, "a D3D12 command allocator stayed busy for 15 s");
             return false;
         }
@@ -3780,6 +3797,27 @@ int Dx12Fg::takeFrames()
     return 0;
 }
 
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+// Test hook (dev builds only): CHIAKI_DX12FG_CRASH=fg:N (or nr:N) raises an access violation in the
+// N-th generate() (neuralRender()) where the runtime's evaluation would run, after the queue waits
+// for Vulkan and before the shared fence is signalled, as a crash inside the runtime does.
+static void testCrash(const char *what)
+{
+    static const std::string spec = [] {
+        const char *v = std::getenv("CHIAKI_DX12FG_CRASH");
+        return std::string(v ? v : "");
+    }();
+    static int fg_calls = 0;
+    static int nr_calls = 0;
+    const size_t len = std::strlen(what);
+    if (spec.size() <= len + 1 || spec.compare(0, len, what) != 0 || spec[len] != ':')
+        return;
+    int &calls = std::strcmp(what, "fg") == 0 ? fg_calls : nr_calls;
+    if (++calls == std::atoi(spec.c_str() + len + 1))
+        RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+}
+#endif
+
 bool Dx12Fg::generate(int count, uint64_t wait_value, uint64_t signal_value, bool reset, bool use_motion,
                       float mvec_scale_x, float mvec_scale_y)
 {
@@ -3807,6 +3845,9 @@ bool Dx12Fg::generate(int count, uint64_t wait_value, uint64_t signal_value, boo
             d.copyBufferToTex(d.color, d.color_buf.res.Get());
             if (use_motion)
                 d.copyBufferToTex(d.motion, d.motion_buf.res.Get());
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+            testCrash("fg");
+#endif
             ok = d.evaluate(count, reset, mvec_scale_x, mvec_scale_y);
             for (int i = 0; ok && i < count; i++)
                 d.copyTexToBuffer(d.out_bufs[static_cast<size_t>(i)].res.Get(), d.outs[static_cast<size_t>(i)]);
@@ -4063,6 +4104,9 @@ bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset
             d.copyBufferToTex(d.nr_in, d.nr_in_buf.res.Get());
             if (timed)
                 d.list->EndQuery(d.nr_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+            testCrash("nr");
+#endif
             ok = d.nrEvaluate(reset);
             if (ok && timed) {
                 d.list->EndQuery(d.nr_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
@@ -4120,6 +4164,46 @@ void Dx12Fg::markCrashed()
 bool Dx12Fg::crashed() const
 {
     return impl->crashed;
+}
+
+void Dx12Fg::signalFromHost(uint64_t value)
+{
+    Impl &d = *impl;
+    if (!d.semaphore || !d.vkSignalSemaphore || value == 0)
+        return;
+    auto reached = [&d]() -> uint64_t {
+        uint64_t current = 0;
+        if (d.vkGetSemaphoreCounterValue
+            && d.vkGetSemaphoreCounterValue(d.vk.device, d.semaphore, &current) == VK_SUCCESS)
+            return current;
+        // Reading a fence does not call into the runtime.
+        return d.shared_fence ? d.shared_fence->GetCompletedValue() : 0;
+    };
+    if (reached() >= value)
+        return;
+    if (value > 1 && d.vkWaitSemaphores) {
+        const uint64_t before = value - 1;
+        VkSemaphoreWaitInfo wait_info = {};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &d.semaphore;
+        wait_info.pValues = &before;
+        d.vkWaitSemaphores(d.vk.device, &wait_info, 1000000000ull);
+        if (reached() >= value)
+            return;
+    }
+    VkSemaphoreSignalInfo signal_info = {};
+    signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+    signal_info.semaphore = d.semaphore;
+    signal_info.value = value;
+    const VkResult res = d.vkSignalSemaphore(d.vk.device, &signal_info);
+    d.log(1, "the shared fence was raised to %llu from the host (its D3D12 signal never ran)%s",
+          static_cast<unsigned long long>(value), res == VK_SUCCESS ? "" : ", which failed");
+}
+
+uint32_t Dx12Fg::gpuWaitTimeouts() const
+{
+    return impl->gpu_wait_timeouts;
 }
 
 bool Dx12Fg::ngxUpInProcess()

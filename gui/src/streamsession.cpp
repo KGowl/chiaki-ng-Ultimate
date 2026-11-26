@@ -35,7 +35,9 @@
 // DualSense touchpad is 1919 x 1079
 #define PS5_TOUCHPAD_MAX_X 1919.0f
 #define PS5_TOUCHPAD_MAX_Y 1079.0f
+// A start that fails is retried for SESSION_RETRY_SECONDS, with waits of a third of that in between.
 #define SESSION_RETRY_SECONDS 20
+#define SESSION_RETRY_DELAY_MS (SESSION_RETRY_SECONDS * 1000 / 3)
 #define HAPTIC_RUMBLE_MIN_STRENGTH 100
 
 #define MICROPHONE_SAMPLES 480
@@ -536,6 +538,9 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 			SendFeedbackState();
 		}
 	});
+	retry_timer = new QTimer(this);
+	retry_timer->setSingleShot(true);
+	connect(retry_timer, &QTimer::timeout, this, &StreamSession::RetryStart);
 	// If duid isn't empty connect with psn
 	chiaki_connect_info.holepunch_session = NULL;
 	if(!connect_info.duid.isEmpty())
@@ -815,7 +820,53 @@ void StreamSession::Start()
 void StreamSession::Stop()
 {
 	mic_active.storeRelaxed(false);
+	stop_requested = true;
 	chiaki_session_stop(&session);
+	if(retry_timer->isActive())
+	{
+		// No session thread runs while a retry waits, so nothing else would report the end.
+		retry_timer->stop();
+		QMetaObject::invokeMethod(this, [this]() { EndSession(CHIAKI_QUIT_REASON_STOPPED); }, Qt::QueuedConnection);
+	}
+}
+
+void StreamSession::ScheduleRetry(ChiakiQuitReason reason)
+{
+	if(stop_requested)
+	{
+		EndSession(CHIAKI_QUIT_REASON_STOPPED);
+		return;
+	}
+	CHIAKI_LOGI(GetChiakiLog(), "Session start failed (%s), retrying in %d ms", chiaki_quit_reason_string(reason), SESSION_RETRY_DELAY_MS);
+	retry_timer->start(SESSION_RETRY_DELAY_MS);
+}
+
+void StreamSession::RetryStart()
+{
+	// The failed attempt's thread has reported its end and is returning. Join it, which also
+	// releases its handle, before Start() puts the next thread in its place.
+	if(session_started)
+	{
+		chiaki_session_join(&session);
+		session_started = false;
+	}
+	try
+	{
+		Start();
+	}
+	catch(const Exception &e)
+	{
+		CHIAKI_LOGE(GetChiakiLog(), "Session retry failed: %s", e.what());
+		EndSession(CHIAKI_QUIT_REASON_SESSION_REQUEST_UNKNOWN);
+	}
+}
+
+// Reports the end of a session that has no session thread left to report it.
+void StreamSession::EndSession(ChiakiQuitReason reason)
+{
+	connected = false;
+	emit ConnectedChanged();
+	emit SessionQuit(reason, QString());
 }
 
 void StreamSession::GoToBed()
@@ -2412,7 +2463,9 @@ void StreamSession::Event(ChiakiEvent *event)
 		case CHIAKI_EVENT_QUIT:
 			if(!connected && !holepunch_session && chiaki_quit_reason_is_error(event->quit.reason) && connect_timer.elapsed() < SESSION_RETRY_SECONDS * 1000)
 			{
-				QTimer::singleShot(SESSION_RETRY_SECONDS / 3, this, &StreamSession::Start);
+				// This is the session thread, which ends after this callback: schedule on ours.
+				const ChiakiQuitReason reason = event->quit.reason;
+				QMetaObject::invokeMethod(this, [this, reason]() { ScheduleRetry(reason); }, Qt::QueuedConnection);
 				return;
 			}
 			connected = false;

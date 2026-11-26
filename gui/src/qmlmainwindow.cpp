@@ -3321,7 +3321,9 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
             picture_frames_current.fetchAndAddRelaxed(1);
         }
         dup_frames_since_kept++;
-        const bool drop = repeat && fg_status_backend.loadRelaxed() > 0;
+        // Only while frame generation really makes frames (not when it is set up but held back, e.g. by
+        // a display too slow for it, or refused for HDR): otherwise a repeat is just shown again.
+        const bool drop = repeat && fg_status_multiplier.loadRelaxed() > 1;
         if (drop)
             st.dropped++;
         else if (repeat)
@@ -5652,10 +5654,14 @@ renderer_backend_ready:
         QMetaObject::invokeMethod(quick_render, &QQuickRenderControl::initialize);
     }
 
+    cacheScreenState();
+    connect(this, &QWindow::screenChanged, this, [this](QScreen *) { cacheScreenState(); });
     QTimer *dropped_frames_timer = new QTimer(this);
     dropped_frames_timer->setInterval(1000);
     dropped_frames_timer->start();
     connect(dropped_frames_timer, &QTimer::timeout, this, [this]() {
+        // A refresh rate change without a screen change (the display's mode switched) shows up here.
+        cacheScreenState();
         int dropped_frames_next = dropped_frames_current.fetchAndStoreRelaxed(0);
         if (dropped_frames != dropped_frames_next) {
             dropped_frames = dropped_frames_next;
@@ -5712,8 +5718,8 @@ renderer_backend_ready:
             QString part = QStringLiteral("RTX VSR %1").arg(QLatin1String(RtxVsr::qualityName(vsr_quality)));
             switch (vsr_status_state.loadRelaxed()) {
             case 1:
-                if (rtx_vsr->gpuTimeMs() > 0.0f)
-                    part += QStringLiteral(" %1 ms").arg(rtx_vsr->gpuTimeMs(), 0, 'f', 1);
+                if (vsr_status_gpu_cms.loadRelaxed() > 0)
+                    part += QStringLiteral(" %1 ms").arg(vsr_status_gpu_cms.loadRelaxed() / 100.0, 0, 'f', 1);
                 break;
             case 3:
                 part += tr(": not supported (DLL/GPU)");
@@ -5742,8 +5748,8 @@ renderer_backend_ready:
                 // Frame generation runs on game pictures: say so when the game runs under the stream rate.
                 if (picture_fps >= 0.0 && stream_fps > 0.0 && picture_fps < stream_fps - 1.5)
                     part += tr(" (game %1 fps)").arg(picture_fps, 0, 'f', 0);
-                if (frame_gen->gpuTimeMs() > 0.0f)
-                    part += QStringLiteral(" %1 ms").arg(frame_gen->gpuTimeMs(), 0, 'f', 1);
+                if (fg_status_gpu_cms.loadRelaxed() > 0)
+                    part += QStringLiteral(" %1 ms").arg(fg_status_gpu_cms.loadRelaxed() / 100.0, 0, 'f', 1);
                 part += refresh_note;
             } else {
                 switch (fg_status_reason.loadRelaxed()) {
@@ -6535,7 +6541,8 @@ void QmlMainWindow::resizeSwapchain()
     if (!placebo_swapchain)
         return;
 
-    const QSize window_size(width() * devicePixelRatio(), height() * devicePixelRatio());
+    const double dpr = screen_dpr.load(std::memory_order_relaxed);
+    const QSize window_size(static_cast<int>(width() * dpr), static_cast<int>(height() * dpr));
     // A minimized window has no size; textures cannot be created at 0x0.
     if (window_size.isEmpty())
         return;
@@ -6641,14 +6648,26 @@ void QmlMainWindow::resizeSwapchain()
     quick_tex = new_quick_tex;
     quick_vk_image = new_quick_vk_image;
     quick_vk_format = vk_format;
-    quick_sem_value = 0;
+    // quick_sem stays (only its texture is new): its timeline value keeps counting up. Starting again at 0
+    // would signal values below the semaphore's own, which Vulkan does not allow.
     swapchain_size = new_swapchain_size;
     quick_window->setRenderTarget(QQuickRenderTarget());
+}
+
+void QmlMainWindow::cacheScreenState()
+{
+    Q_ASSERT(QThread::currentThread() == QGuiApplication::instance()->thread());
+    const QScreen *s = screen();
+    const double hz = s ? s->refreshRate() : 0.0;
+    screen_refresh_hz.store(hz > 1.0 ? hz : 60.0, std::memory_order_relaxed);
+    const double dpr = devicePixelRatio();
+    screen_dpr.store(dpr > 0.0 ? dpr : 1.0, std::memory_order_relaxed);
 }
 
 void QmlMainWindow::updateSwapchain()
 {
     Q_ASSERT(QThread::currentThread() == QGuiApplication::instance()->thread());
+    cacheScreenState();
     const qint64 update_swapchain_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
 
     quick_item->setSize(size());
@@ -7176,7 +7195,7 @@ void QmlMainWindow::render()
     const int target_contrast = apply_display_target ? settings->GetDisplayTargetContrast() : 0;
 
     uint64_t ts_pre_update = chiaki_time_now_monotonic_us();
-    double refresh_rate = screen() ? screen()->refreshRate() : 60.0;
+    double refresh_rate = screen_refresh_hz.load(std::memory_order_relaxed);
     if (refresh_rate <= 1.0)
         refresh_rate = 60.0;
     const double refresh_interval_s = 1.0 / refresh_rate;
@@ -7237,7 +7256,12 @@ void QmlMainWindow::render()
             incoming_waiting = direct_pending_frame != nullptr;
         }
         // (RTX VSR, which has no D3D12 half, is checked where the frame's work starts.)
-        if (incoming_waiting && fg_pipe_stage == FgPipeStage::Idle && fg_pipe_allowed && fgPipeEnabled()) {
+        // Not after the stream ended (a late frame must not start frame generation, maybe at the window's
+        // new size), and not when the last picture stood for more than 3 stream frames (a still or slow
+        // scene): its frames left would hold back the next picture by up to (multiplier - 1) of their long
+        // spacing, so they are dropped below instead.
+        if (incoming_waiting && stream_active && fg_active_cadence <= 3 && fg_pipe_stage == FgPipeStage::Idle &&
+            fg_pipe_allowed && fgPipeEnabled()) {
             // Start the new stream frame's DLSS work now and keep presenting the frames
             // generated from the last one while the D3D12 side runs.
             fg_pipe_take = true;
@@ -7285,9 +7309,12 @@ void QmlMainWindow::render()
             }
             reset_direct_frame = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
         }
-        // After a loss or a scene cut, frame generation starts afresh instead of blending into it.
+        // After a loss or a scene cut, frame generation (and DLSS 5's history) starts afresh instead of
+        // blending into it.
         if ((reset_direct_frame || incoming_fg_reset) && frame_gen)
             frame_gen->reset();
+        if (incoming_fg_reset && neural_render)
+            neural_render->resetHistory();
         if (reset_direct_frame) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
@@ -8146,7 +8173,9 @@ void QmlMainWindow::render()
     // NGX refuses DLSS FG through Vulkan once its D3D12 side is up: before DLSS 5 brings that
     // side up, let a running Vulkan DLSS FG go. Frame generation below then runs DLSS FG through
     // the D3D12 bridge.
-    if (nr_wanted && frame_gen && frame_gen->backend() == FrameGen::Backend::Dlss && !FrameGen::d3d12NgxUp()) {
+    // (Not in a render that shows one of its generated frames: that frame's texture would go with it.)
+    if (!fg_override && nr_wanted && frame_gen && frame_gen->backend() == FrameGen::Backend::Dlss &&
+        !FrameGen::d3d12NgxUp()) {
         fg_pending_frames.clear();
         fgPipeCancel();
         fg_pipe_allowed = false;
@@ -8216,7 +8245,7 @@ void QmlMainWindow::render()
     // Pipelined frame generation: start the stream frame taken above (fg_pipe_stage). Its
     // DLSS 5 (or, without it, its DLSS FG) is queued on D3D12 now; the rest follows in
     // fgPipeAdvance() while this render presents a frame generated from the last one.
-    if (fg_pipe_take && fg_pipe_stage == FgPipeStage::Taken && frame_gen && has_settings) {
+    if (fg_pipe_take && fg_pipe_stage == FgPipeStage::Taken && frame_gen && has_settings && stream_active) {
         // The stream frames this picture stands for (more than one when repeats were dropped).
         const int cadence = direct_frame_gap;
         const double source_interval_s = stream_interval_s * cadence;
@@ -8503,11 +8532,16 @@ void QmlMainWindow::render()
         }
         fg_status_backend.storeRelaxed(stream_active ? fg_run_backend : 0);
         fg_status_multiplier.storeRelaxed(fg_pipe_multiplier);
+        fg_status_gpu_cms.storeRelaxed(frame_gen ? static_cast<int>(frame_gen->gpuTimeMs() * 100.0f) : 0);
         fg_status_reason.storeRelaxed(0);
+        // The frames of the last pipelined stream frame are out: none from before a size change is left.
+        if (frame_gen)
+            frame_gen->releaseRetired();
     }
     if (direct_frame_fresh || !bypass_frame_queue) {
         fg_status_backend.storeRelaxed(stream_active ? fg_run_backend : 0);
         fg_status_multiplier.storeRelaxed(fg_applied ? fg_active_multiplier : 0);
+        fg_status_gpu_cms.storeRelaxed(fg_applied && frame_gen ? static_cast<int>(frame_gen->gpuTimeMs() * 100.0f) : 0);
         int reason = 0;
         if (!bypass_frame_queue)
             reason = 1;
@@ -8534,6 +8568,7 @@ void QmlMainWindow::render()
         const bool vsr_wanted = rtx_vsr && rtx_vsr_quality > 0 && nvidia_card && stream_active;
         vsr_status_quality.storeRelaxed(vsr_wanted ? rtx_vsr_quality : 0);
         vsr_status_state.storeRelaxed(vsr_applied ? 1 : (vsr_wanted && rtx_vsr->modeFailed(rtx_vsr_quality) ? 3 : 2));
+        vsr_status_gpu_cms.storeRelaxed(vsr_applied ? static_cast<int>(rtx_vsr->gpuTimeMs() * 100.0f) : 0);
     }
     const struct pl_frame_mix *render_frame_mix = vsr_applied ? &vsr_frame_mix : &frame_mix;
 

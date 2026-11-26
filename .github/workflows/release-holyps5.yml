@@ -45,6 +45,12 @@ jobs:
           cp artifacts/chiaki-ng-win_x64-VC-Release/*.zip "release/chiaki-ng-${TAG}-win_x64-portable.zip"
           cp artifacts/chiaki-ng-win_x64-VC-installer.zip/chiaki-ng-windows-installer.exe "release/chiaki-ng-${TAG}-win_x64-setup.exe"
           unzip -l "release/chiaki-ng-${TAG}-win_x64-portable.zip" | grep -q 'chiaki-fgdx12test.exe' || { echo "chiaki-fgdx12test.exe missing from the portable zip"; exit 1; }
+          # chiaki.exe's debug symbols, so a crash dump of this build can be read (the CI artifact expires).
+          if [ -f artifacts/chiaki-ng-win_x64-VC-pdb/chiaki.pdb ]; then
+            cp artifacts/chiaki-ng-win_x64-VC-pdb/chiaki.pdb "release/chiaki-ng-${TAG}-win_x64-chiaki.pdb"
+          else
+            echo "::warning::chiaki.pdb artifact missing: the release has no debug symbols"
+          fi
           (cd release && sha256sum * > SHA256SUMS.txt)
           cat release/SHA256SUMS.txt
           ls -l release
@@ -58,6 +64,7 @@ jobs:
           |---|---|
           | \`chiaki-ng-${TAG}-win_x64-portable.zip\` | portable package (used by the HolyPS5 setup) |
           | \`chiaki-ng-${TAG}-win_x64-setup.exe\` | installer |
+          | \`chiaki-ng-${TAG}-win_x64-chiaki.pdb\` | debug symbols of chiaki.exe (for reading crash dumps) |
           | \`SHA256SUMS.txt\` | SHA-256 checksums |
 
           Built from ${GITHUB_SHA}.

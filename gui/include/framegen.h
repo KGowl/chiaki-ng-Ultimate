@@ -71,6 +71,9 @@ public:
 
     // The next frame starts a new sequence: nothing is interpolated across it.
     void reset();
+    // Frames from before the last output size (or HDR) change stay valid until this is called (or until
+    // the next process() or size change): call it once none of them is still to be shown.
+    void releaseRetired();
 
     // Flow backend only: analyse motion at 1/2 instead of 1/4 resolution.
     void setFlowHighQuality(bool high);

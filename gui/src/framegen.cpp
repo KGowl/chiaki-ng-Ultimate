@@ -51,6 +51,7 @@ Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <functional>
 #include <string>
 #include <thread>
@@ -67,6 +68,9 @@ constexpr uint64_t kWaitTimeoutNs = 2000000000ull;
 // Video has no depth; a constant mid-range value keeps disocclusion logic neutral.
 constexpr float kConstantDepth = 0.5f;
 constexpr int kMaxConsecutiveFailures = 3;
+// As many failures within this long turn the backend off too, successes in between or not: a backend that
+// fails every few frames (each failure can hold the render thread for a GPU wait) is not kept on.
+constexpr auto kFailureWindow = std::chrono::seconds(30);
 
 } // namespace
 
@@ -141,6 +145,16 @@ struct FrameGen::Impl
     std::unique_ptr<FgBackendImpl> backend_impl;
     std::array<bool, 6> backend_failed = {};
     int consecutive_failures = 0;
+    std::deque<std::chrono::steady_clock::time_point> failure_times;
+    // Notes a failure; true when kMaxConsecutiveFailures of them fell within kFailureWindow.
+    bool tooManyFailures()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        failure_times.push_back(now);
+        while (!failure_times.empty() && now - failure_times.front() > kFailureWindow)
+            failure_times.pop_front();
+        return static_cast<int>(failure_times.size()) >= kMaxConsecutiveFailures;
+    }
 
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queue_family = 0;
@@ -152,6 +166,11 @@ struct FrameGen::Impl
     uint64_t done_value = 0;
 
     std::array<FrameSet, kFrameSets> sets;
+    // The sets of the size before the last size (or HDR) change: frames handed out from them may still be
+    // shown after it (what is left of the last stream frame while the next one starts pipelined), so they
+    // are destroyed only once the caller is done with them (releaseRetired, the next process(), the next
+    // size change, shutdown).
+    std::array<FrameSet, kFrameSets> retired_sets;
     size_t next_set = 0;
     FgImage mvec;
     FgImage depth;
@@ -206,6 +225,8 @@ struct FrameGen::Impl
     bool ensureImage(FgImage &img, int w, int h, pl_fmt fmt, bool renderable, bool clearable);
     void destroyImage(FgImage &img);
     void destroyImages();
+    void retireImages();
+    void destroyRetired();
     bool ensureSize(int w, int h, bool hdr, const std::function<void(const char *)> &trace);
     bool fillConstant(FgImage &img, const float value[4], const void *texel, size_t texel_size);
     bool hold(FgImage &img);
@@ -453,6 +474,34 @@ void FrameGen::Impl::destroyImages()
     last_real = nullptr;
 }
 
+void FrameGen::Impl::retireImages()
+{
+    // A size change: the color images may still be shown by the caller (frames generated before it), so
+    // they go to retired_sets instead of being destroyed. Generation work on them is done (ensureSize waited).
+    // Motion and depth are only read by that work.
+    destroyRetired();
+    retired_sets = sets;
+    for (auto &set : sets) {
+        set.real = FgImage();
+        for (auto &img : set.generated)
+            img = FgImage();
+    }
+    destroyImage(mvec);
+    destroyImage(depth);
+    width = height = 0;
+    last_real = nullptr;
+}
+
+void FrameGen::Impl::destroyRetired()
+{
+    // libplacebo keeps a destroyed texture alive for GPU work still using it; the caller holds no frame of them.
+    for (auto &set : retired_sets) {
+        destroyImage(set.real);
+        for (auto &img : set.generated)
+            destroyImage(img);
+    }
+}
+
 bool FrameGen::Impl::fillConstant(FgImage &img, const float value[4], const void *texel, size_t texel_size)
 {
     if (img.tex->params.blit_dst) {
@@ -488,7 +537,7 @@ bool FrameGen::Impl::ensureSize(int w, int h, bool hdr, const std::function<void
         return false;
     if (backend_impl)
         backend_impl->invalidate();
-    destroyImages();
+    retireImages();
 
     const pl_fmt fmt = hdr ? fmt_color_hdr : fmt_color;
     if (!fmt)
@@ -639,8 +688,10 @@ void FrameGen::Impl::shutdownCommon()
     destroyBackend();
     motion_flow.reset();
     fixup.reset();
-    if (vkDestroyImageView)
+    if (vkDestroyImageView) {
         destroyImages();
+        destroyRetired();
+    }
     if (pool)
         vkDestroyCommandPool(vk->device, pool, nullptr);
     pool = VK_NULL_HANDLE;
@@ -1361,6 +1412,7 @@ bool FrameGen::ensureInitialized(pl_vulkan vk, Backend backend)
     d.backend_impl = std::move(impl_backend);
     d.backend = backend;
     d.consecutive_failures = 0;
+    d.failure_times.clear();
     d.reset_pending = true;
     d.trace_frames = 0;
     qCInfo(chiakiGui) << "[framegen]" << backendName(backend) << "initialized";
@@ -1400,6 +1452,11 @@ void FrameGen::reset()
 {
     impl->reset_pending = true;
     impl->deferred = {};
+}
+
+void FrameGen::releaseRetired()
+{
+    impl->destroyRetired();
 }
 
 void FrameGen::setFlowHighQuality(bool high)
@@ -1458,7 +1515,7 @@ bool FrameGen::Impl::processVfg(FrameSet &set, int count, std::vector<struct pl_
         qCWarning(chiakiGui) << "[framegen] NVIDIA VFG:" << what;
         have_history = false;
         last_real = nullptr;
-        if (++consecutive_failures >= kMaxConsecutiveFailures)
+        if ((++consecutive_failures >= kMaxConsecutiveFailures || tooManyFailures()))
             return disable("after repeated failures");
         return false;
     };
@@ -1641,7 +1698,7 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
         qCWarning(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << what;
         have_history = false;
         last_real = nullptr;
-        if (++consecutive_failures >= kMaxConsecutiveFailures)
+        if ((++consecutive_failures >= kMaxConsecutiveFailures || tooManyFailures()))
             return disable("after repeated failures");
         return false;
     };
@@ -1650,6 +1707,9 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
                                         << Qt::hex << code << Qt::dec << ", in " << stage << ")";
         // Its state is unknown: leak it rather than call into it again.
         backend_failed[static_cast<size_t>(backend)] = true;
+        // The D3D12 call that would have signalled the last value on the shared timeline did not
+        // run: raise it from the host, so nothing on the Vulkan queue (DLSS 5's next run) waits for it.
+        backend_dx->runner->signalFromHost(backend_dx->runner->lastValue());
         backend_dx->runner->markCrashed();
         (void)new std::shared_ptr<Dx12Fg>(std::move(backend_dx->runner));
         (void)backend_impl.release();
@@ -1770,7 +1830,7 @@ bool FrameGen::Impl::dx12Fail(const char *what)
     qCWarning(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << what;
     have_history = false;
     last_real = nullptr;
-    if (++consecutive_failures >= kMaxConsecutiveFailures) {
+    if ((++consecutive_failures >= kMaxConsecutiveFailures || tooManyFailures())) {
         qCWarning(chiakiGui) << "[framegen] Disabling" << FrameGen::backendName(backend) << "after repeated failures";
         backend_failed[static_cast<size_t>(backend)] = true;
         destroyBackend();
@@ -1893,6 +1953,8 @@ bool FrameGen::process(const struct pl_frame *src, int out_w, int out_h, int mul
     Impl &d = *impl;
     // A begun call nobody finished: its frames are not wanted anymore.
     d.deferred = {};
+    // process() is only called with no frame of an earlier call still to be shown.
+    d.destroyRetired();
     // The previous real frame, before processFrames() moves on.
     pl_tex prev = (d.reset_pending || !d.have_history || !d.last_real) ? nullptr : d.last_real->tex;
     if (!processFrames(src, out_w, out_h, multiplier, frame_interval_ms, outputs))
@@ -2148,7 +2210,7 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
         if (!flow_ok) {
             d.have_history = false;
             d.last_real = nullptr;
-            if (++d.consecutive_failures >= kMaxConsecutiveFailures) {
+            if ((++d.consecutive_failures >= kMaxConsecutiveFailures || d.tooManyFailures())) {
                 qCWarning(chiakiGui) << "[framegen] Disabling" << backendName(d.backend) << "after repeated failures";
                 d.backend_failed[static_cast<size_t>(d.backend)] = true;
                 d.destroyBackend();
@@ -2250,7 +2312,7 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
             d.backend_failed[static_cast<size_t>(d.backend)] = true;
             (void)d.backend_impl.release();
             d.backend = FrameGen::Backend::None;
-        } else if (++d.consecutive_failures >= kMaxConsecutiveFailures) {
+        } else if ((++d.consecutive_failures >= kMaxConsecutiveFailures || d.tooManyFailures())) {
             qCWarning(chiakiGui) << "[framegen] Disabling" << backendName(d.backend) << "after repeated failures";
             d.backend_failed[static_cast<size_t>(d.backend)] = true;
             d.destroyBackend();
@@ -2290,6 +2352,7 @@ bool FrameGen::backendFailed(Backend) const { return true; }
 int FrameGen::maxMultiplier() const { return 1; }
 float FrameGen::gpuTimeMs() const { return 0.0f; }
 void FrameGen::reset() {}
+void FrameGen::releaseRetired() {}
 void FrameGen::setFlowHighQuality(bool) {}
 void FrameGen::setDlssMotion(int) {}
 void FrameGen::setVfgMode(int) {}

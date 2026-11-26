@@ -244,6 +244,13 @@ class StreamSession : public QObject
 		bool start_mic_unmuted;
 		bool session_started;
 
+		// Retries of a start that failed. Used on this object's thread only.
+		QTimer *retry_timer;
+		bool stop_requested = false;
+		void ScheduleRetry(ChiakiQuitReason reason);
+		void RetryStart();
+		void EndSession(ChiakiQuitReason reason);
+
 		ChiakiFfmpegDecoder *ffmpeg_decoder;
 		void TriggerFfmpegFrameAvailable();
 #if CHIAKI_LIB_ENABLE_PI_DECODER
