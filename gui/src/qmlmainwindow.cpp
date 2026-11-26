@@ -8037,11 +8037,12 @@ void QmlMainWindow::render()
             nr_status_out_h.storeRelaxed(0);
             nr_status_hdr.storeRelaxed(0);
         }
-        // RTX VSR runs on frames DLSS 5 did not upscale and has no D3D12 half to pipeline.
+        // RTX VSR runs on frames DLSS 5 did not upscale and has no D3D12 half to pipeline. It is
+        // 8-bit only and never runs on HDR streams, which go DLSS 5 (HDR) -> DLSS FG (HDR, RGBA16F).
         const NeuralRender::Options pipe_nr_options = nr_on ? nr_options_for(&direct_frame) : NeuralRender::Options();
         const bool nr_will_upscale = nr_on && pipe_nr_options.out_width > 0 && neural_render->canUpscale();
         const bool vsr_would_run = rtx_vsr && nvidia_card && settings->GetRtxVsrQuality() > 0 && !rtx_vsr->failed() &&
-                                   !nr_will_upscale;
+                                   !nr_will_upscale && !pl_color_space_is_hdr(&direct_frame.color);
         // Fewer than 2 frames, RTX VSR, or a failure: the frame stays Taken and goes down the
         // normal path once the last stream frame's frames are out.
         if (vsr_would_run) {
@@ -8137,8 +8138,13 @@ void QmlMainWindow::render()
     std::array<uint64_t, kRtxVsrMaxMixFrames> vsr_signatures;
     bool vsr_applied = false;
     const int rtx_vsr_quality = rtx_vsr && has_settings ? settings->GetRtxVsrQuality() : 0;
+    // HDR streams: RTX VSR is 8-bit SDR only, so it stays off (the frames keep their HDR values for
+    // DLSS 5 and DLSS FG, and the HDR10 swapchain).
+    const struct pl_frame *vsr_probe = bypass_frame_queue ? &direct_render_frame
+        : frame_mix.num_frames > 0 ? frame_mix.frames[0] : nullptr;
+    const bool vsr_hdr = vsr_probe && vsr_probe->num_planes > 0 && pl_color_space_is_hdr(&vsr_probe->color);
     // Not after neural rendering upscaled the frame (it already is near the window size).
-    if (!fg_override && !nr_upscaled && rtx_vsr_quality > 0 && nvidia_card && stream_active &&
+    if (!fg_override && !nr_upscaled && !vsr_hdr && rtx_vsr_quality > 0 && nvidia_card && stream_active &&
         rtx_vsr->ensureInitialized(placebo_vulkan)) {
         const int vsr_out_w = static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop))));
         const int vsr_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(target_frame.crop))));
