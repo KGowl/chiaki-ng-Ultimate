@@ -279,6 +279,11 @@ if(APPLE)
 	target_link_libraries(chiaki "-framework AVFoundation" "-framework IOKit")
 endif()
 
+# Console test of the repeated picture detector (include/duplicateframe.h) on synthetic scenes
+# (tools/duplicateframetest.cpp). Not built by default: --target chiaki-duplicateframetest.
+add_executable(chiaki-duplicateframetest EXCLUDE_FROM_ALL tools/duplicateframetest.cpp)
+target_include_directories(chiaki-duplicateframetest PRIVATE include)
+
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fanalyzer")
 set_target_properties(chiaki PROPERTIES
 		MACOSX_BUNDLE TRUE

@@ -39,6 +39,7 @@ extern "C" {
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFrame>
+#include <QRegularExpression>
 #include <QList>
 #include <algorithm>
 #include <QOpenGLContext>
@@ -184,7 +185,9 @@ public:
         // First row: the GPU that renders the stream (DLSS on AMD runs through NeuralHub, so it is worth seeing).
         gpuRow = makeRow(tr("GPU"), QColor(QStringLiteral("#eceff1")), gpuValue);
         bitrateRow = makeRow(tr("Mbps"), QColor(QStringLiteral("#00a7ff")), bitrateValue);
-        fpsRow = makeRow(tr("fps stream / display"), QColor(QStringLiteral("#ffe082")), fpsValue, &fpsTitle);
+        // Two lines: the frames the stream brings, and the frames the display shows (frame generation's too).
+        fpsRow = makeRow(tr("stream fps"), QColor(QStringLiteral("#ffe082")), fpsValue);
+        displayFpsRow = makeRow(tr("display fps"), QColor(QStringLiteral("#ffcc80")), displayFpsValue);
         queueRow = makeRow(tr("queue depth avg"), QColor(QStringLiteral("#90caf9")), queueDepthValue);
         pendingRow = makeRow(tr("pending frame age"), QColor(QStringLiteral("#90caf9")), pendingAgeValue);
         packetLossRow = makeRow(tr("packet loss"), QColor(QStringLiteral("#ef9a9a")), packetLossValue);
@@ -304,7 +307,9 @@ public:
         const double packetLoss = hasSession ? session->GetAveragePacketLoss() : 0.0;
         const int lostFrames = hasSession ? static_cast<int>(session->GetFramesLost()) : 0;
         const int droppedFrames = owner ? owner->droppedFrames() : 0;
-        const QString fps = owner ? QStringLiteral("%1 / %2").arg(owner->streamFps(), 0, 'f', 0).arg(owner->displayFps(), 0, 'f', 0) : QString();
+        const QString fps = owner ? QStringLiteral("%1 → %2").arg(owner->streamFps(), 0, 'f', 0).arg(owner->displayFps(), 0, 'f', 0) : QString();
+        const QString streamFps = owner ? owner->streamFpsText() : QString();
+        const QString displayFps = owner ? owner->displayFpsText() : QString();
 
         if (style == Mini || style == Compact) {
             QStringList items;
@@ -313,7 +318,12 @@ public:
                              .arg(QLatin1String(color), value.toHtmlEscaped(), unit.isEmpty() ? QString() : QStringLiteral(" ") + unit.toHtmlEscaped());
             };
             if (hasSession) {
-                item(fps, "#ffe082", tr("fps"));
+                if (style == Compact) {
+                    item(streamFps, "#ffe082", tr("fps in"));
+                    item(displayFps, "#ffcc80", tr("fps out"));
+                } else {
+                    item(fps, "#ffe082", tr("fps"));
+                }
                 item(QString::number(bitrate, 'f', 1), "#00a7ff", tr("Mbps"));
                 if (style == Compact || packetLoss > 0.0)
                     item(QStringLiteral("%1%").arg(packetLoss * 100.0, 0, 'f', 1), "#ef9a9a", tr("loss"));
@@ -341,7 +351,9 @@ public:
         bitrateValue->setText(hasSession ? QString::number(bitrate, 'f', 1) : QString());
 
         fpsRow->setVisible(hasSession);
-        fpsValue->setText(hasSession ? fps : QString());
+        fpsValue->setText(hasSession ? streamFps : QString());
+        displayFpsRow->setVisible(hasSession);
+        displayFpsValue->setText(hasSession ? displayFps : QString());
 
         queueRow->setVisible(full);
         queueDepthValue->setText(QString::number(owner ? owner->queueDepthAverage() : 0.0, 'f', 1));
@@ -375,7 +387,8 @@ private:
                 continue; // idle, unavailable, ...: details in Full
             part.replace(QStringLiteral("NVIDIA "), QString());
             part.replace(QStringLiteral("RTX VSR"), QStringLiteral("VSR"));
-            part.replace(QStringLiteral(" (half-rate source)"), QStringLiteral(" ½"));
+            // The game's rate is on the fps line already.
+            part.remove(QRegularExpression(QStringLiteral(" \\(game \\d+ fps\\)")));
             out << part;
         }
         return out;
@@ -395,7 +408,7 @@ private:
     {
         const bool line = style == Mini || style == Compact;
         lineLabel->setVisible(line);
-        for (QWidget *row : { gpuRow, bitrateRow, fpsRow, queueRow, pendingRow, packetLossRow, droppedFramesRow, lostFramesRow, enhancementRow })
+        for (QWidget *row : { gpuRow, bitrateRow, fpsRow, displayFpsRow, queueRow, pendingRow, packetLossRow, droppedFramesRow, lostFramesRow, enhancementRow })
             row->setVisible(!line);
         QFont titleFont;
         QFont valueFont;
@@ -417,7 +430,6 @@ private:
         }
         for (QLabel *v : values)
             v->setFont(valueFont);
-        fpsTitle->setText(style == Full ? tr("fps stream / display") : tr("fps"));
         QFont lineFont;
         lineFont.setPixelSize(style == Mini ? 13 : 14);
         lineLabel->setFont(lineFont);
@@ -435,12 +447,13 @@ private:
     QLabel *lineLabel = nullptr;
     QList<QLabel *> titles;
     QList<QLabel *> values;
-    QLabel *fpsTitle = nullptr;
     QWidget *gpuRow = nullptr;
     QLabel *gpuValue = nullptr;
     QWidget *bitrateRow = nullptr;
     QWidget *fpsRow = nullptr;
     QLabel *fpsValue = nullptr;
+    QWidget *displayFpsRow = nullptr;
+    QLabel *displayFpsValue = nullptr;
     QWidget *queueRow = nullptr;
     QWidget *pendingRow = nullptr;
     QWidget *packetLossRow = nullptr;
@@ -656,8 +669,9 @@ struct DeferredSwapTask
     bool pending_overflow_waiting = false;
     qint64 present_interval_us = 0;
     qint64 present_submit_interval_us = 0;
-    // The present shows a new image (counted in the display fps).
-    bool new_image = false;
+    // The present shows a new image (counted in the display fps): 0 no, 1 a real picture, 2 a
+    // frame made by frame generation.
+    int new_image = 0;
 };
 
 class DeferredSwapThread final : public QThread
@@ -2905,6 +2919,25 @@ bool QmlMainWindow::hasVideo() const
     return has_video;
 }
 
+QString QmlMainWindow::streamFpsText() const
+{
+    QString text = QString::number(stream_fps, 'f', 0);
+    // A game under the stream rate: its new pictures, the ones frame generation works from.
+    if (picture_fps >= 0.0 && stream_fps > 0.0 && picture_fps < stream_fps - 1.5)
+        text += tr(" (game %1)").arg(picture_fps, 0, 'f', 0);
+    return text;
+}
+
+QString QmlMainWindow::displayFpsText() const
+{
+    const int shown = qRound(display_fps);
+    const int generated = qRound(generated_fps);
+    QString text = QString::number(shown);
+    if (generated > 0)
+        text += tr(" (%1 real + %2 FG)").arg(qMax(0, shown - generated)).arg(generated);
+    return text;
+}
+
 int QmlMainWindow::droppedFrames() const
 {
     return dropped_frames;
@@ -3188,6 +3221,38 @@ bool QmlMainWindow::configuredFrameMixerEnabledForScheduling() const
     return frame_mixer_config(settings) != nullptr;
 }
 
+// The luma plane of a decoded frame in system memory, for the repeated picture test; empty for a
+// hardware frame or a format the test does not know.
+static DuplicateFrameDetector::Luma frameLuma(const AVFrame *f)
+{
+    DuplicateFrameDetector::Luma luma;
+    if (!f || f->hw_frames_ctx || !f->data[0] || f->linesize[0] <= 0 || f->width <= 0 || f->height <= 0)
+        return luma;
+    switch (f->format) {
+    case AV_PIX_FMT_NV12:
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:
+        luma.bytes = 1;
+        luma.max_value = 255.0;
+        break;
+    case AV_PIX_FMT_P010LE: // 10 bits at the top of 16-bit samples
+        luma.bytes = 2;
+        luma.max_value = 65535.0;
+        break;
+    case AV_PIX_FMT_YUV420P10LE:
+        luma.bytes = 2;
+        luma.max_value = 1023.0;
+        break;
+    default:
+        return luma;
+    }
+    luma.data = f->data[0];
+    luma.linesize = f->linesize[0];
+    luma.width = f->width;
+    luma.height = f->height;
+    return luma;
+}
+
 void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us)
 {
     const qint64 present_entry_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
@@ -3207,25 +3272,102 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
     stream_frames_current.fetchAndAddRelaxed(1);
 
     if (bypass_frame_queue) {
-        const bool repeat = repeat_detector.feed(frame.packet_size);
-        const int cadence = repeat_detector.cadence();
-        if (fg_source_cadence.fetchAndStoreRelaxed(cadence) != cadence) {
-            qCInfo(chiakiGui).nospace() << "Source cadence: "
-                << (cadence == 2 ? "every picture repeated (e.g. 30 fps game in a 60 fps stream)"
-                                 : "a new picture every stream frame")
-                << ", new picture " << static_cast<qint64>(repeat_detector.newPictureSize())
-                << " B, last frame " << static_cast<qint64>(repeat_detector.lastSize()) << " B";
+        // Frame generation interpolates between game pictures. A stream frame that repeats the
+        // last picture (a game under 60 fps) would give it two equal pictures and then a jump:
+        // while it runs, a repeat is dropped and the next new picture carries the stream frames
+        // it stands for. CHIAKI_FG_DEDUP=0 goes back to judging by the packet size alone.
+        static const bool dedup_by_picture = qEnvironmentVariable("CHIAKI_FG_DEDUP") != QLatin1String("0");
+        const DuplicateFrameDetector::Luma luma = dedup_by_picture ? frameLuma(frame.frame) : DuplicateFrameDetector::Luma();
+        const int dup_mode = luma.data ? 1 : 2;
+        if (dup_mode_logged != dup_mode) {
+            dup_mode_logged = dup_mode;
+            qCInfo(chiakiGui) << (dup_mode == 1 ? "Repeated pictures: judged from the decoded picture"
+                                  : dedup_by_picture ? "Repeated pictures: judged from the packet size (hardware frames)"
+                                                     : "Repeated pictures: judged from the packet size (CHIAKI_FG_DEDUP=0)");
         }
-        // The repeat is the same picture; frame generation only works on new ones.
-        if (repeat && fg_status_backend.loadRelaxed() > 0) {
+        DupStats &st = dup_stats;
+        if (!st.since_us)
+            st.since_us = present_entry_us;
+        bool repeat = false;
+        bool fg_reset = false;
+        if (luma.data) {
+            const bool damaged = frames_lost > 0 || frame.recovered;
+            const DuplicateFrameDetector::Result r = dup_detector.feed(luma, frame.packet_size, damaged);
+            repeat = r.repeat;
+            fg_reset = r.reset;
+            if (r.compared && repeat) {
+                st.repeat_compared++;
+                st.repeat_mean_sum += r.mean_diff;
+                st.repeat_mean_max = qMax(st.repeat_mean_max, r.mean_diff);
+            } else if (r.compared) {
+                st.new_compared++;
+                st.new_mean_sum += r.mean_diff;
+                st.new_mean_min = qMin(st.new_mean_min, r.mean_diff);
+            }
+            if (r.reset) {
+                st.resets++;
+                if (std::strcmp(r.rule, "cut") == 0)
+                    st.cuts++;
+            }
+            st.rules[r.rule]++;
+        } else {
+            repeat = repeat_detector.feed(frame.packet_size);
+            st.by_size++;
+        }
+        st.frames++;
+        picture_frames_judged.storeRelaxed(1);
+        if (!repeat) {
+            st.pictures++;
+            picture_frames_current.fetchAndAddRelaxed(1);
+        }
+        dup_frames_since_kept++;
+        const bool drop = repeat && fg_status_backend.loadRelaxed() > 0;
+        if (drop)
+            st.dropped++;
+        else if (repeat)
+            st.kept_repeats++;
+        if (!drop) {
+            const int gap = qMin(dup_frames_since_kept, kMaxFrameGap);
+            st.gaps[qMin(gap, 4) - 1]++;
+        }
+        // A line every 10 s for tuning: what was judged, and how far apart the two kinds were.
+        const qint64 st_span_us = present_entry_us - st.since_us;
+        if (st_span_us >= 10000000) {
+            QString rules;
+            for (const auto &rule : st.rules)
+                rules += QStringLiteral(" %1:%2").arg(QString::fromStdString(rule.first)).arg(rule.second);
+            qCInfo(chiakiGui).nospace().noquote()
+                << "[dedup] " << QString::number(st_span_us / 1e6, 'f', 1) << " s: " << st.frames << " stream frames, "
+                << st.pictures << " new pictures (" << QString::number(st.pictures * 1e6 / st_span_us, 'f', 1) << "/s), "
+                << st.dropped << " repeats dropped, " << st.kept_repeats << " kept (frame generation off); gaps 1:"
+                << st.gaps[0] << " 2:" << st.gaps[1] << " 3:" << st.gaps[2] << " 4+:" << st.gaps[3]
+                << "; resets " << st.resets << " (cuts " << st.cuts << "); change new avg "
+                << QString::number(st.new_compared ? st.new_mean_sum / st.new_compared : 0.0, 'f', 5) << " min "
+                << QString::number(st.new_compared ? st.new_mean_min : 0.0, 'f', 5) << ", repeat avg "
+                << QString::number(st.repeat_compared ? st.repeat_mean_sum / st.repeat_compared : 0.0, 'f', 5) << " max "
+                << QString::number(st.repeat_mean_max, 'f', 5)
+                << (st.by_size ? QStringLiteral("; %1 judged by packet size").arg(st.by_size) : QString())
+                << (rules.isEmpty() ? QString() : QStringLiteral("; rules") + rules);
+            st = DupStats();
+            st.since_us = present_entry_us;
+        }
+        if (drop) {
             av_frame_free(&frame.frame);
             return;
         }
+        const int gap = qMin(dup_frames_since_kept, kMaxFrameGap);
+        dup_frames_since_kept = 0;
         {
             QMutexLocker locker(&direct_frame_mutex);
             if (direct_pending_frame) {
                 av_frame_free(&direct_pending_frame);
                 dropped_frames_current.fetchAndAddRelaxed(1);
+                // Never rendered: frame generation from the last rendered picture spans its time too.
+                direct_pending_gap = qMin(direct_pending_gap + gap, kMaxFrameGap);
+                direct_pending_fg_reset = direct_pending_fg_reset || fg_reset;
+            } else {
+                direct_pending_gap = gap;
+                direct_pending_fg_reset = fg_reset;
             }
             direct_pending_frame = frame.frame;
         }
@@ -5362,6 +5504,11 @@ renderer_backend_ready:
         fg_status_multiplier.storeRelaxed(0);
         fg_status_reason.storeRelaxed(0);
         fg_status_requested.storeRelaxed(0);
+        dup_detector.reset();
+        repeat_detector.reset();
+        dup_frames_since_kept = 0;
+        dup_mode_logged = 0;
+        dup_stats = DupStats();
         startup_video_visible_generation.fetchAndAddRelaxed(1);
         grab_input = 0;
         if (session)
@@ -5376,6 +5523,8 @@ renderer_backend_ready:
             {
                 QMutexLocker locker(&direct_frame_mutex);
                 av_frame_free(&direct_pending_frame);
+                direct_pending_gap = 1;
+                direct_pending_fg_reset = false;
                 direct_frame_reset.storeRelease(1);
             }
             {
@@ -5516,13 +5665,21 @@ renderer_backend_ready:
         const qint64 fps_now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         const int stream_frames = stream_frames_current.fetchAndStoreRelaxed(0);
         const int display_frames = display_frames_current.fetchAndStoreRelaxed(0);
+        const int picture_frames = picture_frames_current.fetchAndStoreRelaxed(0);
+        const int generated_frames = generated_frames_current.fetchAndStoreRelaxed(0);
+        const bool pictures_judged = picture_frames_judged.fetchAndStoreRelaxed(0) != 0;
         if (fps_sample_us > 0 && fps_now_us > fps_sample_us) {
             const double elapsed_s = (fps_now_us - fps_sample_us) / 1e6;
             const double next_stream_fps = stream_frames / elapsed_s;
             const double next_display_fps = display_frames / elapsed_s;
-            if (qAbs(next_stream_fps - stream_fps) >= 0.05 || qAbs(next_display_fps - display_fps) >= 0.05) {
+            const double next_picture_fps = pictures_judged ? picture_frames / elapsed_s : -1.0;
+            const double next_generated_fps = generated_frames / elapsed_s;
+            if (qAbs(next_stream_fps - stream_fps) >= 0.05 || qAbs(next_display_fps - display_fps) >= 0.05
+                || qAbs(next_picture_fps - picture_fps) >= 0.05 || qAbs(next_generated_fps - generated_fps) >= 0.05) {
                 stream_fps = next_stream_fps;
                 display_fps = next_display_fps;
+                picture_fps = next_picture_fps;
+                generated_fps = next_generated_fps;
                 emit fpsChanged();
             }
         }
@@ -5582,8 +5739,9 @@ renderer_backend_ready:
                 : QString();
             if (multiplier > 1) {
                 part += QStringLiteral(" %1x").arg(multiplier);
-                if (fg_source_cadence.loadRelaxed() == 2)
-                    part += tr(" (half-rate source)");
+                // Frame generation runs on game pictures: say so when the game runs under the stream rate.
+                if (picture_fps >= 0.0 && stream_fps > 0.0 && picture_fps < stream_fps - 1.5)
+                    part += tr(" (game %1 fps)").arg(picture_fps, 0, 'f', 0);
                 if (frame_gen->gpuTimeMs() > 0.0f)
                     part += QStringLiteral(" %1 ms").arg(frame_gen->gpuTimeMs(), 0, 'f', 1);
                 part += refresh_note;
@@ -5708,10 +5866,13 @@ void QmlMainWindow::update()
 
     if (quick_need_sync.fetchAndStoreRelaxed(0) != 0) {
         quick_render->polishItems();
+        // QQuickRenderControl::sync() reads the scene (text layouts and all) on the render thread,
+        // so the GUI thread must not change it meanwhile: wait for it (the render thread never
+        // waits for the GUI thread). Queued, a text change during the sync crashed in QTextLayout.
         if (quick_render->thread() == QThread::currentThread())
             sync();
         else
-            QMetaObject::invokeMethod(quick_render, std::bind(&QmlMainWindow::sync, this), Qt::QueuedConnection);
+            QMetaObject::invokeMethod(quick_render, std::bind(&QmlMainWindow::sync, this), Qt::BlockingQueuedConnection);
     }
 
     last_render_dispatch_us.storeRelease(static_cast<qint64>(chiaki_time_now_monotonic_us()));
@@ -5982,7 +6143,7 @@ bool QmlMainWindow::enqueueDeferredSwap(qint64 submit_begin_us,
                                         bool pending_overflow_waiting,
                                         qint64 present_interval_us,
                                         qint64 present_submit_interval_us,
-                                        bool new_image)
+                                        int new_image)
 {
     if (!vulkan_deferred_swap_enabled || !deferred_swap_thread || render_backend != RenderBackend::Vulkan || !placebo_swapchain)
         return false;
@@ -6009,7 +6170,7 @@ void QmlMainWindow::processDeferredSwapTask(qint64 submit_begin_us,
                                             bool pending_overflow_waiting,
                                             qint64 present_interval_us,
                                             qint64 present_submit_interval_us,
-                                            bool new_image)
+                                            int new_image)
 {
     auto snapshot_render_schedule_state = [this]() {
         QMutexLocker locker(&render_schedule_mutex);
@@ -6046,6 +6207,8 @@ void QmlMainWindow::processDeferredSwapTask(qint64 submit_begin_us,
         else {
             if (new_image)
                 display_frames_current.fetchAndAddRelaxed(1);
+            if (new_image == 2)
+                generated_frames_current.fetchAndAddRelaxed(1);
             const qint64 submit_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
             logLatencyStats("pl_swapchain_submit_frame", submit_us - submit_call_begin_us);
             CHIAKI_NOISY_DEBUG().nospace()
@@ -6499,7 +6662,7 @@ void QmlMainWindow::updateSwapchain()
     if (quick_render->thread() == QThread::currentThread())
         sync();
     else
-        QMetaObject::invokeMethod(quick_render, std::bind(&QmlMainWindow::sync, this), Qt::QueuedConnection);
+        QMetaObject::invokeMethod(quick_render, std::bind(&QmlMainWindow::sync, this), Qt::BlockingQueuedConnection);
     QMetaObject::invokeMethod(quick_render, std::bind(&QmlMainWindow::render, this), Qt::QueuedConnection);
     const qint64 update_swapchain_end_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     if (update_swapchain_end_us >= update_swapchain_begin_us && update_swapchain_end_us - update_swapchain_begin_us >= 12000) {
@@ -7109,16 +7272,26 @@ void QmlMainWindow::render()
     auto take_incoming_frame = [&]() {
         AVFrame *incoming = nullptr;
         bool reset_direct_frame = false;
+        int incoming_gap = 1;
+        bool incoming_fg_reset = false;
         {
             QMutexLocker locker(&direct_frame_mutex);
             std::swap(incoming, direct_pending_frame);
+            if (incoming) {
+                incoming_gap = direct_pending_gap;
+                incoming_fg_reset = direct_pending_fg_reset;
+                direct_pending_gap = 1;
+                direct_pending_fg_reset = false;
+            }
             reset_direct_frame = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
         }
-        if (reset_direct_frame && frame_gen)
+        // After a loss or a scene cut, frame generation starts afresh instead of blending into it.
+        if ((reset_direct_frame || incoming_fg_reset) && frame_gen)
             frame_gen->reset();
         if (reset_direct_frame) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
+            direct_frame_gap = 1;
         }
         bool mapped = false;
         if (incoming) {
@@ -7135,6 +7308,7 @@ void QmlMainWindow::render()
                     backend->disableZeroCopy();
             } else {
                 direct_frame_serial++;
+                direct_frame_gap = qBound(1, incoming_gap, kMaxFrameGap);
                 mapped = true;
             }
             av_frame_free(&incoming);
@@ -7397,9 +7571,9 @@ void QmlMainWindow::render()
     if (render_entry_us_local > 0 && render_to_start_frame_us >= render_entry_us_local)
         logLatencyStats("render_to_start_frame", render_to_start_frame_us - render_entry_us_local);
     // Submit immediately and let the swapchain / render path enforce pacing.
-    // `new_image`: the present shows a new stream frame or a generated one, not the same
-    // image again; only those count in the display fps.
-    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present, bool new_image = false) -> bool {
+    // `new_image`: the present shows a new stream frame (1) or a generated one (2), not the same
+    // image again (0); only those count in the display fps.
+    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present, int new_image = 0) -> bool {
         const qint64 submit_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         const int queue_depth_now = snapshotQueueDepth();
         if (detailedVerboseTelemetryEnabled()) {
@@ -7486,6 +7660,8 @@ void QmlMainWindow::render()
                 else {
                     if (new_image)
                         display_frames_current.fetchAndAddRelaxed(1);
+                    if (new_image == 2)
+                        generated_frames_current.fetchAndAddRelaxed(1);
                     submit_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
             logLatencyStats("pl_swapchain_submit_frame", submit_us - submit_begin_us);
             CHIAKI_NOISY_DEBUG().nospace()
@@ -8041,7 +8217,8 @@ void QmlMainWindow::render()
     // DLSS 5 (or, without it, its DLSS FG) is queued on D3D12 now; the rest follows in
     // fgPipeAdvance() while this render presents a frame generated from the last one.
     if (fg_pipe_take && fg_pipe_stage == FgPipeStage::Taken && frame_gen && has_settings) {
-        const int cadence = fg_source_cadence.loadRelaxed();
+        // The stream frames this picture stands for (more than one when repeats were dropped).
+        const int cadence = direct_frame_gap;
         const double source_interval_s = stream_interval_s * cadence;
         const int multiplier = qMin(plan_fg_multiplier(cadence, source_interval_s, refresh_rate),
                                     frame_gen->maxMultiplier());
@@ -8237,7 +8414,7 @@ void QmlMainWindow::render()
         const auto backend_choice = static_cast<FrameGen::Backend>(fg_run_backend);
         // With repeats dropped a picture lasts `cadence` stream frames; the
         // multiplier stays relative to the stream rate, so output fps is kept.
-        const int cadence = fg_source_cadence.loadRelaxed();
+        const int cadence = direct_frame_gap;
         const double source_interval_s = stream_interval_s * cadence;
         int multiplier = plan_fg_multiplier(cadence, source_interval_s, refresh_rate);
         fg_refresh_limited = multiplier < 2;
@@ -8278,10 +8455,13 @@ void QmlMainWindow::render()
                 }
                 direct_render_frame = fg_outputs.front();
                 fg_pending_frames.assign(fg_outputs.begin() + 1, fg_outputs.end());
-                if (fg_active_multiplier != multiplier || fg_active_cadence != cadence)
+                if (fg_active_multiplier == 1 || fg_logged_setting != settings->GetFrameGenMultiplier()) {
+                    fg_logged_setting = settings->GetFrameGenMultiplier();
                     qCInfo(chiakiGui).nospace() << "Frame generation active: " << FrameGen::backendName(backend_choice)
-                                      << " " << multiplier << "x"
-                                      << (cadence == 2 ? " of a half-rate source (repeats dropped)" : "");
+                                      << " " << fg_logged_setting << "x of the stream rate, game pictures only (now "
+                                      << multiplier << " frames from a picture that stood for " << cadence
+                                      << " stream frame" << (cadence == 1 ? ")" : "s)");
+                }
                 fg_active_multiplier = multiplier;
                 fg_active_cadence = cadence;
                 fg_applied = true;
@@ -8302,10 +8482,14 @@ void QmlMainWindow::render()
     if (fg_pipe_present) {
         // The first frame made from a pipelined stream frame: what the block above does for a
         // stream frame processed in this render.
-        if (fg_active_multiplier != fg_pipe_multiplier || fg_active_cadence != fg_pipe_cadence)
+        if (fg_active_multiplier == 1 || (has_settings && fg_logged_setting != settings->GetFrameGenMultiplier())) {
+            fg_logged_setting = has_settings ? settings->GetFrameGenMultiplier() : 0;
             qCInfo(chiakiGui).nospace() << "Frame generation active: "
-                << FrameGen::backendName(FrameGen::Backend::Dlss12) << " " << fg_pipe_multiplier << "x"
-                << (fg_pipe_cadence == 2 ? " of a half-rate source (repeats dropped)" : "") << ", pipelined";
+                << FrameGen::backendName(FrameGen::Backend::Dlss12) << " " << fg_logged_setting
+                << "x of the stream rate, game pictures only, pipelined (now " << fg_pipe_multiplier
+                << " frames from a picture that stood for " << fg_pipe_cadence << " stream frame"
+                << (fg_pipe_cadence == 1 ? ")" : "s)");
+        }
         if (!fg_pipe_logged) {
             fg_pipe_logged = true;
             qCInfo(chiakiGui) << "[framegen] Pipelined: the next stream frame's DLSS work runs on D3D12 while the"
@@ -8399,14 +8583,17 @@ void QmlMainWindow::render()
     // frame (direct_frame_fresh, also the first frame generated from it) or one of the frames
     // generated from it (fg_override); the frame queue a frame it had not shown yet, or a blend
     // of several. Redraws of the image already on screen (UI, stats overlay) do not count.
-    bool new_image = false;
+    int new_image = 0;
     if (bypass_frame_queue) {
-        new_image = fg_override || direct_frame_fresh;
+        // Frames left for this picture: the one shown now was made by frame generation (the real
+        // picture comes last in its batch, so once none are left it was the real one).
+        if (fg_override || direct_frame_fresh)
+            new_image = fg_pending_frames.empty() ? 1 : 2;
     } else if (queue_image_mixed) {
-        new_image = true;
+        new_image = 1;
     } else if (frame_mix.num_frames > 0 && queue_image_signature != display_count_signature) {
         display_count_signature = queue_image_signature;
-        new_image = true;
+        new_image = 1;
     }
     close_started_frame(true, new_image);
 

@@ -3,6 +3,7 @@
 #include "streamsession.h"
 #include "settings.h"
 #include "repeatcadence.h"
+#include "duplicateframe.h"
 #include "neuralrender.h"
 
 #include <QMutex>
@@ -12,6 +13,8 @@
 #include <QLoggingCategory>
 #include <array>
 #include <deque>
+#include <map>
+#include <string>
 #include <vector>
 #include <atomic>
 
@@ -76,6 +79,14 @@ class QmlMainWindow : public QWindow
     Q_PROPERTY(QString gpuName READ gpuName NOTIFY gpuInfoChanged)
     Q_PROPERTY(double streamFps READ streamFps NOTIFY fpsChanged)
     Q_PROPERTY(double displayFps READ displayFps NOTIFY fpsChanged)
+    // New game pictures among the stream frames (-1: not judged, e.g. the frame queue path).
+    Q_PROPERTY(double pictureFps READ pictureFps NOTIFY fpsChanged)
+    // Displayed frames made by frame generation (the rest of displayFps are real pictures).
+    Q_PROPERTY(double generatedFps READ generatedFps NOTIFY fpsChanged)
+    // The two fps lines of the stats overlays: what the stream brings ("60 (game 30)"), and what
+    // the display shows ("120 (30 real + 90 FG)").
+    Q_PROPERTY(QString streamFpsText READ streamFpsText NOTIFY fpsChanged)
+    Q_PROPERTY(QString displayFpsText READ displayFpsText NOTIFY fpsChanged)
     Q_PROPERTY(bool keepVideo READ keepVideo WRITE setKeepVideo NOTIFY keepVideoChanged)
     Q_PROPERTY(bool loadingTransitionComplete READ loadingTransitionComplete NOTIFY loadingTransitionCompleteChanged)
     Q_PROPERTY(VideoMode videoMode READ videoMode WRITE setVideoMode NOTIFY videoModeChanged)
@@ -131,6 +142,10 @@ public:
     QString videoEnhancementStatus() const { return video_enhancement_status; }
     double streamFps() const { return stream_fps; }
     double displayFps() const { return display_fps; }
+    double pictureFps() const { return picture_fps; }
+    double generatedFps() const { return generated_fps; }
+    QString streamFpsText() const;
+    QString displayFpsText() const;
     void increaseDroppedFrames();
 
     bool directStream() const;
@@ -257,7 +272,7 @@ private:
                              bool pending_overflow_waiting,
                              qint64 present_interval_us,
                              qint64 present_submit_interval_us,
-                             bool new_image);
+                             int new_image);
     void finalizeDeferredPresentIfIdle();
     void processDeferredSwapTask(qint64 submit_begin_us,
                                  int queue_depth_at_submit,
@@ -266,7 +281,7 @@ private:
                                  bool pending_overflow_waiting,
                                  qint64 present_interval_us,
                                  qint64 present_submit_interval_us,
-                                 bool new_image);
+                                 int new_image);
     void drainDeferredSwaps();
     void setStreamMaxFPS(unsigned int max_fps);
     void createSwapchain();
@@ -332,7 +347,15 @@ private:
     bool bypass_frame_queue = true;
     QMutex direct_frame_mutex;
     AVFrame *direct_pending_frame = nullptr;
+    // With direct_pending_frame (direct_frame_mutex): the stream frames it stands for (more than
+    // one when the repeats before it were dropped, or a frame before it was replaced unrendered),
+    // and whether frame generation must not interpolate into it (a loss, a scene cut).
+    static constexpr int kMaxFrameGap = 8;
+    int direct_pending_gap = 1;
+    bool direct_pending_fg_reset = false;
     struct pl_frame direct_frame = {};
+    // Render thread: direct_pending_gap of the frame mapped in direct_frame.
+    int direct_frame_gap = 1;
     QAtomicInteger<int> direct_frame_reset = 0;
     uint64_t ts_start = 0;
     double queue_pts_origin = -1.0;
@@ -370,10 +393,17 @@ private:
     // an overlay-only render) is not a displayed frame and is not counted.
     QAtomicInteger<int> stream_frames_current = 0;
     QAtomicInteger<int> display_frames_current = 0;
+    // New game pictures among the stream frames, and the displayed frames frame generation made.
+    QAtomicInteger<int> picture_frames_current = 0;
+    QAtomicInteger<int> generated_frames_current = 0;
+    // presentFrame judged pictures in the last timer period (else the picture rate is unknown).
+    QAtomicInteger<int> picture_frames_judged = 0;
     // Render thread only: signature of the last image counted on the frame queue path.
     uint64_t display_count_signature = 0;
     double stream_fps = 0.0;
     double display_fps = 0.0;
+    double picture_fps = -1.0;
+    double generated_fps = 0.0;
     qint64 fps_sample_us = 0;
     // Written by the render thread, shown in the stats overlay.
     // Configured RTX VSR mode (0 = off) and its state: 1 active, 2 idle, 3 mode unsupported.
@@ -409,10 +439,27 @@ private:
     uint32_t nr_tuning_rev = 0;
     int nr_passes = 1;
     std::array<NeuralRenderTuning, NeuralRenderTuning::kMaxPasses> nr_tuning = {};
-    // Stream frames per game picture (2 = 30 fps game in a 60 fps stream,
-    // repeats dropped before frame generation); set by presentFrame.
+    // Game pictures, not stream frames, go to frame generation (GUI thread, presentFrame): a
+    // stream frame that repeats the last picture (a game under 60 fps) is dropped while frame
+    // generation runs, and the next new picture carries the stream frames it stands for.
+    // dup_detector judges the decoded picture; repeat_detector, from the packet size alone, takes
+    // hardware frames and CHIAKI_FG_DEDUP=0.
+    DuplicateFrameDetector dup_detector;
     RepeatCadenceDetector repeat_detector;
-    QAtomicInteger<int> fg_source_cadence = 1;
+    int dup_frames_since_kept = 0;
+    int dup_mode_logged = 0; // 1 picture, 2 packet size: what the log said for this session
+    struct DupStats
+    {
+        qint64 since_us = 0;
+        int frames = 0, pictures = 0, dropped = 0, kept_repeats = 0, resets = 0, cuts = 0, by_size = 0;
+        int gaps[4] = {}; // kept frames standing for 1, 2, 3, 4 or more stream frames
+        int new_compared = 0, repeat_compared = 0;
+        double new_mean_sum = 0.0, new_mean_min = 1.0, repeat_mean_sum = 0.0, repeat_mean_max = 0.0;
+        std::map<std::string, int> rules;
+    };
+    DupStats dup_stats;
+    // Render thread: the frame generation multiplier the log last named (0 = none yet).
+    int fg_logged_setting = 0;
     // Marker file present while frame generation starts; found at startup it
     // means the last start crashed, and frame generation is switched off.
     bool fg_crash_guard_armed = false;
