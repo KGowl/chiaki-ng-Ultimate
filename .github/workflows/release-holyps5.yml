@@ -1,0 +1,74 @@
+name: Release chiaki-ng HolyPS5 build
+
+# Push a tag such as 1.10.0-holyps5.1 to build the Windows x64 package and publish
+# it as a GitHub pre-release. Windows only: the HolyPS5 setup downloads
+# chiaki-ng-<tag>-win_x64-portable.zip and checks it against SHA256SUMS.txt.
+# (*-rtx.* tags go through release-rtx.yml, v*.*.* tags through build-release.yaml.)
+on:
+  push:
+    tags:
+      - '*-holyps5.*'
+  # To rebuild an existing tag: Actions > this workflow > Run workflow, and pick
+  # the tag (not a branch) under "Use workflow from".
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    uses: ./.github/workflows/build-windows-x86.yml
+    with:
+      require_fgdx12test: true
+
+  publish:
+    name: Publish release
+    needs: [windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: github.ref_type == 'tag'
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename packages after the tag
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp artifacts/chiaki-ng-win_x64-VC-Release/*.zip "release/chiaki-ng-${TAG}-win_x64-portable.zip"
+          cp artifacts/chiaki-ng-win_x64-VC-installer.zip/chiaki-ng-windows-installer.exe "release/chiaki-ng-${TAG}-win_x64-setup.exe"
+          unzip -l "release/chiaki-ng-${TAG}-win_x64-portable.zip" | grep -q 'chiaki-fgdx12test.exe' || { echo "chiaki-fgdx12test.exe missing from the portable zip"; exit 1; }
+          (cd release && sha256sum * > SHA256SUMS.txt)
+          cat release/SHA256SUMS.txt
+          ls -l release
+
+      - name: Write release notes
+        run: |
+          cat > release-notes.md <<EOF
+          chiaki-ng ${TAG} for the HolyPS5 setup (Windows x64, NVIDIA RTX).
+
+          | File | |
+          |---|---|
+          | \`chiaki-ng-${TAG}-win_x64-portable.zip\` | portable package (used by the HolyPS5 setup) |
+          | \`chiaki-ng-${TAG}-win_x64-setup.exe\` | installer |
+          | \`SHA256SUMS.txt\` | SHA-256 checksums |
+
+          Built from ${GITHUB_SHA}.
+          EOF
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: chiaki-ng ${{ env.TAG }}
+          body_path: release-notes.md
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: release/*

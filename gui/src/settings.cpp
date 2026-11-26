@@ -865,6 +865,16 @@ void Settings::SetAudioInDevice(QString device_name)
 	settings.setValue("settings/audio_in_device", device_name);
 }
 
+QString Settings::GetHapticsAudioDevice() const
+{
+	return settings.value("settings/haptics_audio_device").toString();
+}
+
+void Settings::SetHapticsAudioDevice(QString device_name)
+{
+	settings.setValue("settings/haptics_audio_device", device_name);
+}
+
 void Settings::SetAudioBufferSize(unsigned int size)
 {
 	settings.setValue("settings/audio_buffer_size", size);

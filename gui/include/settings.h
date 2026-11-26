@@ -421,6 +421,10 @@ class Settings : public QObject
 		QString GetAudioInDevice() const;
 		void SetAudioInDevice(QString device_name);
 
+		// Exact SDL output device name for DualSense haptics; empty = automatic choice.
+		QString GetHapticsAudioDevice() const;
+		void SetHapticsAudioDevice(QString device_name);
+
 		uint GetWifiDroppedNotif() const;
 		void SetWifiDroppedNotif(uint percent);
 

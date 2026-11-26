@@ -280,6 +280,7 @@ StreamSessionConnectInfo::StreamSessionConnectInfo(
 	hw_device_ctx = nullptr;
 	audio_out_device = settings->GetAudioOutDevice();
 	audio_in_device = settings->GetAudioInDevice();
+	haptics_audio_device = settings->GetHapticsAudioDevice();
 	log_level_mask = settings->GetLogLevelMask();
 	log_sanitize = settings->GetLogSanitize();
 	audio_volume = settings->GetAudioVolume();
@@ -439,6 +440,7 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	start_mic_unmuted = connect_info.start_mic_unmuted;
 	audio_out_device_name = connect_info.audio_out_device;
 	audio_in_device_name = connect_info.audio_in_device;
+	haptics_audio_device_name = connect_info.haptics_audio_device;
 
 	chiaki_opus_decoder_init(&opus_decoder, log.GetChiakiLog());
 	chiaki_opus_encoder_init(&opus_encoder, log.GetChiakiLog());
@@ -1831,20 +1833,89 @@ void StreamSession::ConnectHaptics()
 	want.samples = haptics_buffer_size;
 	want.callback = NULL;
 
-	const char *device_name = nullptr;
-	for (int i=0; i < SDL_GetNumAudioDevices(0); i++)
+	// Several output devices can match the needle: with a virtual wired DualSense (e.g. DSZ over
+	// USB/IP) next to the real pad's Bluetooth speaker endpoint, both are called "Wireless
+	// Controller". Haptics need the 4-channel endpoint, so collect every candidate and prefer
+	// one whose device format has 4 channels; otherwise use the first match that opens (the old
+	// behaviour). settings/haptics_audio_device (exact name) overrides the automatic choice.
+	// SDL opens devices by name, so devices with the same name count once.
+	struct HapticsCandidate { QString name; int channels; bool is_override; };
+	QList<HapticsCandidate> candidates;
+	const int num_devices = SDL_GetNumAudioDevices(0);
+	for (int i=0; i < num_devices; i++)
 	{
-		device_name = SDL_GetAudioDeviceName(i, 0);
-		if (!device_name || !strstr(device_name, DUALSENSE_AUDIO_DEVICE_NEEDLE))
+		const char *name = SDL_GetAudioDeviceName(i, 0);
+		if (!name)
+			continue;
+		const QString qname = QString::fromUtf8(name);
+		const bool is_override = !haptics_audio_device_name.isEmpty() && haptics_audio_device_name == qname;
+		if (!is_override && !strstr(name, DUALSENSE_AUDIO_DEVICE_NEEDLE))
+			continue;
+		bool duplicate = false;
+		for (const auto &c : candidates)
+			duplicate = duplicate || c.name == qname;
+		if (duplicate)
 		{
+			CHIAKI_LOGI(log.GetChiakiLog(), "Haptics audio device candidate %d: '%s' (same name as an earlier candidate, skipped)", i, name);
 			continue;
 		}
-		haptics_output = SDL_OpenAudioDevice(device_name, 0, &want, &have, 0);
-		if (haptics_output == 0)
+		// The device's own channel count. SDL_OpenAudioDevice() with no allowed changes always
+		// reports the requested spec, so it can't tell a 4-channel endpoint from a stereo one.
+		int channels = 0;
+#if SDL_VERSION_ATLEAST(2, 0, 16)
+		SDL_AudioSpec dev_spec;
+		SDL_zero(dev_spec);
+		if (SDL_GetAudioDeviceSpec(i, 0, &dev_spec) == 0)
+			channels = dev_spec.channels;
+#endif
+		if (channels <= 0)
+		{
+			SDL_AudioSpec probe_have;
+			SDL_zero(probe_have);
+			SDL_AudioDeviceID probe = SDL_OpenAudioDevice(name, 0, &want, &probe_have, SDL_AUDIO_ALLOW_CHANNELS_CHANGE);
+			if (probe != 0)
+			{
+				channels = probe_have.channels;
+				SDL_CloseAudioDevice(probe);
+			}
+		}
+		CHIAKI_LOGI(log.GetChiakiLog(), "Haptics audio device candidate %d: '%s', %d channels%s", i, name, channels, is_override ? " (configured override)" : "");
+		candidates.append({ qname, channels, is_override });
+	}
+	if (!haptics_audio_device_name.isEmpty())
+	{
+		bool found = false;
+		for (const auto &c : candidates)
+			found = found || c.is_override;
+		if (!found)
+			CHIAKI_LOGW(log.GetChiakiLog(), "Configured haptics audio device '%s' not found, choosing automatically", qPrintable(haptics_audio_device_name));
+	}
+
+	// Try order: configured override, then 4-channel devices, then the rest, each in SDL order.
+	QList<HapticsCandidate> order;
+	for (const auto &c : candidates)
+		if (c.is_override)
+			order.append(c);
+	for (const auto &c : candidates)
+		if (!c.is_override && c.channels == 4)
+			order.append(c);
+	for (const auto &c : candidates)
+		if (!c.is_override && c.channels != 4)
+			order.append(c);
+
+	for (const auto &candidate : order)
+	{
+		const QByteArray chosen = candidate.name.toUtf8();
+		const char *device_name = chosen.constData();
+		SDL_AudioDeviceID dev = SDL_OpenAudioDevice(device_name, 0, &want, &have, 0);
+		if (dev == 0)
 		{
 			CHIAKI_LOGE(log.GetChiakiLog(), "Could not open SDL Audio Device %s for haptics output: %s", device_name, SDL_GetError());
 			continue;
 		}
+		if (candidate.channels != 4)
+			CHIAKI_LOGW(log.GetChiakiLog(), "Haptics audio device '%s' reports %d channels, not 4; haptics may be wrong (set settings/haptics_audio_device to pick another device)", device_name, candidate.channels);
+		haptics_output = dev;
 		SDL_PauseAudioDevice(haptics_output, 0);
 		CHIAKI_LOGI(log.GetChiakiLog(), "Haptics Audio Device '%s' opened with %d channels @ %d Hz, buffer size %u (driver=%s)", device_name, have.channels, have.freq, have.size, SDL_GetCurrentAudioDriver());
 		QMetaObject::invokeMethod(this, [this]() {

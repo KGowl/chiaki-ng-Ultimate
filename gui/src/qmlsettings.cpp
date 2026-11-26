@@ -604,6 +604,17 @@ void QmlSettings::setAudioOutDevice(const QString &device)
     emit audioOutDeviceChanged();
 }
 
+QString QmlSettings::hapticsAudioDevice() const
+{
+    return settings->GetHapticsAudioDevice();
+}
+
+void QmlSettings::setHapticsAudioDevice(const QString &device)
+{
+    settings->SetHapticsAudioDevice(device);
+    emit hapticsAudioDeviceChanged();
+}
+
 QString QmlSettings::decoder() const
 {
     return settings->GetHardwareDecoder();
@@ -2341,6 +2352,7 @@ void QmlSettings::refreshAllKeys()
     emit audioVolumeChanged();
     emit audioOutDeviceChanged();
     emit audioInDeviceChanged();
+    emit hapticsAudioDeviceChanged();
     emit wifiDroppedNotifChanged();
     emit portGuessingEnabledChanged();
     emit portGuessCountChanged();

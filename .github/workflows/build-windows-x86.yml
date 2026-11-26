@@ -2,11 +2,17 @@ name: Build chiaki-ng Windows x86_64 (VC)
 
 on:
   workflow_dispatch:
-  # Called by release-rtx.yml to build release packages.
+  # Called by release-rtx.yml and release-holyps5.yml to build release packages.
   workflow_call:
+    inputs:
+      require_fgdx12test:
+        description: Fail when chiaki-fgdx12test.exe is not in the portable package
+        type: boolean
+        default: false
   push:
     branches:
-      - claude/happy-gauss-7i9rwm
+      - holyps5
+      - 'holyps5-*'
 
 # A newer push to the same branch supersedes a running build. Literal name: in a
 # workflow_call run github.workflow is the caller's, so both builds would share a group.
@@ -331,6 +337,19 @@ jobs:
           Compress-Archive chiaki-ng-Win $RELEASE_PACKAGE_FILE
           $release_filepath = Get-ChildItem $RELEASE_PACKAGE_FILE | %{$_[0].FullName}
           echo "RELEASE_PACKAGE_PATH=$release_filepath" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+
+      # HolyPS5 builds (holyps5 branches, *-holyps5.* tags) must ship the frame generation test tool;
+      # the HolyPS5 setup expects it. Other builds only list the package.
+      - name: Check package contents
+        env:
+          REQUIRE_FGDX12TEST: ${{ inputs.require_fgdx12test || startsWith(github.ref_name, 'holyps5') || contains(github.ref_name, '-holyps5.') }}
+        run: |
+          Get-ChildItem chiaki-ng-Win -File | Sort-Object Name | ForEach-Object { "{0,12}  {1}" -f $_.Length, $_.Name }
+          if (-not (Test-Path chiaki-ng-Win\chiaki.exe)) { throw "chiaki.exe missing from the package" }
+          if (-not (Test-Path chiaki-ng-Win\chiaki-fgdx12test.exe)) {
+            if ($env:REQUIRE_FGDX12TEST -eq 'true') { throw "chiaki-fgdx12test.exe missing from the package" }
+            Write-Warning "chiaki-fgdx12test.exe is not in the package"
+          }
 
       - name: Upload chiaki-ng Artifact
         uses: actions/upload-artifact@v4

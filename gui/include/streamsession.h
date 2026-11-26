@@ -76,6 +76,7 @@ class SdeckHapticsWorker;
 		AVBufferRef *hw_device_ctx;
 		QString audio_out_device;
 		QString audio_in_device;
+		QString haptics_audio_device;
 		uint32_t log_level_mask;
 		bool log_sanitize = true;
 		QString log_file;
@@ -251,6 +252,7 @@ class StreamSession : public QObject
 
 		QString audio_out_device_name;
 		QString audio_in_device_name;
+		QString haptics_audio_device_name;
 		SDL_AudioDeviceID audio_out;
 		SDL_AudioDeviceID audio_in;
 		size_t audio_out_sample_size;

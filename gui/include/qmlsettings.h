@@ -53,6 +53,7 @@ class QmlSettings : public QObject
     Q_PROPERTY(int audioBufferSize READ audioBufferSize WRITE setAudioBufferSize NOTIFY audioBufferSizeChanged)
     Q_PROPERTY(int audioVolume READ audioVolume WRITE setAudioVolume NOTIFY audioVolumeChanged)
     Q_PROPERTY(QString audioInDevice READ audioInDevice WRITE setAudioInDevice NOTIFY audioInDeviceChanged)
+    Q_PROPERTY(QString hapticsAudioDevice READ hapticsAudioDevice WRITE setHapticsAudioDevice NOTIFY hapticsAudioDeviceChanged)
     Q_PROPERTY(QString audioOutDevice READ audioOutDevice WRITE setAudioOutDevice NOTIFY audioOutDeviceChanged)
     Q_PROPERTY(QString decoder READ decoder WRITE setDecoder NOTIFY decoderChanged)
     Q_PROPERTY(bool useZeroCopy READ useZeroCopy WRITE setUseZeroCopy NOTIFY useZeroCopyChanged)
@@ -322,6 +323,9 @@ public:
 
     QString audioOutDevice() const;
     void setAudioOutDevice(const QString &device);
+
+    QString hapticsAudioDevice() const;
+    void setHapticsAudioDevice(const QString &device);
 
     QString decoder() const;
     void setDecoder(const QString &decoder);
@@ -755,6 +759,7 @@ signals:
     void audioVolumeChanged();
     void audioOutDeviceChanged();
     void audioInDeviceChanged();
+    void hapticsAudioDeviceChanged();
     void wifiDroppedNotifChanged();
     void portGuessingEnabledChanged();
     void portGuessCountChanged();

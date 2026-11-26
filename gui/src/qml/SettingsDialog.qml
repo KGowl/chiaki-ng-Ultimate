@@ -1932,6 +1932,32 @@ DialogView {
                             currentIndex: Math.max(0, model.indexOf(Chiaki.settings.audioInDevice))
                             onActivated: (index) => Chiaki.settings.audioInDevice = index ? model[index] : ""
                             KeyNavigation.up: audioOutDevice
+                            KeyNavigation.down: hapticsAudioDevice
+                            KeyNavigation.priority: popup.visible ? KeyNavigation.AfterItem : KeyNavigation.BeforeItem
+                        }
+
+                        Label {
+                            Layout.alignment: Qt.AlignRight
+                            text: qsTr("(Auto)")
+                        }
+
+                        Label {
+                            Layout.alignment: Qt.AlignRight
+                            text: qsTr("DualSense Haptics Device:")
+                        }
+
+                        // Auto picks the 4-channel "Wireless Controller" endpoint (e.g. the DSZ
+                        // virtual wired DualSense rather than the Bluetooth speaker endpoint).
+                        C.ComboBox {
+                            id: hapticsAudioDevice
+                            Layout.preferredWidth: 400
+                            popup.x: (width - popup.width) / 2
+                            popup.width: 700
+                            popup.font.pixelSize: 16
+                            model: [qsTr("Auto")].concat(Chiaki.settings.availableAudioOutDevices)
+                            currentIndex: Math.max(0, model.indexOf(Chiaki.settings.hapticsAudioDevice))
+                            onActivated: (index) => Chiaki.settings.hapticsAudioDevice = index ? model[index] : ""
+                            KeyNavigation.up: audioInDevice
                             KeyNavigation.down: audioBufferSizeSlider
                             KeyNavigation.priority: popup.visible ? KeyNavigation.AfterItem : KeyNavigation.BeforeItem
                         }
@@ -1954,7 +1980,7 @@ DialogView {
                             stepSize: 1
                             value: Chiaki.settings.audioBufferSize / 1920 ? (Chiaki.settings.audioBufferSize / 1920) : 5
                             onMoved: Chiaki.settings.audioBufferSize = value * 1920;
-                            KeyNavigation.up: audioInDevice
+                            KeyNavigation.up: hapticsAudioDevice
 
                             Label {
                                 anchors {
