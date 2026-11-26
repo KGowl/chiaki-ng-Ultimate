@@ -58,8 +58,11 @@ public:
     // (Re)creates the shared buffers, the D3D12 textures and the NGX feature for this
     // size and runs two warm-up evaluations (the runtime builds its pipelines then,
     // about 0.4 s). No GPU work may be pending on either side.
-    bool ensureSize(int w, int h);
-    bool sizeMatches(int w, int h) const;
+    // `hdr`: the color buffers are RGBA16F (DXGI_FORMAT_R16G16B16A16_FLOAT /
+    // VK_FORMAT_R16G16B16A16_SFLOAT) and DLSS-G is told they are HDR (colorBuffersHDR); they
+    // hold the output's own values (BT.2020 PQ), not linear light. Otherwise RGBA8.
+    bool ensureSize(int w, int h, bool hdr = false);
+    bool sizeMatches(int w, int h, bool hdr = false) const;
     // Drops the size dependent state. No GPU work may be pending.
     void invalidate();
 
@@ -73,8 +76,9 @@ public:
     uint64_t completedValue() const;
 
     // Record copies between a Vulkan image (VK_IMAGE_LAYOUT_GENERAL) and the shared
-    // buffers. The color image is RGBA8 (VK_FORMAT_R8G8B8A8_UNORM), the motion image
-    // VK_FORMAT_R16G16_SFLOAT, both w x h as given to ensureSize().
+    // buffers. The color image is VK_FORMAT_R8G8B8A8_UNORM, or VK_FORMAT_R16G16B16A16_SFLOAT
+    // when ensureSize() was given `hdr`; the motion image VK_FORMAT_R16G16_SFLOAT; all w x h
+    // as given to ensureSize().
     void recordColor(VkCommandBuffer cmd, VkImage image);
     void recordMotion(VkCommandBuffer cmd, VkImage image);
     void recordDownload(VkCommandBuffer cmd, VkImage image, int index);
