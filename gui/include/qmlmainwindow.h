@@ -256,7 +256,8 @@ private:
                              bool pending_frame_waiting,
                              bool pending_overflow_waiting,
                              qint64 present_interval_us,
-                             qint64 present_submit_interval_us);
+                             qint64 present_submit_interval_us,
+                             bool new_image);
     void finalizeDeferredPresentIfIdle();
     void processDeferredSwapTask(qint64 submit_begin_us,
                                  int queue_depth_at_submit,
@@ -264,7 +265,8 @@ private:
                                  bool pending_frame_waiting,
                                  bool pending_overflow_waiting,
                                  qint64 present_interval_us,
-                                 qint64 present_submit_interval_us);
+                                 qint64 present_submit_interval_us,
+                                 bool new_image);
     void drainDeferredSwaps();
     void setStreamMaxFPS(unsigned int max_fps);
     void createSwapchain();
@@ -362,10 +364,14 @@ private:
     // Render thread only: the "Failed to start Placebo frame" warning was
     // already logged for the current hidden/minimized period.
     bool start_frame_hidden_logged = false;
-    // Frames decoded from the stream / frames handed to the swapchain, counted
-    // between two ticks of the 1 s stats timer.
+    // Frames decoded from the stream / frames presented with a new image (a new stream
+    // frame or a generated one), counted between two ticks of the 1 s stats timer. A
+    // present that shows the same image again (a redraw for the UI or the stats overlay,
+    // an overlay-only render) is not a displayed frame and is not counted.
     QAtomicInteger<int> stream_frames_current = 0;
     QAtomicInteger<int> display_frames_current = 0;
+    // Render thread only: signature of the last image counted on the frame queue path.
+    uint64_t display_count_signature = 0;
     double stream_fps = 0.0;
     double display_fps = 0.0;
     qint64 fps_sample_us = 0;

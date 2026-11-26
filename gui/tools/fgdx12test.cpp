@@ -17,6 +17,10 @@
 //              NVIDIA's feature 18 model (0 CC, 1 HT).
 //   --pipeline drives backend 5 and --nr (with --with-fg) the way the renderer pipelines them:
 //              begin(), poll beginDone(), then process() / finish(), with the same checks.
+//   --timing   (frame generation) times the calls instead of checking the frames: one frame every
+//              16.7 ms like a 60 fps stream, nothing read back, median / p90 / max per phase. The
+//              checks read every frame back on the CPU and leave the GPU idle long enough to clock
+//              down, so their times are not what a stream gets.
 // For backend 5 and --nr on a GPU without NVIDIA's runtime, NeuralHub's dxgi.dll and
 // neuralhub.ini must sit next to the executable.
 
@@ -36,7 +40,9 @@
 #include <QLoggingCategory>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -354,11 +360,20 @@ struct Rig
     {
         if (!ensureHdrSource())
             return false;
+        // The pattern has 256 levels: their PQ halves once, not a pow() per pixel per frame. Computing
+        // them per pixel kept a CPU core busy long enough between frames for the GPU to clock down,
+        // which made HDR frame generation look 4-7x slower than SDR here (it is not in a stream).
+        static const std::array<uint16_t, 256> pq_half = [] {
+            std::array<uint16_t, 256> lut = {};
+            for (int i = 0; i < 256; i++)
+                lut[static_cast<size_t>(i)] = floatToHalf(static_cast<float>(pqEncode(patternNits(i))));
+            return lut;
+        }();
         std::vector<uint16_t> data(static_cast<size_t>(w) * h * 4);
         for (int y = 0; y < h; y++) {
             uint16_t *row = data.data() + static_cast<size_t>(y) * w * 4;
             for (int x = 0; x < w; x++) {
-                const uint16_t v = floatToHalf(static_cast<float>(pqEncode(patternNits(pattern(x, y, shift_px)))));
+                const uint16_t v = pq_half[pattern(x, y, shift_px)];
                 row[4 * x] = row[4 * x + 1] = row[4 * x + 2] = v;
                 row[4 * x + 3] = 0x3c00; // 1.0
             }
@@ -757,7 +772,7 @@ int main(int argc, char **argv)
     timeBeginPeriod(1);
 #endif
     int backend_value = 5, frames = 20, mvx = 8, w = 1920, h = 1080, model = 0, passes = 1, tune_at = -1;
-    bool nr_mode = false, with_fg = false, hdr = false, pipeline = false;
+    bool nr_mode = false, with_fg = false, hdr = false, pipeline = false, timing = false;
     float scale = 1.0f;
     std::string image_path, out_path;
     for (int i = 1; i < argc; i++) {
@@ -777,6 +792,7 @@ int main(int argc, char **argv)
         else if (a == "--passes" && i + 1 < argc) passes = std::atoi(argv[++i]);
         else if (a == "--tune-at" && i + 1 < argc) tune_at = std::atoi(argv[++i]);
         else if (a == "--pipeline") pipeline = true;
+        else if (a == "--timing") timing = true;
     }
     if (nr_mode) {
         if (!NeuralRender::compiledIn()) {
@@ -796,9 +812,10 @@ int main(int argc, char **argv)
         return result;
     }
     const auto backend = static_cast<FrameGen::Backend>(backend_value);
-    std::printf("chiaki-fgdx12test: backend %s, %d frames, %d px/frame motion%s%s\n", FrameGen::backendName(backend), frames,
+    std::printf("chiaki-fgdx12test: backend %s, %d frames, %d px/frame motion%s%s%s\n", FrameGen::backendName(backend), frames,
                 mvx, pipeline ? ", pipelined (begin / beginDone / finish)" : "",
-                hdr ? ", HDR (PQ BT.2020 RGBA16F, up to 1500 nits)" : "");
+                hdr ? ", HDR (PQ BT.2020 RGBA16F, up to 1500 nits)" : "",
+                timing ? ", timing only (paced at 60 fps, frames not checked)" : "");
     // Frame generation must stay off for HDR frames: an 8-bit backend, or (test hook) a runtime
     // that refuses RGBA16F, which must not take the backend down for SDR frames either.
     const bool refuse_hdr = hdr && std::getenv("CHIAKI_DX12FG_REFUSE_HDR") != nullptr;
@@ -832,6 +849,7 @@ int main(int argc, char **argv)
         { "2x, clean-up off", w, h, 2, frames, 0 },
         { "2x, clean-up on (default)", w, h, 2, std::min(frames, 8), 2 },
         { "4x, clean-up off", w, h, 4, std::min(frames, 8), 0 },
+        { "4x, clean-up on (default)", w, h, 4, std::min(frames, 8), 2 },
         { "resize to 1280x720, 2x", 1280, 720, 2, std::min(frames, 6), 0 },
         { "back to the first size, 3x", w, h, 3, std::min(frames, 6), 0 },
     };
@@ -856,6 +874,8 @@ int main(int argc, char **argv)
         int good = 0, checked = 0;
         double sum_ms = 0.0;
         int timed = 0;
+        std::vector<double> times; // --timing
+        int timing_failures = 0;
         PqStats hdr_src = {};
         for (int k = 0; k < phase.frames; k++) {
             shift_counter++;
@@ -888,6 +908,17 @@ int main(int argc, char **argv)
             if (k >= 2) {
                 sum_ms += ms;
                 timed++;
+            }
+            if (timing) {
+                if (k > 0 && !hdr_off && (!ok || outputs.empty()))
+                    timing_failures++;
+                if (k >= 2)
+                    times.push_back(ms);
+                // The next stream frame comes 16.7 ms after this one started.
+                const double left_ms = 1000.0 / 60.0 - timer.nsecsElapsed() / 1e6;
+                if (left_ms > 0.0)
+                    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long long>(left_ms * 1000.0)));
+                continue;
             }
             if (!ok || outputs.empty()) {
                 std::printf("frame %2d: process() returned %s, %zu outputs\n", k, ok ? "true" : "false", outputs.size());
@@ -963,6 +994,17 @@ int main(int argc, char **argv)
             if (frame_good)
                 good++;
         }
+        if (timing) {
+            std::sort(times.begin(), times.end());
+            if (!times.empty()) {
+                const auto at = [&](double q) { return times[std::min(times.size() - 1, static_cast<size_t>(q * times.size()))]; };
+                std::printf("-- timing: %zu frames, process() median %.2f ms, p90 %.2f ms, max %.2f ms%s\n", times.size(),
+                            at(0.5), at(0.9), times.back(), timing_failures ? ", FAIL: calls without frames" : "");
+            }
+            if (timing_failures)
+                failures++;
+            continue;
+        }
         if (timed)
             std::printf("-- %d of %d checked frames good, average process() %.2f ms, GPU time reported %.2f ms\n", good,
                         checked, sum_ms / timed, fg.gpuTimeMs());
@@ -995,6 +1037,7 @@ int main(int argc, char **argv)
     }
     fg.destroy();
     rig.destroy();
-    std::printf("\nVERDICT: %s\n", failures == 0 ? "ALL PHASES PASSED" : "SOME PHASES FAILED, see above");
+    std::printf("\nVERDICT: %s\n", failures != 0 ? "SOME PHASES FAILED, see above"
+                                   : timing ? "TIMING DONE (frames not checked)" : "ALL PHASES PASSED");
     return failures == 0 ? 0 : 1;
 }
