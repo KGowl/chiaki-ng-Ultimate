@@ -330,6 +330,20 @@ private:
     bool bypass_frame_queue = true;
     QMutex direct_frame_mutex;
     AVFrame *direct_pending_frame = nullptr;
+    // Per-stage latency of Direct Mapping, logged every 10 s at info level ("Latency:"):
+    // decoder delivery -> taken by the render, DLSS 5 and frame generation call times, and
+    // delivery -> the first present made from that stream frame (pipelined or not).
+    qint64 direct_pending_delivery_us = 0; // with direct_pending_frame (direct_frame_mutex)
+    qint64 fg_pipe_delivery_us = 0;        // the stream frame in the frame generation pipeline
+    qint64 stage_present_delivery_us = 0;  // the next swap presents this stream frame's first frame
+    struct StageStats
+    {
+        qint64 since_us = 0;
+        int frames = 0, presents = 0, nr = 0, fg = 0;
+        double take_ms = 0.0, present_ms = 0.0, present_max_ms = 0.0, nr_ms = 0.0, fg_ms = 0.0;
+        double nr_gpu_ms = 0.0, fg_gpu_ms = 0.0;
+    } stage_stats;
+    void stageStatsFlush(qint64 now_us);
     struct pl_frame direct_frame = {};
     QAtomicInteger<int> direct_frame_reset = 0;
     uint64_t ts_start = 0;

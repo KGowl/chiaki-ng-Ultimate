@@ -3229,6 +3229,7 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
                 dropped_frames_current.fetchAndAddRelaxed(1);
             }
             direct_pending_frame = frame.frame;
+            direct_pending_delivery_us = decoder_delivery_us > 0 ? decoder_delivery_us : present_entry_us;
         }
         if (!startup_warmup_frame_active)
             startup_first_real_frame_queued_pending_visibility.storeRelease(1);
@@ -7099,6 +7100,8 @@ void QmlMainWindow::render()
         fg_pending_frames.erase(fg_pending_frames.begin());
         fg_pipe_present = true;
         fg_override = true;
+        stage_present_delivery_us = fg_pipe_delivery_us;
+        fg_pipe_delivery_us = 0;
     } else if (bypass_frame_queue && fg_pipe_stage != FgPipeStage::Idle) {
         // Taken, but its pipeline failed: the normal path below handles it.
         fgPipeCancel();
@@ -7108,10 +7111,22 @@ void QmlMainWindow::render()
     auto take_incoming_frame = [&]() {
         AVFrame *incoming = nullptr;
         bool reset_direct_frame = false;
+        qint64 incoming_delivery_us = 0;
         {
             QMutexLocker locker(&direct_frame_mutex);
             std::swap(incoming, direct_pending_frame);
+            incoming_delivery_us = direct_pending_delivery_us;
             reset_direct_frame = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
+        }
+        if (incoming && incoming_delivery_us > 0) {
+            const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+            stage_stats.frames++;
+            stage_stats.take_ms += (now_us - incoming_delivery_us) / 1000.0;
+            // Pipelined, its first frame is presented in a later render (fg_pipe_present).
+            if (fg_pipe_take)
+                fg_pipe_delivery_us = incoming_delivery_us;
+            else
+                stage_present_delivery_us = incoming_delivery_us;
         }
         if (reset_direct_frame && frame_gen)
             frame_gen->reset();
@@ -7548,6 +7563,14 @@ void QmlMainWindow::render()
                 logSwapInterval(swap_us);
                 this->last_swap_return_us.storeRelease(swap_us);
                 present_complete_us = swap_us;
+                if (stage_present_delivery_us > 0 && swap_us >= stage_present_delivery_us) {
+                    const double ms = (swap_us - stage_present_delivery_us) / 1000.0;
+                    stage_stats.presents++;
+                    stage_stats.present_ms += ms;
+                    stage_stats.present_max_ms = qMax(stage_stats.present_max_ms, ms);
+                    stage_present_delivery_us = 0;
+                }
+                stageStatsFlush(swap_us);
                 const auto swap_render_state = snapshotRenderScheduleState();
                 logRenderPhaseStall(swap_us,
                                     "swap",
@@ -8087,9 +8110,16 @@ void QmlMainWindow::render()
         if (bypass_frame_queue) {
             struct pl_frame rendered = {};
             uint64_t rendered_signature = 0;
-            if (direct_render_frame.num_planes > 0 &&
+            const qint64 nr_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+            const bool nr_done = direct_render_frame.num_planes > 0 &&
                 neural_render->process(&direct_render_frame, direct_frame_serial, nr_options_for(&direct_render_frame),
-                                       &rendered, &rendered_signature)) {
+                                       &rendered, &rendered_signature);
+            if (nr_done && direct_frame_fresh) {
+                stage_stats.nr++;
+                stage_stats.nr_ms += (static_cast<qint64>(chiaki_time_now_monotonic_us()) - nr_begin_us) / 1000.0;
+                stage_stats.nr_gpu_ms += neural_render->gpuTimeMs();
+            }
+            if (nr_done) {
                 note_result(&direct_render_frame, rendered);
                 direct_render_frame = rendered;
                 direct_signature = rendered_signature;
@@ -8259,10 +8289,17 @@ void QmlMainWindow::render()
             frame_gen->setDlssMotion(settings->GetFrameGenDlssMotion());
             frame_gen->setCleanup(settings->GetFrameGenCleanup());
             frame_gen->setVfgMode(settings->GetFrameGenVfgMode());
-            if (multiplier >= 2 &&
+            const qint64 fg_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+            const bool fg_done = multiplier >= 2 &&
                 frame_gen->process(&direct_render_frame, fg_out_w, fg_out_h, multiplier,
                                    static_cast<float>(source_interval_s * 1000.0), fg_outputs) &&
-                !fg_outputs.empty()) {
+                !fg_outputs.empty();
+            if (fg_done) {
+                stage_stats.fg++;
+                stage_stats.fg_ms += (static_cast<qint64>(chiaki_time_now_monotonic_us()) - fg_begin_us) / 1000.0;
+                stage_stats.fg_gpu_ms += frame_gen->gpuTimeMs();
+            }
+            if (fg_done) {
                 if (fg_outputs.size() > 1 && fg_crash_guard_armed && ++fg_crash_guard_good_frames >= 120) {
                     QFile::remove(frameGenCrashGuardPath());
                     fg_crash_guard_armed = false;
@@ -8402,6 +8439,34 @@ void QmlMainWindow::render()
     // by the next renders.
     if (!fg_pending_frames.empty() || fg_pipe_stage != FgPipeStage::Idle)
         scheduleUpdate(false, UpdateRequestReason::PendingFrame);
+}
+
+void QmlMainWindow::stageStatsFlush(qint64 now_us)
+{
+    StageStats &s = stage_stats;
+    if (s.since_us == 0) {
+        s.since_us = now_us;
+        return;
+    }
+    if (now_us - s.since_us < 10000000)
+        return;
+    if (s.frames > 0) {
+        QString line = QStringLiteral("Latency: %1 stream frames in %2 s, decoded -> taken by the render %3 ms")
+                           .arg(s.frames).arg((now_us - s.since_us) / 1e6, 0, 'f', 1)
+                           .arg(s.take_ms / s.frames, 0, 'f', 2);
+        if (s.nr)
+            line += QStringLiteral(", DLSS 5 call %1 ms (GPU %2 ms)").arg(s.nr_ms / s.nr, 0, 'f', 2)
+                        .arg(s.nr_gpu_ms / s.nr, 0, 'f', 2);
+        if (s.fg)
+            line += QStringLiteral(", frame generation call %1 ms (GPU %2 ms)").arg(s.fg_ms / s.fg, 0, 'f', 2)
+                        .arg(s.fg_gpu_ms / s.fg, 0, 'f', 2);
+        if (s.presents)
+            line += QStringLiteral(", decoded -> first present %1 ms avg, %2 ms max (%3 frames)")
+                        .arg(s.present_ms / s.presents, 0, 'f', 2).arg(s.present_max_ms, 0, 'f', 2).arg(s.presents);
+        qCInfo(chiakiGui).noquote() << line;
+    }
+    s = StageStats();
+    s.since_us = now_us;
 }
 
 bool QmlMainWindow::fgPipeEnabled()
