@@ -656,6 +656,8 @@ struct DeferredSwapTask
     bool pending_overflow_waiting = false;
     qint64 present_interval_us = 0;
     qint64 present_submit_interval_us = 0;
+    // The present shows a new image (counted in the display fps).
+    bool new_image = false;
 };
 
 class DeferredSwapThread final : public QThread
@@ -727,7 +729,8 @@ protected:
                                                task.pending_frame_waiting,
                                                task.pending_overflow_waiting,
                                                task.present_interval_us,
-                                               task.present_submit_interval_us);
+                                               task.present_submit_interval_us,
+                                               task.new_image);
             }
 
             {
@@ -5978,11 +5981,13 @@ bool QmlMainWindow::enqueueDeferredSwap(qint64 submit_begin_us,
                                         bool pending_frame_waiting,
                                         bool pending_overflow_waiting,
                                         qint64 present_interval_us,
-                                        qint64 present_submit_interval_us)
+                                        qint64 present_submit_interval_us,
+                                        bool new_image)
 {
     if (!vulkan_deferred_swap_enabled || !deferred_swap_thread || render_backend != RenderBackend::Vulkan || !placebo_swapchain)
         return false;
     DeferredSwapTask task;
+    task.new_image = new_image;
     task.submit_request_us = submit_begin_us;
     task.queue_depth_at_submit = queue_depth_at_submit;
     task.depth_limit = depth_limit;
@@ -6003,7 +6008,8 @@ void QmlMainWindow::processDeferredSwapTask(qint64 submit_begin_us,
                                             bool pending_frame_waiting,
                                             bool pending_overflow_waiting,
                                             qint64 present_interval_us,
-                                            qint64 present_submit_interval_us)
+                                            qint64 present_submit_interval_us,
+                                            bool new_image)
 {
     auto snapshot_render_schedule_state = [this]() {
         QMutexLocker locker(&render_schedule_mutex);
@@ -6038,7 +6044,8 @@ void QmlMainWindow::processDeferredSwapTask(qint64 submit_begin_us,
         if (!pl_swapchain_submit_frame(placebo_swapchain))
             qCWarning(chiakiGui) << "Failed to submit Placebo frame on deferred thread!";
         else {
-            display_frames_current.fetchAndAddRelaxed(1);
+            if (new_image)
+                display_frames_current.fetchAndAddRelaxed(1);
             const qint64 submit_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
             logLatencyStats("pl_swapchain_submit_frame", submit_us - submit_call_begin_us);
             CHIAKI_NOISY_DEBUG().nospace()
@@ -7390,7 +7397,9 @@ void QmlMainWindow::render()
     if (render_entry_us_local > 0 && render_to_start_frame_us >= render_entry_us_local)
         logLatencyStats("render_to_start_frame", render_to_start_frame_us - render_entry_us_local);
     // Submit immediately and let the swapchain / render path enforce pacing.
-    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present) -> bool {
+    // `new_image`: the present shows a new stream frame or a generated one, not the same
+    // image again; only those count in the display fps.
+    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present, bool new_image = false) -> bool {
         const qint64 submit_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         const int queue_depth_now = snapshotQueueDepth();
         if (detailedVerboseTelemetryEnabled()) {
@@ -7460,7 +7469,8 @@ void QmlMainWindow::render()
                                                             pending_frame_waiting,
                                                             pending_overflow_waiting,
                                                             present_interval_us,
-                                                            static_cast<qint64>(qMax(1.0, present_submit_interval_s * 1000000.0) + 0.5));
+                                                            static_cast<qint64>(qMax(1.0, present_submit_interval_s * 1000000.0) + 0.5),
+                                                            new_image);
             if (async_enqueued) {
                 async_present_completion = true;
                 present_complete_us = submit_ready_us;
@@ -7474,7 +7484,8 @@ void QmlMainWindow::render()
                 if (!pl_swapchain_submit_frame(placebo_swapchain))
                     qCWarning(chiakiGui) << "Failed to submit Placebo frame!";
                 else {
-                    display_frames_current.fetchAndAddRelaxed(1);
+                    if (new_image)
+                        display_frames_current.fetchAndAddRelaxed(1);
                     submit_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
             logLatencyStats("pl_swapchain_submit_frame", submit_us - submit_begin_us);
             CHIAKI_NOISY_DEBUG().nospace()
@@ -7933,6 +7944,10 @@ void QmlMainWindow::render()
             return;
         }
     }
+    // Frame queue path, for the display fps: the decoded frame this render shows (before DLSS 5
+    // and RTX VSR swap in their own signatures), and whether it blends several frames.
+    const uint64_t queue_image_signature = !bypass_frame_queue && frame_mix.signatures ? frame_mix.signatures[0] : 0;
+    const bool queue_image_mixed = !bypass_frame_queue && frame_mix.num_frames > 1;
 
     // DLSS neural rendering (DLSS 5 through the NGX D3D12 bridge; NeuralHub on AMD):
     // replace each source frame with a neural rendered RGB frame, at its own size or
@@ -8380,7 +8395,20 @@ void QmlMainWindow::render()
                 logLatencyStats("render_work", render_after_us - render_entry_us_local);
         }
     }
-    close_started_frame(true);
+    // Display fps counts only presents with a new image: Direct Mapping shows a new stream
+    // frame (direct_frame_fresh, also the first frame generated from it) or one of the frames
+    // generated from it (fg_override); the frame queue a frame it had not shown yet, or a blend
+    // of several. Redraws of the image already on screen (UI, stats overlay) do not count.
+    bool new_image = false;
+    if (bypass_frame_queue) {
+        new_image = fg_override || direct_frame_fresh;
+    } else if (queue_image_mixed) {
+        new_image = true;
+    } else if (frame_mix.num_frames > 0 && queue_image_signature != display_count_signature) {
+        display_count_signature = queue_image_signature;
+        new_image = true;
+    }
+    close_started_frame(true, new_image);
 
     if (startup_video_visible_refresh_pending.loadAcquire() != 0) {
         loading_transition_complete.storeRelease(1);
