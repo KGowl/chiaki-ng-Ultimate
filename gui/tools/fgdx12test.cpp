@@ -3,8 +3,11 @@
 // on a libplacebo Vulkan device, and the generated frames are read back and compared with
 // where the pattern should be between the previous and the current real frame.
 //
-// Usage: chiaki-fgdx12test [--backend 5] [--frames N] [--mvx N] [--w W --h H]
+// Usage: chiaki-fgdx12test [--backend 5] [--frames N] [--mvx N] [--w W --h H] [--hdr]
 //   --backend  FrameGen::Backend value: 1 DLSS (Vulkan), 3 Flow, 5 DLSS through D3D12 (default)
+//   --hdr      HDR frame generation: the pattern as a PQ BT.2020 RGBA16F frame (up to 1500 nits),
+//              checked in PQ terms: the generated frames sit where they should, keep the highlights
+//              (pixels above SDR white, 203 nits, as in the source) and keep more than 8 bits.
 //        chiaki-fgdx12test --nr [--image file] [--out file.png] [--with-fg] [--frames N] [--mvx N]
 //                          [--scale 1|1.5|2] [--hdr] [--model 0|1] [--passes 1-3] [--tune-at K]
 //   --nr       neural rendering (NeuralRender, DLSS 5 through D3D12) on a moving pattern or on
@@ -79,6 +82,81 @@ uint8_t pattern(int x, int y, int shift_px)
     const int xx = x - shift_px + 1000000;
     const int v = 40 + (xx * 3) % 97 + ((((xx >> 5) ^ (y >> 5)) & 1) * 80) + (y * 5) % 23;
     return static_cast<uint8_t>(std::min(v, 255));
+}
+
+float srgbToLinear(float v)
+{
+    return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+}
+
+uint16_t floatToHalf(float f)
+{
+    uint32_t x = 0;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int exp = static_cast<int>((x >> 23) & 0xffu) - 127 + 15;
+    const uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0)
+        return static_cast<uint16_t>(sign);
+    if (exp >= 31)
+        return static_cast<uint16_t>(sign | 0x7c00u);
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
+}
+
+// ---- HDR frame generation test (--hdr without --nr) ----
+// The pattern's values (0..255) as light: up to kPqPeak nits, about half of the pixels above SDR
+// white, PQ encoded (BT.2020) into a half float frame.
+constexpr double kPqPeak = 1500.0;
+
+double pqEncode(double nits)
+{
+    const double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0;
+    const double c1 = 3424.0 / 4096.0, c2 = 2413.0 / 4096.0 * 32.0, c3 = 2392.0 / 4096.0 * 32.0;
+    const double y = std::pow(std::clamp(nits / 10000.0, 0.0, 1.0), m1);
+    return std::pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
+}
+
+double pqDecode(double e)
+{
+    const double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0;
+    const double c1 = 3424.0 / 4096.0, c2 = 2413.0 / 4096.0 * 32.0, c3 = 2392.0 / 4096.0 * 32.0;
+    const double p = std::pow(std::clamp(e, 0.0, 1.0), 1.0 / m2);
+    return 10000.0 * std::pow(std::max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
+}
+
+double patternNits(double v)
+{
+    return 0.5 + kPqPeak * std::pow(std::clamp(v, 0.0, 255.0) / 255.0, 2.4);
+}
+
+// Back from light to the pattern's scale, so bestShift's thresholds stay what they are in SDR.
+float patternFromNits(double nits)
+{
+    return static_cast<float>(255.0 * std::pow(std::max(nits - 0.5, 0.0) / kPqPeak, 1.0 / 2.4));
+}
+
+struct PqStats
+{
+    double peak_nits = 0.0; // brightest pixel
+    double above_sdr = 0.0; // share of pixels above SDR white (scRGB > 1.0), percent
+    double grid = 0.0;      // mean distance of PQ * 255 from the 8-bit grid: ~0.25 above 8 bits, ~0 at 8 bits
+};
+
+PqStats pqStats(const std::vector<float> &pq)
+{
+    PqStats s;
+    const size_t n = pq.size() / 4;
+    for (size_t i = 0; i < pq.size(); i += 4) {
+        const double nits = pqDecode(pq[i]);
+        s.peak_nits = std::max(s.peak_nits, nits);
+        if (nits > PL_COLOR_SDR_WHITE)
+            s.above_sdr += 1.0;
+        const double q = pq[i] * 255.0;
+        s.grid += std::fabs(q - std::round(q));
+    }
+    s.above_sdr = 100.0 * s.above_sdr / std::max<size_t>(n, 1);
+    s.grid /= std::max<size_t>(n, 1);
+    return s;
 }
 
 struct Rig
@@ -260,6 +338,55 @@ struct Rig
         pl_tex_upload(gpu, &up);
     }
 
+    // --hdr frame generation: the pattern PQ encoded (BT.2020) into the half float source.
+    struct pl_color_space pqSpace() const
+    {
+        struct pl_color_space c = {};
+        c.primaries = PL_COLOR_PRIM_BT_2020;
+        c.transfer = PL_COLOR_TRC_PQ;
+        c.hdr.max_luma = static_cast<float>(kPqPeak);
+        c.hdr.min_luma = 0.005f;
+        c.hdr.prim = *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+        return c;
+    }
+
+    bool uploadPq(int shift_px)
+    {
+        if (!ensureHdrSource())
+            return false;
+        std::vector<uint16_t> data(static_cast<size_t>(w) * h * 4);
+        for (int y = 0; y < h; y++) {
+            uint16_t *row = data.data() + static_cast<size_t>(y) * w * 4;
+            for (int x = 0; x < w; x++) {
+                const uint16_t v = floatToHalf(static_cast<float>(pqEncode(patternNits(pattern(x, y, shift_px)))));
+                row[4 * x] = row[4 * x + 1] = row[4 * x + 2] = v;
+                row[4 * x + 3] = 0x3c00; // 1.0
+            }
+        }
+        uploadHalf(data.data());
+        return true;
+    }
+
+    struct pl_frame pqSourceFrame() const
+    {
+        struct pl_frame frame = sourceFrame();
+        frame.planes[0].texture = source_hdr;
+        frame.color = pqSpace();
+        return frame;
+    }
+
+    // A frame produced by FrameGen in PQ terms (rgba32f, no tone mapping: it is in that space)
+    // and its red channel on the pattern's scale.
+    bool readPq(const struct pl_frame &frame, std::vector<float> &pq, std::vector<float> &red)
+    {
+        if (!readFloat(frame, w, h, pqSpace(), pq))
+            return false;
+        red.resize(static_cast<size_t>(w) * h);
+        for (size_t i = 0; i < red.size(); i++)
+            red[i] = patternFromNits(pqDecode(pq[4 * i]));
+        return true;
+    }
+
     // Linear light, 1.0 = SDR white, BT.709, highlights up to hdr_peak: how chiaki-ng's
     // neural rendering takes an HDR stream.
     struct pl_color_space hdrSpace() const
@@ -345,12 +472,13 @@ struct Rig
 // Best horizontal shift of `red` against the pattern of the current frame (the one at
 // `shift_px`): 0 = the current frame, `mvx` = the previous frame. Returns the shift and the
 // mean absolute difference there and at 0.
-int bestShift(const std::vector<uint8_t> &red, int w, int h, int shift_px, double &diff_best, double &diff_zero)
+template <typename T>
+int bestShift(const std::vector<T> &red, int w, int h, int shift_px, double &diff_best, double &diff_zero)
 {
     double dsum[17] = {};
     int count = 0;
     for (int y = h * 4 / 10; y < h * 6 / 10; y += 4) {
-        const uint8_t *row = red.data() + static_cast<size_t>(y) * w;
+        const T *row = red.data() + static_cast<size_t>(y) * w;
         for (int x = 100; x < w - 100; x += 2) {
             for (int s = -8; s <= 8; s++)
                 dsum[s + 8] += std::fabs(static_cast<double>(row[x]) - static_cast<double>(pattern(x + s, y, shift_px)));
@@ -372,25 +500,6 @@ struct Phase
     const char *name;
     int w, h, multiplier, frames, cleanup;
 };
-
-float srgbToLinear(float v)
-{
-    return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
-}
-
-uint16_t floatToHalf(float f)
-{
-    uint32_t x = 0;
-    std::memcpy(&x, &f, sizeof(x));
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    const int exp = static_cast<int>((x >> 23) & 0xffu) - 127 + 15;
-    const uint32_t mant = x & 0x7fffffu;
-    if (exp <= 0)
-        return static_cast<uint16_t>(sign);
-    if (exp >= 31)
-        return static_cast<uint16_t>(sign | 0x7c00u);
-    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
-}
 
 // A synthetic HDR frame from an SDR one (same as nrprobe): linear light with the highlights
 // pushed up to `peak` times SDR white.
@@ -687,8 +796,17 @@ int main(int argc, char **argv)
         return result;
     }
     const auto backend = static_cast<FrameGen::Backend>(backend_value);
-    std::printf("chiaki-fgdx12test: backend %s, %d frames, %d px/frame motion%s\n", FrameGen::backendName(backend), frames,
-                mvx, pipeline ? ", pipelined (begin / beginDone / finish)" : "");
+    std::printf("chiaki-fgdx12test: backend %s, %d frames, %d px/frame motion%s%s\n", FrameGen::backendName(backend), frames,
+                mvx, pipeline ? ", pipelined (begin / beginDone / finish)" : "",
+                hdr ? ", HDR (PQ BT.2020 RGBA16F, up to 1500 nits)" : "");
+    // Frame generation must stay off for HDR frames: an 8-bit backend, or (test hook) a runtime
+    // that refuses RGBA16F, which must not take the backend down for SDR frames either.
+    const bool refuse_hdr = hdr && std::getenv("CHIAKI_DX12FG_REFUSE_HDR") != nullptr;
+    const bool hdr_off = hdr && (!FrameGen::backendHdrCapable(backend) || refuse_hdr);
+    if (hdr && !FrameGen::backendHdrCapable(backend))
+        std::printf("note: %s has no HDR path, frame generation must stay off for HDR frames\n", FrameGen::backendName(backend));
+    if (refuse_hdr)
+        std::printf("note: CHIAKI_DX12FG_REFUSE_HDR: the runtime refuses HDR, frame generation must stay off for HDR frames\n");
     if (!FrameGen::backendCompiledIn(backend)) {
         std::printf("VERDICT: backend not compiled in\n");
         return 2;
@@ -738,10 +856,24 @@ int main(int argc, char **argv)
         int good = 0, checked = 0;
         double sum_ms = 0.0;
         int timed = 0;
+        PqStats hdr_src = {};
         for (int k = 0; k < phase.frames; k++) {
             shift_counter++;
-            rig.upload(mvx * shift_counter);
-            struct pl_frame src = rig.sourceFrame();
+            struct pl_frame src;
+            if (hdr) {
+                if (!rig.uploadPq(mvx * shift_counter)) {
+                    std::printf("FAIL: HDR source texture\n");
+                    failures++;
+                    break;
+                }
+                src = rig.pqSourceFrame();
+                std::vector<float> pq, red;
+                if (k == 0 && rig.readPq(src, pq, red))
+                    hdr_src = pqStats(pq);
+            } else {
+                rig.upload(mvx * shift_counter);
+                src = rig.sourceFrame();
+            }
             std::vector<struct pl_frame> outputs;
             QElapsedTimer timer;
             timer.start();
@@ -759,8 +891,13 @@ int main(int argc, char **argv)
             }
             if (!ok || outputs.empty()) {
                 std::printf("frame %2d: process() returned %s, %zu outputs\n", k, ok ? "true" : "false", outputs.size());
-                if (k > 0)
+                if (k > 0 && !hdr_off)
                     failures++;
+                continue;
+            }
+            if (hdr_off) {
+                std::printf("frame %2d: FAIL, frames came back for an HDR source that must get none\n", k);
+                failures++;
                 continue;
             }
             const size_t generated = outputs.size() - 1;
@@ -774,7 +911,8 @@ int main(int argc, char **argv)
             bool frame_good = true;
             for (size_t i = 0; i < generated; i++) {
                 std::vector<uint8_t> red;
-                if (!rig.read(outputs[i], red)) {
+                std::vector<float> red_hdr, pq;
+                if (hdr ? !rig.readPq(outputs[i], pq, red_hdr) : !rig.read(outputs[i], red)) {
                     std::printf("frame %2d: reading output %zu failed\n", k, i);
                     frame_good = false;
                     break;
@@ -782,20 +920,43 @@ int main(int argc, char **argv)
                 const double t = static_cast<double>(i + 1) / static_cast<double>(generated + 1);
                 const int ideal = static_cast<int>(std::lround(mvx * (1.0 - t)));
                 double diff_best = 0.0, diff_zero = 0.0;
-                const int best = bestShift(red, phase.w, phase.h, mvx * shift_counter, diff_best, diff_zero);
-                char buf[160];
+                const int best = hdr ? bestShift(red_hdr, phase.w, phase.h, mvx * shift_counter, diff_best, diff_zero)
+                                     : bestShift(red, phase.w, phase.h, mvx * shift_counter, diff_best, diff_zero);
+                char buf[256];
                 std::snprintf(buf, sizeof(buf), " [t=%.2f shift %d (ideal %d) diff %.2f vs %.2f]", t, best, ideal, diff_best, diff_zero);
                 line += buf;
                 if (std::abs(best - ideal) > 1 || diff_best > diff_zero * 0.5)
                     frame_good = false;
+                if (hdr) {
+                    // The highlights stay (no clipping at SDR white) and the values keep more
+                    // than 8 bits (an 8-bit stage would put them on the 8-bit grid).
+                    const PqStats g = pqStats(pq);
+                    std::snprintf(buf, sizeof(buf), "{peak %.0f nits, >SDR white %.1f%%, grid %.3f}", g.peak_nits, g.above_sdr,
+                                  g.grid);
+                    line += buf;
+                    if (g.peak_nits < hdr_src.peak_nits * 0.8 || g.above_sdr < hdr_src.above_sdr * 0.8 || g.grid < 0.1)
+                        frame_good = false;
+                }
             }
             std::vector<uint8_t> real;
+            std::vector<float> real_hdr, real_pq;
             double real_best = 0.0, real_zero = 0.0;
             int real_shift = 99;
-            if (rig.read(outputs.back(), real))
-                real_shift = bestShift(real, phase.w, phase.h, mvx * shift_counter, real_best, real_zero);
+            if (hdr ? rig.readPq(outputs.back(), real_pq, real_hdr) : rig.read(outputs.back(), real))
+                real_shift = hdr ? bestShift(real_hdr, phase.w, phase.h, mvx * shift_counter, real_best, real_zero)
+                                 : bestShift(real, phase.w, phase.h, mvx * shift_counter, real_best, real_zero);
             if (real_shift != 0)
                 frame_good = false;
+            if (hdr) {
+                // The real frame is only re-encoded: as precise as the source.
+                const PqStats r = pqStats(real_pq);
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), " | real {peak %.0f nits, >SDR white %.1f%%, grid %.3f}", r.peak_nits,
+                              r.above_sdr, r.grid);
+                line += buf;
+                if (r.grid < 0.1 || std::fabs(r.peak_nits - hdr_src.peak_nits) > hdr_src.peak_nits * 0.02)
+                    frame_good = false;
+            }
             std::printf("frame %2d: %zu generated%s | real frame shift %d, process %.2f ms %s\n", k, generated, line.c_str(),
                         real_shift, ms, frame_good ? "OK" : "BAD");
             checked++;
@@ -805,10 +966,33 @@ int main(int argc, char **argv)
         if (timed)
             std::printf("-- %d of %d checked frames good, average process() %.2f ms, GPU time reported %.2f ms\n", good,
                         checked, sum_ms / timed, fg.gpuTimeMs());
+        if (hdr)
+            std::printf("-- HDR source: peak %.0f nits, %.1f%% of the pixels above SDR white (scRGB > 1.0), grid %.3f\n",
+                        hdr_src.peak_nits, hdr_src.above_sdr, hdr_src.grid);
+        if (hdr_off)
+            continue; // nothing to check: no frames is the right answer
         if (checked == 0 || good < checked - 1)
             failures++;
     }
 
+    if (refuse_hdr && failures == 0) {
+        // After HDR was refused the same backend must still generate SDR frames.
+        std::printf("\n== SDR after the HDR refusal, 2x\n");
+        int sdr_frames = 0;
+        if (rig.resize(w, h) && !fg.backendFailed(backend) && fg.ensureInitialized(rig.vk, backend)) {
+            for (int k = 0; k < 4; k++) {
+                shift_counter++;
+                rig.upload(mvx * shift_counter);
+                struct pl_frame src = rig.sourceFrame();
+                std::vector<struct pl_frame> outputs;
+                if (fg.process(&src, w, h, 2, 33.3f, outputs) && outputs.size() == 2)
+                    sdr_frames++;
+            }
+        }
+        std::printf("-- %d of 4 SDR frames with a generated frame%s\n", sdr_frames, sdr_frames >= 3 ? "" : ", FAIL");
+        if (sdr_frames < 3)
+            failures++;
+    }
     fg.destroy();
     rig.destroy();
     std::printf("\nVERDICT: %s\n", failures == 0 ? "ALL PHASES PASSED" : "SOME PHASES FAILED, see above");

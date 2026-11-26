@@ -9,8 +9,9 @@
 
 // Frame generation (interpolation) for the video stream on libplacebo's
 // Vulkan device. Each real frame is rendered to an RGBA8 texture at display
-// size and handed to a backend, which interpolates between it and the
-// previous real frame. Video has no motion vectors or depth, so the backends
+// size (HDR streams: RGBA16F holding BT.2020 PQ values, see backendHdrCapable)
+// and handed to a backend, which interpolates between it and the previous
+// real frame. Video has no motion vectors or depth, so the backends
 // get zero motion vectors and a constant depth and rely on their own optical
 // flow.
 //
@@ -40,6 +41,9 @@ public:
 
     static bool compiledIn();
     static bool backendCompiledIn(Backend backend);
+    // Whether `backend` generates frames for HDR streams (DLSS FG through Vulkan or D3D12, Flow).
+    // FSR 3.1 and NVIDIA VFG are 8-bit only: process() returns false for HDR frames with them.
+    static bool backendHdrCapable(Backend backend);
     // NGX's D3D12 side is up in this process (DLSS 5 or DLSS FG through the D3D12 bridge). NGX
     // then refuses DLSS Frame Generation through Vulkan, so Backend::Dlss has to run as Dlss12.
     static bool d3d12NgxUp();

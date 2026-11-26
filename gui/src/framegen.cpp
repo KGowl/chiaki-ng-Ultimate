@@ -119,10 +119,23 @@ struct FrameGen::Impl
     pl_gpu gpu = nullptr;
     pl_renderer renderer = nullptr;
     pl_fmt fmt_color = nullptr;
+    // HDR streams: the color textures are RGBA16F holding the output's own values (BT.2020 PQ,
+    // the stream's HDR metadata), not linear light, so Flow and the clean-up thresholds made for
+    // perceptual values keep working. nullptr when the GPU cannot render to and store into it.
+    pl_fmt fmt_color_hdr = nullptr;
     pl_fmt fmt_mvec = nullptr;
     pl_fmt fmt_depth = nullptr;
     bool common_ready = false;
+    // The HDR stream warning (backend without an HDR path) and the HDR active line, once each.
     bool hdr_warned = false;
+    bool hdr_logged = false;
+    // The runtime refused RGBA16F (HDR) buffers: HDR frames get no frame generation with that
+    // backend from then on, SDR frames still do.
+    std::array<bool, 6> hdr_refused = {};
+    // What the color textures are made for now (ensureSize) and the color space the frames in
+    // them are tagged with (fillFrame).
+    bool color_hdr = false;
+    struct pl_color_space out_color = pl_color_space_bt709;
 
     FrameGen::Backend backend = FrameGen::Backend::None;
     std::unique_ptr<FgBackendImpl> backend_impl;
@@ -193,7 +206,7 @@ struct FrameGen::Impl
     bool ensureImage(FgImage &img, int w, int h, pl_fmt fmt, bool renderable, bool clearable);
     void destroyImage(FgImage &img);
     void destroyImages();
-    bool ensureSize(int w, int h, const std::function<void(const char *)> &trace);
+    bool ensureSize(int w, int h, bool hdr, const std::function<void(const char *)> &trace);
     bool fillConstant(FgImage &img, const float value[4], const void *texel, size_t texel_size);
     bool hold(FgImage &img);
     void release(FgImage &img, VkSemaphore sem, uint64_t value);
@@ -218,10 +231,20 @@ struct FrameGen::Impl
     bool dx12Download(FrameSet &set, int count, uint64_t output_value, std::vector<struct pl_frame> &outputs);
     bool dx12Fail(const char *what);
 #endif
+    // What DLSS-G is told about the color buffers (colorBuffersHDR): HDR when they are;
+    // CHIAKI_DLSSG_HDR_FLAG=0/1 overrides it for HDR frames (A/B tests).
+    static bool dlssHdrFlag(bool hdr)
+    {
+        static const int forced = [] {
+            const char *v = std::getenv("CHIAKI_DLSSG_HDR_FLAG");
+            return v && (v[0] == '0' || v[0] == '1') ? v[0] - '0' : -1;
+        }();
+        return hdr && (forced < 0 || forced == 1);
+    }
     CommandSlot *beginSlot();
     // Clean-up of the generated frames in `outputs` (real frame last) against `prev`.
     void fixupAfter(pl_tex prev, std::vector<struct pl_frame> &outputs);
-    static void fillFrame(const FgImage &img, struct pl_frame *frame);
+    void fillFrame(const FgImage &img, struct pl_frame *frame) const;
 
     // FrameGen::begin(): the call whose generated frames are not copied back yet.
     struct Deferred
@@ -285,6 +308,13 @@ bool FrameGen::Impl::initCommon(pl_vulkan vk_)
     };
     const auto sampled_storage = static_cast<enum pl_fmt_caps>(PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_STORABLE);
     fmt_color = find_fmt("rgba8", static_cast<enum pl_fmt_caps>(sampled_storage | PL_FMT_CAP_RENDERABLE));
+    // Optional: without it HDR streams get no frame generation (as before).
+    fmt_color_hdr = pl_find_named_fmt(gpu, "rgba16f");
+    const auto hdr_caps = static_cast<enum pl_fmt_caps>(sampled_storage | PL_FMT_CAP_RENDERABLE);
+    if (fmt_color_hdr && (fmt_color_hdr->caps & hdr_caps) != hdr_caps) {
+        qCWarning(chiakiGui) << "[framegen] Texture format rgba16f lacks the required capabilities, no HDR frame generation";
+        fmt_color_hdr = nullptr;
+    }
     fmt_mvec = find_fmt("rg16f", sampled_storage);
     fmt_depth = find_fmt("r32f", sampled_storage);
     if (!fmt_color || !fmt_mvec || !fmt_depth)
@@ -348,7 +378,7 @@ bool FrameGen::Impl::waitDone(uint64_t value)
 
 bool FrameGen::Impl::ensureImage(FgImage &img, int w, int h, pl_fmt fmt, bool renderable, bool clearable)
 {
-    if (img.tex && img.w == w && img.h == h)
+    if (img.tex && img.w == w && img.h == h && img.tex->params.format == fmt)
         return true;
     destroyImage(img);
 
@@ -450,9 +480,9 @@ bool FrameGen::Impl::fillConstant(FgImage &img, const float value[4], const void
     return ok;
 }
 
-bool FrameGen::Impl::ensureSize(int w, int h, const std::function<void(const char *)> &trace)
+bool FrameGen::Impl::ensureSize(int w, int h, bool hdr, const std::function<void(const char *)> &trace)
 {
-    if (w == width && h == height && mvec.tex)
+    if (w == width && h == height && mvec.tex && hdr == color_hdr)
         return true;
     if (!waitDone(done_value))
         return false;
@@ -460,15 +490,19 @@ bool FrameGen::Impl::ensureSize(int w, int h, const std::function<void(const cha
         backend_impl->invalidate();
     destroyImages();
 
+    const pl_fmt fmt = hdr ? fmt_color_hdr : fmt_color;
+    if (!fmt)
+        return false;
     for (auto &set : sets) {
-        if (!ensureImage(set.real, w, h, fmt_color, true, false))
+        if (!ensureImage(set.real, w, h, fmt, true, false))
             return false;
         for (auto &img : set.generated) {
-            if (!ensureImage(img, w, h, fmt_color, true, false))
+            if (!ensureImage(img, w, h, fmt, true, false))
                 return false;
         }
     }
-    trace("color textures created");
+    color_hdr = hdr;
+    trace(hdr ? "color textures created (rgba16f, HDR)" : "color textures created");
     if (!ensureImage(mvec, w, h, fmt_mvec, false, true) || !ensureImage(depth, w, h, fmt_depth, false, true))
         return false;
     trace(mvec.tex->params.blit_dst && depth.tex->params.blit_dst
@@ -571,7 +605,7 @@ bool FrameGen::Impl::submitEx(VkCommandBuffer cmd, FgImage *const *waits, size_t
     return true;
 }
 
-void FrameGen::Impl::fillFrame(const FgImage &img, struct pl_frame *frame)
+void FrameGen::Impl::fillFrame(const FgImage &img, struct pl_frame *frame) const
 {
     *frame = {};
     frame->num_planes = 1;
@@ -581,7 +615,7 @@ void FrameGen::Impl::fillFrame(const FgImage &img, struct pl_frame *frame)
     frame->planes[0].component_mapping[1] = PL_CHANNEL_G;
     frame->planes[0].component_mapping[2] = PL_CHANNEL_B;
     frame->repr = pl_color_repr_rgb;
-    frame->color = pl_color_space_bt709;
+    frame->color = out_color;
     frame->crop = { 0.0f, 0.0f, static_cast<float>(img.w), static_cast<float>(img.h) };
 }
 
@@ -693,7 +727,7 @@ public:
                 FgImage *const *outputs, int count, bool reset, float frame_interval_ms) override
     {
         (void)frame_interval_ms;
-        if (!handle || width != color.w || height != color.h) {
+        if (!handle || width != color.w || height != color.h || format != color.format) {
             if (handle)
                 NVSDK_NGX_VULKAN_ReleaseFeature(handle);
             handle = nullptr;
@@ -719,6 +753,7 @@ public:
             }
             width = color.w;
             height = color.h;
+            format = color.format;
             reset = true;
         }
 
@@ -745,7 +780,7 @@ public:
             const float sign = fg.dlss_motion_reversed ? 1.0f : -1.0f;
             opt.mvecScale[0] = fg.mvecs_from_flow ? sign / static_cast<float>(color.w) : 1.0f;
             opt.mvecScale[1] = fg.mvecs_from_flow ? sign / static_cast<float>(color.h) : 1.0f;
-            opt.colorBuffersHDR = false;
+            opt.colorBuffersHDR = FrameGen::Impl::dlssHdrFlag(fg.color_hdr);
             opt.depthInverted = false;
             opt.cameraMotionIncluded = true;
             opt.reset = reset;
@@ -772,6 +807,7 @@ public:
             NVSDK_NGX_VULKAN_ReleaseFeature(handle);
         handle = nullptr;
         width = height = 0;
+        format = VK_FORMAT_UNDEFINED;
     }
 
     void shutdown() override
@@ -828,6 +864,7 @@ private:
     int max_generated = 1;
     int width = 0;
     int height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
     unsigned long long frame_id = 0;
 };
 
@@ -1231,6 +1268,12 @@ bool FrameGen::backendCompiledIn(Backend backend)
     }
 }
 
+bool FrameGen::backendHdrCapable(Backend backend)
+{
+    // FSR 3.1 is set up with RGBA8 surfaces and NVIDIA VFG takes 8-bit frames.
+    return backend == Backend::Dlss || backend == Backend::Flow || backend == Backend::Dlss12;
+}
+
 bool FrameGen::d3d12NgxUp()
 {
 #if defined(CHIAKI_HAVE_DX12FG)
@@ -1627,14 +1670,24 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
 
     const int w = set.real.w;
     const int h = set.real.h;
-    if (!runner->sizeMatches(w, h)) {
+    if (!runner->sizeMatches(w, h, color_hdr)) {
         // The shared buffers are rebuilt: nothing may still use them.
         if (!waitDone(done_value))
             return false;
         unsigned long seh_code = 0;
-        const bool sized = guardedCall([&]() { return runner->ensureSize(w, h); }, &seh_code);
+        const bool sized = guardedCall([&]() { return runner->ensureSize(w, h, color_hdr); }, &seh_code);
         if (seh_code)
             return crashed(seh_code, runner->stage());
+        if (!sized && color_hdr) {
+            // Not the backend's fault in general: only HDR frames go without it.
+            hdr_refused[static_cast<size_t>(backend)] = true;
+            have_history = false;
+            last_real = nullptr;
+            qCWarning(chiakiGui) << "[framegen]" << backendName(backend)
+                                 << "does not take RGBA16F (HDR) frames: HDR streams keep DLSS 5 / the picture in HDR"
+                                    " and frame generation stays off for them";
+            return false;
+        }
         if (!sized)
             return disable("(the D3D12 side could not be set up, see above)");
         reset_pending = true;
@@ -1927,13 +1980,35 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
     outputs.clear();
     if (!d.backend_impl || !src || src->num_planes <= 0 || out_w <= 0 || out_h <= 0)
         return false;
-    if (pl_color_space_is_hdr(&src->color)) {
-        // The generation path here is 8-bit SDR; leave HDR streams alone.
+    const bool hdr = pl_color_space_is_hdr(&src->color);
+    if (hdr && d.hdr_refused[static_cast<size_t>(d.backend)])
+        return false; // logged when it was refused
+    if (hdr && (!backendHdrCapable(d.backend) || !d.fmt_color_hdr)) {
+        // FSR 3.1 and NVIDIA VFG take 8-bit frames only: leave HDR streams alone with them.
         if (!d.hdr_warned) {
-            qCInfo(chiakiGui) << "[framegen] HDR stream detected, frame generation is skipped for HDR content";
+            qCInfo(chiakiGui) << "[framegen] HDR stream detected, frame generation is skipped for HDR content with"
+                              << backendName(d.backend)
+                              << (d.fmt_color_hdr ? "(8-bit only)" : "(no renderable rgba16f textures)");
             d.hdr_warned = true;
         }
         return false;
+    }
+    if (hdr) {
+        // The frames stay in the output's terms: BT.2020 PQ with the stream's HDR metadata, so
+        // rendering them here maps nothing (tone mapping happens once, where they are shown).
+        d.out_color = src->color;
+        d.out_color.primaries = PL_COLOR_PRIM_BT_2020;
+        d.out_color.transfer = PL_COLOR_TRC_PQ;
+        if (!d.hdr_logged) {
+            d.hdr_logged = true;
+            const bool dlss = d.backend == Backend::Dlss || d.backend == Backend::Dlss12;
+            qCInfo(chiakiGui).nospace() << "[framegen] HDR frame generation active (RGBA16F, PQ BT.2020), "
+                                        << backendName(d.backend)
+                                        << (!dlss ? "" : Impl::dlssHdrFlag(true) ? ", colorBuffersHDR on" : ", colorBuffersHDR off");
+        }
+    } else {
+        d.out_color = pl_color_space_bt709;
+        d.hdr_logged = false;
     }
     const int count = std::clamp(multiplier - 1, 1, d.backend_impl->maxGenerated());
     const bool trace = d.trace_frames < 4;
@@ -1949,7 +2024,7 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
             qCInfo(chiakiGui).nospace() << "[framegen] frame " << d.trace_frames << ": " << step
                                         << " (" << trace_timer.elapsed() << " ms)";
     };
-    if (!d.ensureSize(out_w, out_h, trace_step)) {
+    if (!d.ensureSize(out_w, out_h, hdr, trace_step)) {
         qCWarning(chiakiGui) << "[framegen] Could not allocate frame generation textures";
         return false;
     }
@@ -1965,9 +2040,15 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
     for (int i = 0; i < 4; i++)
         target.planes[0].component_mapping[i] = i;
     target.repr = pl_color_repr_rgb;
-    target.color = pl_color_space_bt709;
+    target.color = d.out_color;
     struct pl_render_params render_params = pl_render_default_params;
     render_params.frame_mixer = nullptr;
+    if (hdr) {
+        // Only re-encoded into the float texture: no peak detection (nothing is tone mapped
+        // between equal spaces anyway) and no dithering.
+        render_params.peak_detect_params = nullptr;
+        render_params.dither_params = nullptr;
+    }
     if (!pl_render_image(d.renderer, src, &target, &render_params)) {
         qCWarning(chiakiGui) << "[framegen] Failed to prepare the frame generation input";
         return false;
@@ -2081,11 +2162,11 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
         if (!flow_reset) {
             for (int i = 0; i < count; i++) {
                 outputs.emplace_back();
-                Impl::fillFrame(set.generated[static_cast<size_t>(i)], &outputs.back());
+                d.fillFrame(set.generated[static_cast<size_t>(i)], &outputs.back());
             }
         }
         outputs.emplace_back();
-        Impl::fillFrame(set.real, &outputs.back());
+        d.fillFrame(set.real, &outputs.back());
         return true;
     }
 
@@ -2184,11 +2265,11 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
     if (!reset) {
         for (int i = 0; i < count; i++) {
             outputs.emplace_back();
-            Impl::fillFrame(*generated[i], &outputs.back());
+            d.fillFrame(*generated[i], &outputs.back());
         }
     }
     outputs.emplace_back();
-    Impl::fillFrame(set.real, &outputs.back());
+    d.fillFrame(set.real, &outputs.back());
     return true;
 }
 
@@ -2198,6 +2279,7 @@ struct FrameGen::Impl {};
 
 bool FrameGen::compiledIn() { return false; }
 bool FrameGen::backendCompiledIn(Backend) { return false; }
+bool FrameGen::backendHdrCapable(Backend) { return false; }
 bool FrameGen::d3d12NgxUp() { return false; }
 const char *FrameGen::backendName(Backend) { return "None"; }
 FrameGen::FrameGen(pl_log) {}

@@ -124,6 +124,66 @@ constexpr UINT64 kSlTimestampOffset = 256; // each copy's GPU timestamp, in its 
 constexpr uint32_t kSlIdMask = 0xffffff;  // frame id in the marker's RGB
 enum SlSlotState { kSlFree, kSlCaptured, kSlTaken };
 
+// The marker pixel: the frame id's three bytes in RGB, alpha 0 (a real frame). With HDR frames
+// (RGBA16F) each byte is stored as a half float of the same value (integers up to 2048 are exact)
+// and alpha is half 0; DLSS-G writes alpha 1.0 into the frames it generates either way.
+uint16_t halfFromByte(uint8_t v)
+{
+    if (!v)
+        return 0;
+    int e = 7;
+    while (!(v & 0x80)) {
+        v = static_cast<uint8_t>(v << 1);
+        e--;
+    }
+    // v = 1.m * 2^e, m in the 7 bits under the leading one.
+    return static_cast<uint16_t>(((e + 15) << 10) | ((v & 0x7f) << 3));
+}
+
+int byteFromHalf(uint16_t h)
+{
+    const int e = (h >> 10) & 0x1f;
+    if (!e)
+        return 0; // zero (or a denormal, which a marker never is)
+    const int m = (h & 0x3ff) | 0x400;
+    const int shift = e - 15 - 10;
+    const int v = shift >= 0 ? m << shift : m >> -shift;
+    return std::clamp(v, 0, 255);
+}
+
+void slWriteMarker(uint8_t *dst, uint32_t id, bool hdr)
+{
+    const uint8_t b[3] = { static_cast<uint8_t>(id & 0xff), static_cast<uint8_t>((id >> 8) & 0xff),
+                           static_cast<uint8_t>((id >> 16) & 0xff) };
+    if (!hdr) {
+        dst[0] = b[0];
+        dst[1] = b[1];
+        dst[2] = b[2];
+        dst[3] = 0;
+        return;
+    }
+    const uint16_t px[4] = { halfFromByte(b[0]), halfFromByte(b[1]), halfFromByte(b[2]), 0 };
+    std::memcpy(dst, px, sizeof(px));
+}
+
+struct SlMarker
+{
+    bool generated;
+    int64_t id;
+};
+
+SlMarker slReadMarker(const uint8_t *px, bool hdr)
+{
+    if (!hdr) {
+        return { px[3] != 0, static_cast<int64_t>(px[0]) | (static_cast<int64_t>(px[1]) << 8)
+                                 | (static_cast<int64_t>(px[2]) << 16) };
+    }
+    uint16_t h[4];
+    std::memcpy(h, px, sizeof(h));
+    return { (h[3] & 0x7fff) != 0, static_cast<int64_t>(byteFromHalf(h[0])) | (static_cast<int64_t>(byteFromHalf(h[1])) << 8)
+                                       | (static_cast<int64_t>(byteFromHalf(h[2])) << 16) };
+}
+
 std::mutex g_sl_mutex; // start-up and hooks, once per process
 bool g_sl_tried = false;
 bool g_sl_started = false;
@@ -628,6 +688,20 @@ struct Dx12Fg::Impl
     };
     int width = 0;
     int height = 0;
+    // HDR frame generation: the color buffers (shared, D3D12 textures, Streamline's swapchain) are
+    // RGBA16F holding the output's own values (BT.2020 PQ), else RGBA8.
+    bool fg_hdr = false;
+    DXGI_FORMAT fgFormat() const { return fg_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM; }
+    UINT fgTexelBytes() const { return fg_hdr ? 8 : 4; }
+    // CHIAKI_DLSSG_HDR_FLAG=0/1 overrides what DLSS-G is told (colorBuffersHDR) for HDR frames.
+    bool fgHdrFlag() const
+    {
+        static const int forced = [] {
+            const char *v = std::getenv("CHIAKI_DLSSG_HDR_FLAG");
+            return v && (v[0] == '0' || v[0] == '1') ? v[0] - '0' : -1;
+        }();
+        return forced >= 0 ? forced == 1 && fg_hdr : fg_hdr;
+    }
     Tex color, motion, depth;
     std::array<Tex, kMaxOutputs> outs;
     Shared color_buf, motion_buf;
@@ -1424,7 +1498,9 @@ bool Dx12Fg::Impl::slSetOptions(int count)
     o.numBackBuffers = static_cast<uint32_t>(kSlBackBuffers);
     o.colorWidth = o.mvecDepthWidth = static_cast<uint32_t>(width);
     o.colorHeight = o.mvecDepthHeight = static_cast<uint32_t>(height + 1);
-    o.colorBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // HDR: Streamline's DLSS-G takes HDR from this format (it reports eFailHDRFormatNotSupported
+    // in DLSSGState::status when it cannot run it).
+    o.colorBufferFormat = fgFormat();
     o.mvecBufferFormat = DXGI_FORMAT_R16G16_FLOAT;
     o.depthBufferFormat = DXGI_FORMAT_R32_FLOAT;
     const sl::Result r = slDLSSGSetOptions(sl::ViewportHandle(0), o);
@@ -1454,18 +1530,19 @@ void Dx12Fg::Impl::slResetSortingLocked()
 bool Dx12Fg::Impl::slEnsureSize(int w, int h)
 {
     stage = "Streamline buffers";
-    // The frame in the shared buffers: w x h RGBA8, rows as D3D12 lays them out (no texture).
+    // The frame in the shared buffers: w x h RGBA8 (HDR: RGBA16F), rows as D3D12 lays them out
+    // (no texture).
     D3D12_RESOURCE_DESC td = {};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = static_cast<UINT64>(w);
     td.Height = static_cast<UINT>(h);
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Format = fgFormat();
     td.SampleDesc.Count = 1;
     device->GetCopyableFootprints(&td, 0, 1, 0, &color.footprint, nullptr, nullptr, &color.total);
-    color.format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    color.bytes_per_texel = 4;
+    color.format = fgFormat();
+    color.bytes_per_texel = fgTexelBytes();
     // Depth and motion as DLSS-G wants them, constant: mid-range depth, zero motion (it finds
     // the motion itself with its optical flow).
     bool ok = makeShared(color_buf, color.total) && makeTex(depth, w, h + 1, DXGI_FORMAT_R32_FLOAT, 4)
@@ -1474,7 +1551,8 @@ bool Dx12Fg::Impl::slEnsureSize(int w, int h)
         ok = ok && makeShared(s.buf, color.total);
     ok = ok && fill({ &motion }, &depth);
     if (ok) {
-        sl_marker_stride = ((static_cast<UINT64>(w) * 4 + kSlReadbackStride - 1) / kSlReadbackStride) * kSlReadbackStride;
+        sl_marker_stride = ((static_cast<UINT64>(w) * fgTexelBytes() + kSlReadbackStride - 1) / kSlReadbackStride)
+            * kSlReadbackStride;
         D3D12_HEAP_PROPERTIES hp = {};
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         const D3D12_RESOURCE_DESC rd = bufferDesc(sl_marker_stride * kSlots);
@@ -1498,7 +1576,7 @@ bool Dx12Fg::Impl::slEnsureSize(int w, int h)
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.Width = sw;
     sd.Height = sh;
-    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.Format = fgFormat();
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = static_cast<UINT>(kSlBackBuffers);
@@ -1564,6 +1642,15 @@ bool Dx12Fg::Impl::slEnsureSize(int w, int h)
     }
     if (!ok)
         log(1, "Streamline: the warm-up frames failed");
+    if (ok && fg_hdr) {
+        // DLSS-G says so here when it does not take the RGBA16F back buffer.
+        sl::DLSSGState hdr_state;
+        if (slDLSSGGetState(sl::ViewportHandle(0), hdr_state, nullptr) == sl::Result::eOk
+            && (static_cast<uint32_t>(hdr_state.status) & static_cast<uint32_t>(sl::DLSSGStatus::eFailHDRFormatNotSupported))) {
+            log(1, "Streamline: DLSS-G does not take the RGBA16F (HDR) back buffer (eFailHDRFormatNotSupported)");
+            ok = false;
+        }
+    }
     return ok;
 }
 
@@ -1658,11 +1745,7 @@ bool Dx12Fg::Impl::slPresentFrame(int count, bool reset, bool signal, uint64_t s
     const D3D12_RESOURCE_STATES saved_depth = depth.state, saved_motion = motion.state;
     if (ok) {
         const size_t slot_index = static_cast<size_t>(slot - slots.data());
-        uint8_t *marker = sl_marker_ptr + slot_index * sl_marker_stride;
-        marker[0] = static_cast<uint8_t>(sl_frame & 0xff);
-        marker[1] = static_cast<uint8_t>((sl_frame >> 8) & 0xff);
-        marker[2] = static_cast<uint8_t>((sl_frame >> 16) & 0xff);
-        marker[3] = 0;
+        slWriteMarker(sl_marker_ptr + slot_index * sl_marker_stride, sl_frame, fg_hdr);
         stage = "copy into Streamline's back buffer";
         // Through the proxy: DLSS-G wants GetCurrentBackBufferIndex called.
         ID3D12Resource *bb = sl_buffers[sl_swapchain->GetCurrentBackBufferIndex() % kSlBackBuffers].Get();
@@ -1767,11 +1850,15 @@ uint64_t Dx12Fg::Impl::slCapture(IDXGISwapChain *sc, UINT sync, UINT flags)
         sl_stat_skipped++; // a frame of the size before
         return 0;
     }
-    if (bd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && bd.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS
-        && bd.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+    const bool format_ok = fg_hdr
+        ? bd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || bd.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS
+        : bd.Format == DXGI_FORMAT_R8G8B8A8_UNORM || bd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS
+            || bd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if (!format_ok) {
         if (!sl_format_warned) {
             sl_format_warned = true;
-            log(1, "Streamline presents in format %d, not RGBA8: its frames cannot be copied back", static_cast<int>(bd.Format));
+            log(1, "Streamline presents in format %d, not %s: its frames cannot be copied back", static_cast<int>(bd.Format),
+                fg_hdr ? "RGBA16F" : "RGBA8");
         }
         sl_stat_skipped++;
         return 0;
@@ -1878,14 +1965,15 @@ void Dx12Fg::Impl::slSortLocked()
             continue;
         }
         const uint8_t *px = sl_readback_ptr + (rec.seq % kSlReadback) * kSlReadbackStride;
+        const SlMarker mk = slReadMarker(px, fg_hdr);
         if (g_sl_trace && sl_trace_lines < 400) {
             const size_t k = rec.seq % kSlReadback;
             char item[96];
-            snprintf(item, sizeof(item), " %s@%.1f(p%.1f s%u f%x)", px[3] != 0 ? "G" : "R", sl_trace_t[k],
+            snprintf(item, sizeof(item), " %s@%.1f(p%.1f s%u f%x)", mk.generated ? "G" : "R", sl_trace_t[k],
                      static_cast<double>(sl_trace_present[k]), sl_trace_mode[k] >> 16, sl_trace_mode[k] & 0xffff);
             sl_trace_line += item;
         }
-        if (px[3] != 0) {
+        if (mk.generated) {
             const double t = sl_cap_time[rec.seq % kSlReadback];
             // When it was there: its GPU timestamp (between the present call and now), or now.
             double there = seen;
@@ -1907,8 +1995,7 @@ void Dx12Fg::Impl::slSortLocked()
             continue;
         }
         slFreeLocked(rec.slot); // a real frame: chiaki has it already
-        const int64_t id = static_cast<int64_t>(px[0]) | (static_cast<int64_t>(px[1]) << 8)
-            | (static_cast<int64_t>(px[2]) << 16);
+        const int64_t id = mk.id;
         if (sl_waiting && id == static_cast<int64_t>(sl_frame) && !sl_ready_valid) {
             sl_ready.swap(sl_gens);
             sl_ready_valid = true;
@@ -2493,7 +2580,7 @@ bool Dx12Fg::Impl::createFeature()
     NVSDK_NGX_DLSSG_Create_Params cp = {};
     cp.Width = static_cast<unsigned int>(width);
     cp.Height = static_cast<unsigned int>(height);
-    cp.NativeBackbufferFormat = static_cast<unsigned int>(DXGI_FORMAT_R8G8B8A8_UNORM);
+    cp.NativeBackbufferFormat = static_cast<unsigned int>(fgFormat());
     cp.RenderWidth = cp.Width;
     cp.RenderHeight = cp.Height;
     cp.DynamicResolutionScaling = false;
@@ -2561,7 +2648,7 @@ bool Dx12Fg::Impl::evaluate(int count, bool reset, float msx, float msy, int log
         fillCamera(opt, width, height);
         opt.mvecScale[0] = msx;
         opt.mvecScale[1] = msy;
-        opt.colorBuffersHDR = false;
+        opt.colorBuffersHDR = fgHdrFlag();
         opt.depthInverted = false;
         opt.cameraMotionIncluded = true;
         opt.reset = reset;
@@ -3532,9 +3619,9 @@ void Dx12Fg::setFrameInterval(float ms)
 #endif
 }
 
-bool Dx12Fg::sizeMatches(int w, int h) const
+bool Dx12Fg::sizeMatches(int w, int h, bool hdr) const
 {
-    return impl->sized && impl->width == w && impl->height == h;
+    return impl->sized && impl->width == w && impl->height == h && impl->fg_hdr == hdr;
 }
 
 void Dx12Fg::invalidate()
@@ -3542,35 +3629,46 @@ void Dx12Fg::invalidate()
     impl->destroySized();
 }
 
-bool Dx12Fg::ensureSize(int w, int h)
+bool Dx12Fg::ensureSize(int w, int h, bool hdr)
 {
     Impl &d = *impl;
-    if (sizeMatches(w, h))
+    if (sizeMatches(w, h, hdr))
         return true;
     d.destroySized();
     if (!d.fg_available) {
         d.log(1, "DLSS Frame Generation is not available through NGX D3D12 on this GPU");
         return false;
     }
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+    // Test hook (dev builds only): the runtime refuses HDR buffers, to exercise the fallback.
+    if (hdr && std::getenv("CHIAKI_DX12FG_REFUSE_HDR")) {
+        d.log(1, "test hook: RGBA16F (HDR) frame generation refused");
+        return false;
+    }
+#endif
     d.width = w;
     d.height = h;
+    d.fg_hdr = hdr;
+    const char *kind = hdr ? (d.fgHdrFlag() ? "HDR RGBA16F, colorBuffersHDR" : "HDR RGBA16F") : "SDR RGBA8";
 #if defined(CHIAKI_HAVE_STREAMLINE)
     if (d.sl_route) {
         if (!d.slEnsureSize(w, h)) {
-            d.log(1, "Streamline: frame generation could not be set up for %dx%d", w, h);
+            d.log(1, "Streamline: frame generation could not be set up for %dx%d (%s)", w, h, kind);
             d.destroySized();
             return false;
         }
         d.sized = true;
-        d.log(0, "DLSS Frame Generation (Streamline) ready: %dx%d", w, h);
+        d.log(0, "DLSS Frame Generation (Streamline) ready: %dx%d, %s", w, h, kind);
         return true;
     }
 #endif
     d.stage = "textures";
-    bool ok = d.makeTex(d.color, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4) &&
+    const DXGI_FORMAT cf = d.fgFormat();
+    const UINT cb = d.fgTexelBytes();
+    bool ok = d.makeTex(d.color, w, h, cf, cb) &&
               d.makeTex(d.motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4) && d.makeTex(d.depth, w, h, DXGI_FORMAT_R32_FLOAT, 4);
     for (int i = 0; ok && i < d.max_generated; i++)
-        ok = d.makeTex(d.outs[static_cast<size_t>(i)], w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 4);
+        ok = d.makeTex(d.outs[static_cast<size_t>(i)], w, h, cf, cb);
     d.stage = "shared buffers";
     ok = ok && d.makeShared(d.color_buf, d.color.total) && d.makeShared(d.motion_buf, d.motion.total);
     for (int i = 0; ok && i < d.max_generated; i++)
@@ -3590,7 +3688,7 @@ bool Dx12Fg::ensureSize(int w, int h)
         return false;
     }
     d.sized = true;
-    d.log(0, "DLSS Frame Generation (D3D12) ready: %dx%d", w, h);
+    d.log(0, "DLSS Frame Generation (D3D12) ready: %dx%d, %s", w, h, kind);
     return true;
 }
 

@@ -160,7 +160,8 @@ if(CHIAKI_ENABLE_NGX)
 	# The same include directories as the application (Vulkan and libplacebo headers come from there).
 	target_include_directories(chiaki-fgdx12test PRIVATE include "${CHIAKI_NGX_SDK_DIR}/include"
 		$<TARGET_PROPERTY:chiaki,INCLUDE_DIRECTORIES>)
-	target_compile_definitions(chiaki-fgdx12test PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG)
+	# CHIAKI_DX12FG_TEST_HOOKS: environment variables that make the bridge fail on purpose (dx12fg.cpp).
+	target_compile_definitions(chiaki-fgdx12test PRIVATE CHIAKI_HAVE_NGX CHIAKI_HAVE_DX12FG CHIAKI_DX12FG_TEST_HOOKS)
 	target_link_libraries(chiaki-fgdx12test PkgConfig::LIBPLACEBO Qt::Core Qt::Gui "${CHIAKI_NGX_LIB}"
 		advapi32 user32 setupapi version shell32 ole32 avrt winmm)
 	add_dependencies(chiaki-fgdx12test chiaki-nrgate)
