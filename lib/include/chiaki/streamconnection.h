@@ -78,6 +78,20 @@ typedef struct chiaki_stream_connection_t
 	char *remote_disconnect_reason;
 
 	double measured_bitrate;
+	/**
+	 * What the console grants (its connection quality reports), summarised in the log every
+	 * ~10 s at info level: its target bitrate against what was asked for (bwKbpsSent).
+	 */
+	struct ChiakiStreamQualitySummary
+	{
+		uint64_t since_ms;
+		unsigned int reports;
+		int64_t target_sum;
+		int32_t target_min, target_max;
+		double measured_sum;
+		double rtt_sum;
+		int64_t loss_sum;
+	} quality_summary;
 } ChiakiStreamConnection;
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnection *stream_connection, ChiakiSession *session, double packet_loss_max);

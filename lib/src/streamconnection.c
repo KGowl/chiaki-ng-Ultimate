@@ -8,6 +8,7 @@
 #include <chiaki/base64.h>
 #include <chiaki/audio.h>
 #include <chiaki/video.h>
+#include <chiaki/time.h>
 
 #include <string.h>
 #include <inttypes.h>
@@ -104,6 +105,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnecti
 	stream_connection->should_stop = false;
 	stream_connection->remote_disconnected = false;
 	stream_connection->remote_disconnect_reason = NULL;
+	stream_connection->measured_bitrate = 0.0;
+	memset(&stream_connection->quality_summary, 0, sizeof(stream_connection->quality_summary));
 
 	return CHIAKI_ERR_SUCCESS;
 
@@ -668,6 +671,39 @@ static void stream_connection_takion_data_handle_disconnect(ChiakiStreamConnecti
 	chiaki_cond_signal(&stream_connection->state_cond);
 }
 
+// Every ~10 s at info level: the bitrate the console targets (its connection quality reports)
+// against what was asked for, the bitrate received, RTT and loss. What limits the bitrate shows
+// here: a target far below the request with no loss is the console's own cap.
+static void stream_connection_quality_summary(ChiakiStreamConnection *stream_connection, const tkproto_ConnectionQualityPayload *q)
+{
+	struct ChiakiStreamQualitySummary *s = &stream_connection->quality_summary;
+	const uint64_t now = chiaki_time_now_monotonic_ms();
+	if(!s->reports)
+	{
+		s->since_ms = now;
+		s->target_min = s->target_max = q->target_bitrate;
+	}
+	s->reports++;
+	s->target_sum += q->target_bitrate;
+	if(q->target_bitrate < s->target_min)
+		s->target_min = q->target_bitrate;
+	if(q->target_bitrate > s->target_max)
+		s->target_max = q->target_bitrate;
+	s->measured_sum += stream_connection->measured_bitrate;
+	s->rtt_sum += q->rtt;
+	s->loss_sum += q->loss;
+	if(now - s->since_ms < 10000)
+		return;
+	CHIAKI_LOGI(stream_connection->log,
+		"Bitrate: asked %u kbps, console target %d..%d (avg %lld) kbps, received avg %.1f Mbit/s, "
+		"rtt avg %.1f, loss reports %lld, %u reports in %.1f s",
+		stream_connection->session->connect_info.video_profile.bitrate,
+		s->target_min, s->target_max, (long long)(s->target_sum / s->reports),
+		s->measured_sum / s->reports, s->rtt_sum / s->reports, (long long)s->loss_sum, s->reports,
+		(double)(now - s->since_ms) / 1000.0);
+	memset(s, 0, sizeof(*s));
+}
+
 static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size)
 {
 	tkproto_TakionMessage msg;
@@ -704,6 +740,7 @@ static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_co
 		stream_connection->measured_bitrate = chiaki_stream_stats_bitrate(&stream_connection->video_receiver->frame_processor.stream_stats, stream_connection->session->connect_info.video_profile.max_fps) / 1000000.0;
 		CHIAKI_LOGV(stream_connection->log, "StreamConnection measured bitrate: %.4f MBit/s", stream_connection->measured_bitrate);
 		chiaki_stream_stats_reset(&stream_connection->video_receiver->frame_processor.stream_stats);
+		stream_connection_quality_summary(stream_connection, &q);
 		break;
 	}
 	case tkproto_TakionMessage_PayloadType_CORRUPTFRAME:
