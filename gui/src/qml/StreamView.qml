@@ -474,9 +474,10 @@ Item {
                     }
                 }
 
+                // Two lines: the frames the stream brings, and the frames the display shows.
                 Label {
                     Layout.alignment: Qt.AlignRight
-                    text: qsTr("fps stream / display")
+                    text: qsTr("stream fps")
                     font.pixelSize: 15
                     visible: Chiaki.session ? true : false
 
@@ -486,9 +487,28 @@ Item {
                             baseline: parent.baseline
                             rightMargin: 5
                         }
-                        text: parent.visible ? "%1 / %2".arg(Chiaki.window.streamFps.toFixed(0)).arg(Chiaki.window.displayFps.toFixed(0)) : ""
+                        text: parent.visible ? Chiaki.window.streamFpsText : ""
                         font.bold: true
                         color: "#ffe082"
+                        font.pixelSize: 18
+                    }
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    text: qsTr("display fps")
+                    font.pixelSize: 15
+                    visible: Chiaki.session ? true : false
+
+                    Label {
+                        anchors {
+                            right: parent.left
+                            baseline: parent.baseline
+                            rightMargin: 5
+                        }
+                        text: parent.visible ? Chiaki.window.displayFpsText : ""
+                        font.bold: true
+                        color: "#ffcc80"
                         font.pixelSize: 18
                     }
                 }

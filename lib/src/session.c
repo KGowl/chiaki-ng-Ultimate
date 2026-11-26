@@ -328,7 +328,16 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_stop(ChiakiSession *session)
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_join(ChiakiSession *session)
 {
-	return chiaki_thread_join(&session->session_thread, NULL);
+	ChiakiErrorCode err = chiaki_thread_join(&session->session_thread, NULL);
+#ifdef _WIN32
+	// chiaki_thread_join() only waits: without this every started session thread leaks its handle.
+	if(err == CHIAKI_ERR_SUCCESS)
+	{
+		CloseHandle(session->session_thread.thread);
+		session->session_thread.thread = NULL;
+	}
+#endif
+	return err;
 }
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_request_idr(ChiakiSession *session)

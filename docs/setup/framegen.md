@@ -167,16 +167,31 @@ Both use Flow's motion search (Flow Quality applies, about 0.5 ms at
 Performance). FSR Frame Generation now also gets these motion vectors
 instead of zero motion.
 
-### 30 fps games in a 60 fps stream
+### Games under 60 fps (repeated pictures)
 
 The console keeps sending 60 frames per second even when the game renders
-only 30, so every picture arrives twice. chiaki-ng recognises this from the
-size of the encoded frames (a repeat is an almost empty frame), drops the
-repeats and generates frames from the real 30 fps pictures; the multiplier
-doubles so the output frame rate stays what you picked (2x of a 60 fps stream
-= 4x of the 30 fps pictures = 120 fps). The stats overlay then shows
-*(half-rate source)* and the log `Source cadence: every picture repeated`.
-It switches back within a frame or two when the game runs at 60 again.
+fewer (30, 20, or a rate that moves between them), so some pictures arrive
+again. Frame generation fed with a repeat would interpolate between two equal
+pictures and then jump, so while it runs chiaki-ng drops every repeat and
+generates frames only between real game pictures, each one spanning the
+stream frames it stood for: the output frame rate stays what you picked
+(2x of a 60 fps stream = 4x of 30 fps pictures = 120 fps).
+
+A repeat is told from a new picture by the decoded picture itself
+(`include/duplicateframe.h`): the luma plane, as 16 x 16 block means, is
+compared with the last new picture; repeats change ten times or more less
+than new pictures. A learned line between the two, the game's rhythm (every
+2nd or 3rd frame new), the frame's size and a limit of 6 frames without a new
+picture settle the close calls. A frame after a network loss, and a scene cut,
+make frame generation start afresh instead of blending across them. Hardware
+frames that are not copied to system memory, and `CHIAKI_FG_DEDUP=0`, fall back
+to judging by the frame size alone. `chiaki-duplicateframetest` (not built by
+default) runs the detector on synthetic 60, 45, 30, 20 fps and uneven scenes.
+
+The stats overlay shows two lines: *stream fps* (with the game's rate, e.g.
+`60 (game 30)`) and *display fps* (e.g. `120 (30 real + 90 FG)`). The log has
+`Repeated pictures: judged from the decoded picture` and, every 10 s, a
+`[dedup]` line with the pictures, repeats dropped and gaps.
 Pick a multiplier whose output divides your refresh rate evenly (on 240 Hz:
 2x or 4x of 60, not 3x).
 

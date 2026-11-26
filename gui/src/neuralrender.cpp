@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <deque>
 #include <vector>
 
 Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
@@ -22,7 +24,11 @@ constexpr size_t kMaxCachedFrames = 8;
 // Two command buffers per frame (copy in, copy out).
 constexpr size_t kCommandSlots = 6;
 constexpr uint64_t kWaitTimeoutNs = 2000000000ull;
+// Neural rendering stops after kMaxFailures failures within kFailureWindow (a success in between
+// does not start the count again: a failure every few frames would stall the stream for good),
+// and at once after a crash or a GPU wait that gave up.
 constexpr int kMaxFailures = 3;
+constexpr std::chrono::seconds kFailureWindow(30);
 constexpr VkImageLayout kLayout = VK_IMAGE_LAYOUT_GENERAL;
 
 void bridgeLog(int level, const char *message, void *)
@@ -74,7 +80,12 @@ struct NeuralRender::Impl
     bool hdr_warned = false;
     bool upscale_warned = false;
     bool reset_pending = true;
-    int failures = 0;
+    // When the recent failures happened (steady clock), see kFailureWindow.
+    std::deque<std::chrono::steady_clock::time_point> failure_times;
+    // In the current processImpl() call: a Vulkan wait gave up (waitDone), and the runtime's D3D12
+    // wait timeouts before it began.
+    bool gpu_wait_failed = false;
+    uint32_t gpu_timeouts_seen = 0;
     std::shared_ptr<Dx12Fg> runner;
     // NeuralHub's in-game panel: chiaki's window it is shown over, and whether NeuralHub runs
     // the neural rendering (read from the GUI thread).
@@ -128,6 +139,7 @@ struct NeuralRender::Impl
              uint64_t *pending_output = nullptr);
     bool copyBack(Image &out, uint64_t output_value);
     void abandonRunner();
+    void abandonGpuObjects();
     bool processImpl(const struct pl_frame *src, uint64_t signature, const NeuralRender::Options &options,
                      struct pl_frame *out_frame, uint64_t *out_signature, bool defer);
     void noteFailure(bool crashed);
@@ -246,6 +258,7 @@ bool NeuralRender::Impl::waitDone(uint64_t value)
     const VkResult res = vkWaitSemaphores(vk->device, &wait_info, kWaitTimeoutNs);
     if (res != VK_SUCCESS) {
         qCWarning(chiakiGui) << "[neural-render] Waiting for the copies failed, result" << static_cast<int>(res);
+        gpu_wait_failed = true;
         return false;
     }
     return true;
@@ -363,6 +376,30 @@ void NeuralRender::Impl::abandonRunner()
     (void)new std::shared_ptr<Dx12Fg>(std::move(runner));
 }
 
+// A GPU wait gave up: this side's command buffers, semaphores and textures may still be in use
+// on the GPU, so they are left as they are (leaked) instead of destroyed, and so are the runtime's
+// neural rendering buffers (frame generation may go on using the shared instance).
+void NeuralRender::Impl::abandonGpuObjects()
+{
+    if (runner)
+        (void)new std::shared_ptr<Dx12Fg>(std::move(runner));
+    cache.clear();
+    input = Image();
+    pool = VK_NULL_HANDLE;
+    cmd_slots = {};
+    sem_in = sem_out = sem_done = VK_NULL_HANDLE;
+    // libplacebo keeps what its own pending work uses alive.
+    pl_renderer_destroy(&renderer);
+    in_value = out_value = done_value = 0;
+    begun_value = 0;
+    initialized = false;
+    reset_pending = true;
+    provider_panel.store(false);
+    tunable.store(false);
+    vk = nullptr;
+    gpu = nullptr;
+}
+
 // (1) Vulkan copies `input` into the shared buffer and signals the D3D12 timeline, (2) the
 // D3D12 queue waits for it, runs the feature and signals the next value, (3) Vulkan waits for
 // that and copies the shared output buffer into `out`.
@@ -474,8 +511,12 @@ bool NeuralRender::Impl::copyBack(Image &out, uint64_t output_value)
 
 void NeuralRender::Impl::shutdown()
 {
-    if (vk && vkWaitSemaphores)
-        waitDone(done_value);
+    if (vk && vkWaitSemaphores && !waitDone(done_value)) {
+        // The GPU is not through this side's work: destroying what it still uses would be worse
+        // than leaking it.
+        abandonGpuObjects();
+        return;
+    }
     if (runner) {
         // Frame generation may keep the shared instance alive: drop this side's buffers.
         runner->nrInvalidate();
@@ -582,7 +623,7 @@ bool NeuralRender::tunable() const
 
 void NeuralRender::hidePanel()
 {
-    if (impl->runner)
+    if (impl->runner && !impl->runner->crashed())
         impl->runner->nrHidePanel();
 }
 
@@ -608,14 +649,30 @@ bool NeuralRender::beginDone() const
 void NeuralRender::Impl::noteFailure(bool crashed)
 {
     reset_pending = true;
-    if (crashed || ++failures >= kMaxFailures) {
-        qCWarning(chiakiGui) << "[neural-render] Disabling DLSS neural rendering for this session"
-                             << (crashed ? "(its runtime crashed)" : "(repeated failures)");
-        if (crashed)
-            abandonRunner();
+    // A host wait that gave up (Vulkan here, or D3D12 inside the runtime): the GPU did not get
+    // through the work, so each retry would stall the stream again.
+    const bool gpu_stuck = gpu_wait_failed || (runner && runner->gpuWaitTimeouts() != gpu_timeouts_seen);
+    const auto now = std::chrono::steady_clock::now();
+    while (!failure_times.empty() && now - failure_times.front() > kFailureWindow)
+        failure_times.pop_front();
+    failure_times.push_back(now);
+    if (!crashed && !gpu_stuck && static_cast<int>(failure_times.size()) < kMaxFailures)
+        return;
+    qCWarning(chiakiGui) << "[neural-render] Disabling DLSS neural rendering for this session"
+                         << (crashed ? "(its runtime crashed)"
+                             : gpu_stuck ? "(the GPU did not finish its work in time)"
+                                         : "(3 failures within 30 s)");
+    // The D3D12 call that should signal the last value on the shared timeline may never run:
+    // let whatever waits for it go on.
+    if ((crashed || gpu_stuck) && runner)
+        runner->signalFromHost(runner->lastValue());
+    if (crashed && runner)
+        abandonRunner();
+    if (gpu_stuck)
+        abandonGpuObjects();
+    else
         shutdown();
-        init_failed = true;
-    }
+    init_failed = true;
 }
 
 bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signature,
@@ -625,6 +682,16 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
     Impl &d = *this;
     if (!d.initialized || !src || src->num_planes <= 0)
         return false;
+    d.gpu_wait_failed = false;
+    d.gpu_timeouts_seen = d.runner ? d.runner->gpuWaitTimeouts() : 0;
+    if (d.runner && d.runner->crashed()) {
+        // Frame generation saw the shared runtime crash. The value it left as the last one on the
+        // shared timeline may never be signalled, and the next run would make the Vulkan queue
+        // wait for it: nothing is submitted, neural rendering gives the runtime up.
+        qCWarning(chiakiGui) << "[neural-render] The shared NGX D3D12 runtime crashed in frame generation";
+        d.noteFailure(true);
+        return false;
+    }
     const bool hdr = pl_color_space_is_hdr(&src->color);
     if (hdr && !d.fmt_hdr) {
         if (!d.hdr_warned) {
@@ -743,10 +810,14 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
 
     // Resizing destroys the texture, so pending copies must not use it anymore.
     if (d.input.tex && (d.input.w != config.width || d.input.h != config.height || d.input.hdr != hdr)
-        && !d.waitDone(d.done_value))
+        && !d.waitDone(d.done_value)) {
+        d.noteFailure(false);
         return false;
-    if (!d.ensureImage(d.input, config.width, config.height, hdr))
+    }
+    if (!d.ensureImage(d.input, config.width, config.height, hdr)) {
+        d.noteFailure(false);
         return false;
+    }
     struct pl_frame in_target = {};
     in_target.num_planes = 1;
     in_target.planes[0].texture = d.input.tex;
@@ -761,6 +832,7 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
         render_params.peak_detect_params = nullptr; // keep the stream's levels for the model
     if (!pl_render_image(d.renderer, src, &in_target, &render_params)) {
         qCWarning(chiakiGui) << "[neural-render] Failed to prepare the input frame";
+        d.noteFailure(false);
         return false;
     }
 
@@ -768,6 +840,7 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
     // A recycled entry is several frames old, so this wait normally returns at once.
     if (!d.waitDone(entry.done_value) || !d.ensureImage(entry.image, config.out_width, config.out_height, hdr)) {
         entry.key = 0;
+        d.noteFailure(false);
         return false;
     }
     bool crashed = false;
@@ -778,7 +851,6 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
         d.noteFailure(crashed);
         return false;
     }
-    d.failures = 0;
     d.reset_pending = false;
     if (defer) {
         entry.pending_output = pending_output;

@@ -213,6 +213,16 @@ public:
     // shared() returns nullptr for that Vulkan device from then on.
     void markCrashed();
     bool crashed() const;
+    // Raises the shared timeline semaphore to `value` from the host when its counter is below it.
+    // After a crash inside the runtime the D3D12 call that would have signalled `value` never ran,
+    // and Vulkan work waiting for it on the GPU (holding up everything queued after it on the same
+    // queue) would wait forever. It first waits up to 1 s for `value - 1` (the Vulkan copy in front
+    // of the D3D12 call, which itself waited for every earlier D3D12 signal), so no earlier signal
+    // lands after this one and moves the counter back. Vulkan calls only (never D3D12 or the
+    // runtime): safe after markCrashed(). Call it with lastValue().
+    void signalFromHost(uint64_t value);
+    // How many host waits for D3D12 GPU work gave up (15 s) since the instance was created.
+    uint32_t gpuWaitTimeouts() const;
 
     // The runtime call in progress, named in the log if the runtime crashes.
     const char *stage() const;
