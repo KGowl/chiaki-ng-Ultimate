@@ -11,8 +11,11 @@
 #include <chiaki/time.h>
 #include "../../lib/src/utils.h"
 
+#include <QDateTime>
+#include <QDir>
 #include <QKeyEvent>
 #include <QMutexLocker>
+#include <QStandardPaths>
 #include <QtMath>
 #include <atomic>
 
@@ -589,7 +592,13 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	else
 	{
 #endif
-		chiaki_session_set_video_sample_cb(&session, chiaki_ffmpeg_decoder_video_sample_cb, ffmpeg_decoder);
+	{
+		// Through VideoSampleCb, which hands the samples to the video capture (Ctrl+R) first.
+		capture_hevc = chiaki_target_is_ps5(connect_info.target) && connect_info.video_profile.codec != CHIAKI_CODEC_H264;
+		capture_hdr = capture_hevc && connect_info.video_profile.codec == CHIAKI_CODEC_H265_HDR;
+		video_capture.setCodec(capture_hevc, GetChiakiLog());
+		chiaki_session_set_video_sample_cb(&session, VideoSampleCb, this);
+	}
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 	}
 #endif
@@ -864,6 +873,9 @@ void StreamSession::RetryStart()
 // Reports the end of a session that has no session thread left to report it.
 void StreamSession::EndSession(ChiakiQuitReason reason)
 {
+	// The session thread is gone: no more samples, close a capture that still runs.
+	if(video_capture.currentState() != VideoCapture::Idle)
+		ToggleVideoCapture();
 	connected = false;
 	emit ConnectedChanged();
 	emit SessionQuit(reason, QString());
@@ -2886,6 +2898,38 @@ void StreamSession::TriggerFfmpegFrameAvailable()
 		measured_bitrate = session.stream_connection.measured_bitrate;
 		emit MeasuredBitrateChanged();
 	}
+}
+
+bool StreamSession::VideoSampleCb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
+{
+	auto *self = static_cast<StreamSession *>(user);
+	self->video_capture.feed(buf, buf_size);
+	return chiaki_ffmpeg_decoder_video_sample_cb(buf, buf_size, frames_lost, frame_recovered, self->ffmpeg_decoder);
+}
+
+void StreamSession::ToggleVideoCapture()
+{
+	if(video_capture.currentState() != VideoCapture::Idle)
+	{
+		video_capture.stop();
+		CHIAKI_LOGI(GetChiakiLog(), "Video capture stopped: %s (%.1f MB)",
+			qPrintable(QDir::toNativeSeparators(video_capture.path())), video_capture.bytesWritten() / 1048576.0);
+		return;
+	}
+	const QString dir = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation) + QStringLiteral("/chiaki-ng captures");
+	const QString path = QStringLiteral("%1/chiaki-%2%3.%4").arg(dir,
+		QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")),
+		capture_hdr ? QStringLiteral("-hdr") : QString(),
+		capture_hevc ? QStringLiteral("h265") : QStringLiteral("h264"));
+	if(!video_capture.arm(path, 30))
+	{
+		CHIAKI_LOGW(GetChiakiLog(), "Video capture: cannot create %s", qPrintable(QDir::toNativeSeparators(path)));
+		return;
+	}
+	// Only the request: RequestIDR() would also make the receiver skip frames until the keyframe.
+	const ChiakiErrorCode err = chiaki_session_request_idr(&session);
+	CHIAKI_LOGI(GetChiakiLog(), "Video capture: %s, up to 30 s from the next keyframe (keyframe request %s); Ctrl+R stops it",
+		qPrintable(QDir::toNativeSeparators(path)), err == CHIAKI_ERR_SUCCESS ? "sent" : chiaki_error_string(err));
 }
 
 bool StreamSession::RequestIDR()

@@ -252,6 +252,14 @@ struct FrameGen::Impl
     bool dx12Download(FrameSet &set, int count, uint64_t output_value, std::vector<struct pl_frame> &outputs);
     bool dx12Fail(const char *what);
 #endif
+    // Experiment (CHIAKI_DX12FG_FLOW_MOTION=1, measured with chiaki-fgdx12test --eval): DLSS Frame
+    // Generation through D3D12 gets Flow's motion search as its motion vectors. Without it, it gets
+    // zero motion and finds the motion with its own optical flow.
+    static bool dx12FlowMotion()
+    {
+        static const bool on = qEnvironmentVariableIntValue("CHIAKI_DX12FG_FLOW_MOTION") == 1;
+        return on;
+    }
     // What DLSS-G is told about the color buffers (colorBuffersHDR): HDR when they are;
     // CHIAKI_DLSSG_HDR_FLAG=0/1 overrides it for HDR frames (A/B tests).
     static bool dlssHdrFlag(bool hdr)
@@ -1757,28 +1765,40 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
     runner->setFrameInterval(frame_interval_ms);
     count = std::clamp(count, 1, runner->maxGenerated());
 
-    // (1) Real frame -> shared color buffer.
+    // (1) Real frame -> shared color buffer. By default DLSS-G gets zero motion and finds it with
+    // its own optical flow; dx12FlowMotion() (an experiment) gives it Flow's motion search too.
+    const bool give_motion = dx12FlowMotion();
     CommandSlot *slot = begin_slot();
     if (!slot)
         return fail("command buffer unavailable");
     if (!hold(set.real))
         return fail("could not take the frame from libplacebo");
+    if (give_motion && !hold(mvec)) {
+        release(set.real, set.real.sem, set.real.value);
+        return fail("could not take the motion vectors");
+    }
     runner->recordColor(slot->cmd, set.real.image);
+    if (give_motion)
+        runner->recordMotion(slot->cmd, mvec.image); // zero when Flow had none (first frame, scene start)
     bool ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
     const uint64_t input_value = runner->lastValue() + 1;
     {
-        FgImage *waits[] = { &set.real };
+        FgImage *waits[] = { &set.real, &mvec };
         // D3D12 has finished with the buffer being overwritten.
         const SemValue extra_waits[] = { { runner->semaphore(), runner->lastValue() } };
         const SemValue input_signal[] = { { runner->semaphore(), input_value } };
-        ok = ok && submitEx(slot->cmd, waits, 1, extra_waits, 1, input_signal, 1);
+        ok = ok && submitEx(slot->cmd, waits, give_motion ? 2 : 1, extra_waits, 1, input_signal, 1);
     }
     if (ok) {
         slot->done_value = done_value;
         runner->setLastValue(input_value);
         release(set.real, sem_done, done_value);
+        if (give_motion)
+            release(mvec, sem_done, done_value);
     } else {
         release(set.real, set.real.sem, set.real.value);
+        if (give_motion)
+            release(mvec, mvec.sem, mvec.value);
         return fail("copying the frame failed");
     }
     trace_step("dx12 input copied");
@@ -1786,8 +1806,13 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
     // (2) The D3D12 half; it always signals `output_value`.
     const uint64_t output_value = input_value + 1;
     unsigned long seh_code = 0;
+    // Flow's vectors are the displacement to the previous frame in pixels: DLSS-G takes them
+    // normalized and reversed (as the Vulkan route, FrameGen::Backend::Dlss).
+    const bool motion_scaled = give_motion && mvecs_from_flow;
+    const float msx = motion_scaled ? -1.0f / static_cast<float>(w) : 1.0f;
+    const float msy = motion_scaled ? -1.0f / static_cast<float>(h) : 1.0f;
     const bool generated_ok = guardedCall([&]() {
-        return runner->generate(fresh ? 1 : count, input_value, output_value, fresh, false, 1.0f, 1.0f);
+        return runner->generate(fresh ? 1 : count, input_value, output_value, fresh, give_motion, msx, msy);
     }, &seh_code);
     runner->setLastValue(output_value);
     if (seh_code)
@@ -2122,7 +2147,8 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
     // chosen) and FSR as their motion vectors, and for the clean-up passes.
     const bool cleanup = d.cleanup_mode > 0 && !d.fixup_failed;
     const bool motion_for_backend = (d.backend == FrameGen::Backend::Dlss && d.dlss_flow_motion) ||
-                                    d.backend == FrameGen::Backend::Fsr;
+                                    d.backend == FrameGen::Backend::Fsr ||
+                                    (d.backend == FrameGen::Backend::Dlss12 && d.dx12FlowMotion());
     const bool want_motion = motion_for_backend ||
                              (cleanup && d.backend != FrameGen::Backend::Dlss && d.backend != FrameGen::Backend::Fsr);
     if (want_motion && !d.motion_flow_failed) {

@@ -212,6 +212,30 @@ The network, the PS5's encoder and decoding are not in it. Every 10 s the log
 has a `[picture latency]` line (average, p50, p95, max, and the enhancements
 that ran), to compare settings.
 
+## Measuring artifacts
+
+Frame generation can be measured on the real stream:
+
+1. While streaming, **Ctrl+R** saves the video as the PS5 sends it (H.264/H.265, HDR as
+   sent) to `Videos\chiaki-ng captures\chiaki-<time>[-hdr].h265`, up to 30 s from the
+   next keyframe (chiaki-ng asks the PS5 for one); Ctrl+R again stops earlier. The stats
+   overlay shows `REC 12 s` meanwhile. Pick a 60 fps game: its frames in between are the
+   ground truth.
+2. Turn it into PNG frames with ffmpeg:
+   - SDR: `ffmpeg -f hevc -r 60 -i chiaki-….h265 -pix_fmt rgb24 frames\%05d.png`
+   - HDR (PQ BT.2020 values as sent, 16-bit):
+     `ffmpeg -f hevc -r 60 -i chiaki-…-hdr.h265 -vf scale=in_color_matrix=bt2020:in_range=tv:out_range=full -pix_fmt rgb48be frames\%05d.png`
+3. `chiaki-fgdx12test --eval frames [--multiplier 2] [--cleanup 0|1|2] [--out worst]` feeds
+   every 2nd frame (`--multiplier`) to frame generation as a real one and compares each
+   generated frame with the real frame it stands for: luma PSNR / MAE, *art* (16×16 blocks
+   off by more than 12/255) and *worse* (blocks clearly worse than showing the last real
+   frame again), next to showing the last real frame again and a plain blend. `--out`
+   keeps the worst frames as *truth | generated | difference* pictures.
+
+DLSS Frame Generation through D3D12 gets zero motion vectors and finds the motion with
+its own optical flow; `CHIAKI_DX12FG_FLOW_MOTION=1` gives it Flow's motion search instead
+(an experiment: on RTX 30 through dlssg_for_sm86 it made no difference).
+
 ## Limitations
 
 The stream carries no motion vectors or depth, so both backends get zero

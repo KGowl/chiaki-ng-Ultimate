@@ -29,6 +29,7 @@
 
 #include "exception.h"
 #include "sessionlog.h"
+#include "videocapture.h"
 #include "controllermanager.h"
 #include "settings.h"
 
@@ -253,6 +254,11 @@ class StreamSession : public QObject
 
 		ChiakiFfmpegDecoder *ffmpeg_decoder;
 		void TriggerFfmpegFrameAvailable();
+		// Ctrl+R: the video stream saved as it arrives (frame generation tests, see videocapture.h).
+		VideoCapture video_capture;
+		bool capture_hevc = true;
+		bool capture_hdr = false;
+		static bool VideoSampleCb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user);
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 		ChiakiPiDecoder *pi_decoder;
 #endif
@@ -349,6 +355,10 @@ class StreamSession : public QObject
 		void GoToBed();
 	Q_INVOKABLE bool RequestIDR();
 		void ToggleMute();
+		// Starts saving the video stream (up to 30 s from the next keyframe) or stops it.
+		void ToggleVideoCapture();
+		int VideoCaptureState() { return video_capture.currentState(); }
+		int VideoCaptureSeconds() { return video_capture.seconds(); }
 		void SetLoginPIN(const QString &pin);
 		void GoHome();
 		QString GetHost() { return host; }

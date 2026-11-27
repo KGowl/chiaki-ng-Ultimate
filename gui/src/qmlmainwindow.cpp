@@ -5801,6 +5801,14 @@ renderer_backend_ready:
         const int rcas_strength_status = rcas_status_strength.loadRelaxed();
         if (rcas_strength_status > 0)
             parts << QStringLiteral("RCAS %1%").arg(rcas_strength_status);
+        // Ctrl+R: the video stream being saved.
+        if (session) {
+            const int capture_state = session->VideoCaptureState();
+            if (capture_state == 1)
+                parts << tr("REC: waiting for a keyframe");
+            else if (capture_state == 2)
+                parts << tr("REC %1 s").arg(session->VideoCaptureSeconds());
+        }
         const QString status = parts.join(QStringLiteral(" · "));
         if (status != video_enhancement_status) {
             video_enhancement_status = status;
@@ -8863,6 +8871,11 @@ bool QmlMainWindow::handleShortcut(QKeyEvent *event)
     case Qt::Key_M:
         if (session)
             session->ToggleMute();
+        return true;
+    case Qt::Key_R:
+        // Saves the video stream for frame generation tests (see videocapture.h), or stops it.
+        if (session)
+            session->ToggleVideoCapture();
         return true;
     case Qt::Key_O:
         emit menuRequested();
