@@ -1121,6 +1121,25 @@ void QmlSettings::setNeuralRenderUpscale(bool enabled)
     emit neuralRenderChanged();
 }
 
+int QmlSettings::neuralRenderUpscaleMode() const
+{
+    if (!settings->GetNeuralRenderUpscale())
+        return 0;
+    return settings->GetNeuralRenderUpscaleTarget() == 1 ? 2 : 1;
+}
+
+void QmlSettings::setNeuralRenderUpscaleMode(int mode)
+{
+    mode = qBound(0, mode, 2);
+    if (mode == neuralRenderUpscaleMode())
+        return;
+    settings->SetNeuralRenderUpscale(mode > 0);
+    // Off keeps the last target, so switching back on returns to it.
+    if (mode > 0)
+        settings->SetNeuralRenderUpscaleTarget(mode == 2 ? 1 : 0);
+    emit neuralRenderChanged();
+}
+
 int QmlSettings::neuralRenderModel() const
 {
     return settings->GetNeuralRenderModel();

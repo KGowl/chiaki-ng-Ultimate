@@ -34,7 +34,7 @@ class StandInSettings : public QObject
     Q_PROPERTY(int neuralRenderPasses READ passes WRITE setPasses NOTIFY neuralRenderChanged)
     Q_PROPERTY(bool neuralRenderPerPass READ perPass WRITE setPerPass NOTIFY neuralRenderChanged)
     Q_PROPERTY(int neuralRenderModel READ model WRITE setModel NOTIFY neuralRenderChanged)
-    Q_PROPERTY(bool neuralRenderUpscale READ upscale WRITE setUpscale NOTIFY neuralRenderChanged)
+    Q_PROPERTY(int neuralRenderUpscaleMode READ upscaleMode WRITE setUpscaleMode NOTIFY neuralRenderChanged)
     // The panel's other rows (RTX settings tab and Eye Candy tab).
     Q_PROPERTY(bool neuralRender MEMBER neural_render NOTIFY changed)
     Q_PROPERTY(int rcasStrength MEMBER rcas NOTIFY changed)
@@ -75,8 +75,9 @@ public:
     }
     int model() const { return model_; }
     void setModel(int m) { model_ = m; emit neuralRenderChanged(); }
-    bool upscale() const { return upscale_; }
-    void setUpscale(bool v) { upscale_ = v; emit neuralRenderChanged(); }
+    int upscaleMode() const { return upscale_mode; }
+    // As QmlSettings: 0 = off, 1 = toward the window, 2 = 4K.
+    void setUpscaleMode(int m) { upscale_mode = std::max(0, std::min(2, m)); emit neuralRenderChanged(); }
 
     Q_INVOKABLE QVariantMap neuralRenderTuning(int pass) const { return tunings[static_cast<size_t>(std::max(0, std::min(2, pass)))]; }
     Q_INVOKABLE QVariant neuralRenderTuningDefault(const QString &key) const { return defaults().value(key); }
@@ -97,7 +98,7 @@ public:
     int passes_ = 1;
     bool per_pass = false;
     int model_ = 0;
-    bool upscale_ = true;
+    int upscale_mode = 1;
     bool neural_render = true;
     int rcas = 0;
     bool show_stats = false;
@@ -294,9 +295,13 @@ int main(int argc, char **argv)
     key(Qt::Key_Down);
     check(row() == 11, "Skin structure is skipped while the mask is off (Down goes to DLSS upscaling)");
     key(Qt::Key_Right);
-    check(!S.upscale_, "DLSS upscaling off");
+    check(S.upscale_mode == 2, "DLSS upscaling Right: To the window -> 4K");
+    key(Qt::Key_Right);
+    check(S.upscale_mode == 2, "DLSS upscaling stops at 4K");
+    key(Qt::Key_Left, 2);
+    check(S.upscale_mode == 0, "DLSS upscaling Left x2: Off");
     key(Qt::Key_Return);
-    check(S.upscale_, "DLSS upscaling on again");
+    check(S.upscale_mode == 1, "Return: DLSS upscaling Off -> To the window");
     key(Qt::Key_Down);
     key(Qt::Key_Right, 3);
     check(S.rcas == 15, "Sharpness Right x3: 15%");

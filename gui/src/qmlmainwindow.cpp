@@ -8196,7 +8196,9 @@ void QmlMainWindow::render()
         }
     }
     // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
-    // the largest step DLSS Performance covers well), or the source size.
+    // the largest step DLSS Performance covers well), or the source size. The 4K target
+    // takes 2160 lines (also at most 2x: 1080p -> 3840x2160) whatever the window; a smaller
+    // window gets that picture downscaled (by frame generation's input copy or the final render).
     auto nr_options_for = [&](const struct pl_frame *src) {
         NeuralRender::Options options;
         options.model = settings->GetNeuralRenderModel();
@@ -8205,11 +8207,17 @@ void QmlMainWindow::render()
         if (!settings->GetNeuralRenderUpscale() || !src)
             return options;
         const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
-        const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
         if (src_w < 1.0f || src_h < 1.0f)
             return options;
-        const float ratio = qMin(dst_w / src_w, dst_h / src_h);
-        const float scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
+        float scale = 1.0f;
+        if (settings->GetNeuralRenderUpscaleTarget() == 1) {
+            const float to_4k = qMin(2160.0f / src_h, 2.0f);
+            scale = to_4k >= 1.05f ? to_4k : 1.0f;
+        } else {
+            const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
+            const float ratio = qMin(dst_w / src_w, dst_h / src_h);
+            scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
+        }
         if (scale > 1.0f) {
             // Even sizes keep the chroma-free RGB textures and the upscaler's ratios exact.
             options.out_width = static_cast<int>(lroundf(src_w * scale / 2.0f)) * 2;

@@ -110,6 +110,8 @@ class QmlSettings : public QObject
 	Q_PROPERTY(bool neuralRender READ neuralRender WRITE setNeuralRender NOTIFY neuralRenderChanged)
 	Q_PROPERTY(bool neuralRenderSupported READ neuralRenderSupported CONSTANT)
 	Q_PROPERTY(bool neuralRenderUpscale READ neuralRenderUpscale WRITE setNeuralRenderUpscale NOTIFY neuralRenderChanged)
+	// 0 = off, 1 = toward the window, 2 = 4K (neural_render_upscale + neural_render_upscale_target).
+	Q_PROPERTY(int neuralRenderUpscaleMode READ neuralRenderUpscaleMode WRITE setNeuralRenderUpscaleMode NOTIFY neuralRenderChanged)
 	Q_PROPERTY(int neuralRenderModel READ neuralRenderModel WRITE setNeuralRenderModel NOTIFY neuralRenderChanged)
 	Q_PROPERTY(int neuralRenderPasses READ neuralRenderPasses WRITE setNeuralRenderPasses NOTIFY neuralRenderChanged)
 	Q_PROPERTY(bool neuralRenderPerPass READ neuralRenderPerPass WRITE setNeuralRenderPerPass NOTIFY neuralRenderChanged)
@@ -395,6 +397,8 @@ public:
     bool neuralRenderSupported() const;
     bool neuralRenderUpscale() const;
     void setNeuralRenderUpscale(bool enabled);
+    int neuralRenderUpscaleMode() const;
+    void setNeuralRenderUpscaleMode(int mode);
     int neuralRenderModel() const;
     void setNeuralRenderModel(int model);
     int neuralRenderPasses() const;

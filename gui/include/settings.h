@@ -563,9 +563,13 @@ class Settings : public QObject
 		// DLSS neural rendering (DLSS 5) on the video through the NGX D3D12 bridge, see neuralrender.h.
 		bool GetNeuralRender() const { return settings.value("settings/neural_render", false).toBool(); }
 		void SetNeuralRender(bool enabled) { settings.setValue("settings/neural_render", enabled); }
-		// Upscale after neural rendering toward the window size (1.5x or 2x steps).
+		// Upscale after neural rendering (target below).
 		bool GetNeuralRenderUpscale() const { return settings.value("settings/neural_render_upscale", true).toBool(); }
 		void SetNeuralRenderUpscale(bool enabled) { settings.setValue("settings/neural_render_upscale", enabled); }
+		// Where that upscale goes: 0 = toward the window size (1.5x or 2x steps), 1 = 4K (2160 lines, at most 2x
+		// of the stream) whatever the window, downscaled to a smaller window.
+		int GetNeuralRenderUpscaleTarget() const { return qBound(0, settings.value("settings/neural_render_upscale_target", 0).toInt(), 1); }
+		void SetNeuralRenderUpscaleTarget(int target) { settings.setValue("settings/neural_render_upscale_target", qBound(0, target, 1)); }
 		// NVIDIA feature 18 model: 0 = CC, 1 = HT.
 		int GetNeuralRenderModel() const { return settings.value("settings/neural_render_model", 0).toInt(); }
 		void SetNeuralRenderModel(int model) { settings.setValue("settings/neural_render_model", model); }

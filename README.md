@@ -80,7 +80,7 @@ Notes:
 
 | Feature | GPU | Where |
 |---|---|---|
-| **DLSS 5 neural rendering** – NVIDIA's neural rendering model on each stream frame, at the stream size or upscaled 1.5x / 2x toward the window by DLSS Super Resolution (1080p → 4K); SDR and HDR | NVIDIA RTX (`nvngx_dlssnr.dll`, not bundled); AMD Radeon through NeuralHub (not bundled) | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
+| **DLSS 5 neural rendering** – NVIDIA's neural rendering model on each stream frame, at the stream size, upscaled 1.5x / 2x toward the window by DLSS Super Resolution (1080p → 4K), or always to 4K (2160 lines, downscaled to a smaller window); SDR and HDR | NVIDIA RTX (`nvngx_dlssnr.dll`, not bundled); AMD Radeon through NeuralHub (not bundled) | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
 | **DLSS Frame Generation via D3D12** – DLSS FG through the same bridge, 2x–4x; the next stream frame's DLSS work runs on D3D12 while the frames generated from the last one are presented | AMD through NeuralHub; NVIDIA next to DLSS 5 (NGX refuses Vulkan DLSS FG once its D3D12 side is up) or when Vulkan DLSS FG fails | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
 | **RTX settings panel** – in-stream panel with *RTX* and *Eye Candy* tabs (DLSS 5, upscaling, sharpness, frame generation multiplier, stats overlay, RTX VSR, clean-up, border fill); a button at the top right when the mouse moves, End on NVIDIA | all | while streaming |
 | **DLSS 5 controls (NVIDIA)** – model CC / HT, 1–3 passes, each with its own preset and controls, applied at once | NVIDIA RTX | RTX settings panel (End) |
