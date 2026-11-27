@@ -75,6 +75,8 @@ namespace {
 // Instances with NGX's D3D12 side up (Dx12Fg::ngxUpInProcess). A crashed instance is never
 // destroyed and stays counted, as its NGX state does.
 std::atomic<int> g_ngx_d3d12_up{0};
+// A call into nvngx_dlssnr.dll (through nrgate) faulted in this process: it is not called again.
+std::atomic<bool> g_gate_faulted{false};
 
 constexpr size_t kSlots = 4;
 constexpr UINT kHiddenWindowSize = 1280;
@@ -734,6 +736,14 @@ struct Dx12Fg::Impl
     ULONGLONG nr_tuning_logged = 0;
 #if defined(CHIAKI_DX12FG_TEST_HOOKS)
     std::string nr_test_keys; // CHIAKI_DX12FG_NR_KEYS as last applied
+    ComPtr<ID3D12Fence> stall_fence; // CHIAKI_DX12FG_STALL: never signalled
+    void stallQueue()
+    {
+        if (!stall_fence && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stall_fence))))
+            return;
+        queue->Wait(stall_fence.Get(), 1);
+        log(0, "test hook: the D3D12 queue now waits for a fence nobody signals (stuck GPU work)");
+    }
     bool nrTestKeys();
 #endif
     void nrSetKeys(int pass);
@@ -757,10 +767,53 @@ struct Dx12Fg::Impl
     UINT64 timestamp_frequency = 0;
     uint64_t nr_query_done = 0;
     double nr_gpu_ms = 0.0;
+    // GPU time of the frame generation evaluations (generate()), the same way.
+    ComPtr<ID3D12QueryHeap> fg_queries;
+    ComPtr<ID3D12Resource> fg_query_readback;
+    uint64_t fg_query_done = 0;
+    double fg_gpu_ms = 0.0;
     // The runtime crashed while one of the users called it; never handed out again.
     bool crashed = false;
+    // D3D12 work on the queue did not finish (markStuck()); never handed out again.
+    bool stuck = false;
     // Host waits for D3D12 GPU work that gave up (waitIdle, beginList).
     uint32_t gpu_wait_timeouts = 0;
+    // After a wait gave up the next ones are short (the work is stuck, every wait would take the
+    // whole timeout again), until one succeeds.
+    bool gpu_wait_short = false;
+    DWORD waitMs() const { return gpu_wait_short || stuck ? 250u : 15000u; }
+    // Why the last ensureSize() / nrEnsure() failed (sizeRefused(), nrUpscaleFailed()).
+    bool size_refused = false;
+    bool fg_create_oom = false; // the last DLSS-G creation failed for want of GPU memory
+    bool nr_upscale_failed = false;
+    // The stage a gate call faulted in (stage() then).
+    const char *fault_stage = nullptr;
+    // nrgate turns a fault inside nvngx_dlssnr.dll into an error code and a note. The snippet's
+    // state (a lock it held, its heap) is unknown from then on: the shared runtime counts as
+    // crashed and nobody calls into it again. True when the last gate call faulted.
+    bool gateFaulted(const char *call);
+    // The shared timeline's counter (Vulkan's view, else the D3D12 fence's); never waits.
+    uint64_t sharedCounter() const;
+    // Raises the shared timeline to `value` from the host when it is below (no wait).
+    void raiseShared(uint64_t value);
+    // signalFromHost(): waits up to 1 s for `value - 1` first.
+    void signalFromHostSafe(uint64_t value);
+    // GPU timing of one evaluation: a timestamp query pair resolved into a readback buffer.
+    bool createTimer(ComPtr<ID3D12QueryHeap> &heap, ComPtr<ID3D12Resource> &readback);
+    // Reads the result of the timed list that finished (`done` its idle fence value) into `ms`
+    // (smoothed); true when the readback buffer is free for the next measurement.
+    bool collectTimer(ID3D12Resource *readback, uint64_t &done, double &ms);
+    // The GPU may still use these: their references are dropped without releasing them.
+    static void leakTex(Tex &t)
+    {
+        (void)t.res.Detach();
+        t = Tex();
+    }
+    static void leakShared(Shared &s)
+    {
+        (void)s.res.Detach();
+        s = Shared();
+    }
 
     // ---- NeuralHub's in-game panel (its key, End by default), NeuralHub route only ----
     // NeuralHub polls its keys and draws its panel when it sees its swapchain presented, so
@@ -928,7 +981,8 @@ struct Dx12Fg::Impl
     bool nrCreateUpscaler();
     bool nrEvaluate(bool reset, int log_level = 1);
     bool nrWarmUp();
-    void destroyNr();
+    // false when the GPU did not finish (the state is then leaked, not freed).
+    bool destroyNr();
     // Every neural rendering texture that exists, for warm-up fills and state rollback.
     std::vector<Tex *> nrTextures()
     {
@@ -964,7 +1018,8 @@ struct Dx12Fg::Impl
     };
     States saveStates() const;
     void restoreStates(const States &s);
-    void destroySized();
+    // false when the GPU did not finish (the state is then leaked, not freed).
+    bool destroySized();
 };
 
 bool Dx12Fg::Impl::loadVulkan()
@@ -2183,12 +2238,15 @@ bool Dx12Fg::Impl::waitIdle()
     if (idle_fence->GetCompletedValue() < value) {
         if (FAILED(idle_fence->SetEventOnCompletion(value, idle_event)))
             return false;
-        if (WaitForSingleObject(idle_event, 15000) != WAIT_OBJECT_0) {
+        const DWORD ms = waitMs();
+        if (WaitForSingleObject(idle_event, ms) != WAIT_OBJECT_0) {
             gpu_wait_timeouts++;
-            log(1, "the D3D12 GPU work did not finish within 15 s");
+            gpu_wait_short = true;
+            log(1, "the D3D12 GPU work did not finish within %u ms", static_cast<unsigned>(ms));
             return false;
         }
     }
+    gpu_wait_short = false;
     return true;
 }
 
@@ -2341,6 +2399,11 @@ void Dx12Fg::Impl::initGate()
         log(1, "DLSS 5 neural rendering needs NVIDIA's nvngx_dlssnr.dll next to chiaki.exe (not bundled)");
         return;
     }
+    if (g_gate_faulted.load()) {
+        // Its state is unknown since: not called again in this process.
+        log(1, "DLSS 5 neural rendering stays off: nvngx_dlssnr.dll faulted earlier in this session");
+        return;
+    }
     stage = "neural rendering gate";
     if (!gate.open(exe_dir + L"\\nvngx.dll_dlssnr.dll")) {
         log(1, "nvngx.dll_dlssnr.dll (part of chiaki-ng) is missing or incomplete next to chiaki.exe");
@@ -2353,6 +2416,15 @@ void Dx12Fg::Impl::initGate()
     stage = "nvngx_dlssnr Init_Ext";
     const auto r = static_cast<NVSDK_NGX_Result>(
         gate.init(kNrApplicationId, ngx_data.c_str(), device.Get(), NVSDK_NGX_Version_API, nr_params));
+    const char *fault = gate.fault();
+    if (fault && fault[0]) {
+        // Nothing ran on the GPU yet and frame generation uses NGX's own core, not the snippet: only
+        // neural rendering goes. The snippet is never called again in this process (not even its
+        // Shutdown1).
+        g_gate_faulted.store(true);
+        log(1, "nvngx_dlssnr.dll faulted while initialising (%s): no DLSS 5 neural rendering this session", fault);
+        return;
+    }
     if (NVSDK_NGX_FAILED(r)) {
         log(1, "nvngx_dlssnr.dll refused to initialise: %s (0x%08x) %s", ngxResultString(r), static_cast<unsigned>(r),
             gate.fault());
@@ -2525,12 +2597,15 @@ bool Dx12Fg::Impl::beginList(Slot **out_slot)
     Slot &slot = slots[next_slot];
     next_slot = (next_slot + 1) % slots.size();
     if (slot.done_value && idle_fence->GetCompletedValue() < slot.done_value) {
+        const DWORD ms = waitMs();
         if (FAILED(idle_fence->SetEventOnCompletion(slot.done_value, idle_event)) ||
-            WaitForSingleObject(idle_event, 15000) != WAIT_OBJECT_0) {
+            WaitForSingleObject(idle_event, ms) != WAIT_OBJECT_0) {
             gpu_wait_timeouts++;
-            log(1, "a D3D12 command allocator stayed busy for 15 s");
+            gpu_wait_short = true;
+            log(1, "a D3D12 command allocator stayed busy for %u ms", static_cast<unsigned>(ms));
             return false;
         }
+        gpu_wait_short = false;
     }
     if (FAILED(slot.allocator->Reset()) || FAILED(list->Reset(slot.allocator.Get(), nullptr)))
         return false;
@@ -2606,18 +2681,21 @@ bool Dx12Fg::Impl::createFeature()
         return false;
     stage = "NGX_D3D12_CREATE_DLSSG";
     const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSSG(list.Get(), 1, 1, &handle, params, &cp);
-    const bool executed = endList(*slot) && waitIdle();
+    fg_create_oom = r == NVSDK_NGX_Result_FAIL_OutOfGPUMemory;
     if (NVSDK_NGX_FAILED(r) || !handle) {
+        // Nothing of what a failed creation recorded runs.
+        list->Close();
         log(1, "creating DLSS Frame Generation (D3D12) failed: %s (0x%08x)", ngxResultString(r), static_cast<unsigned>(r));
         handle = nullptr;
         return false;
     }
-    return executed;
+    return endList(*slot) && waitIdle();
 }
 
 void Dx12Fg::Impl::releaseFeature()
 {
-    if (handle)
+    // After a crash the runtime is not called again: the feature is leaked.
+    if (handle && !crashed)
         NVSDK_NGX_D3D12_ReleaseFeature(handle);
     handle = nullptr;
 }
@@ -2785,10 +2863,31 @@ bool Dx12Fg::Impl::warmUp()
     return true;
 }
 
-void Dx12Fg::Impl::destroySized()
+bool Dx12Fg::Impl::destroySized()
 {
-    if (queue)
-        waitIdle();
+    const bool had = sized || handle || color.res || color_buf.res;
+    // The GPU may still run work on these when it did not finish (or the runtime crashed and its
+    // state is unknown): they are left as they are then, never freed under it.
+    const bool idle = !had || !queue || waitIdle();
+    if (!idle || (crashed && had)) {
+        if (had)
+            log(1, "the frame generation buffers are left allocated (%s)",
+                crashed ? "the runtime crashed" : "the D3D12 GPU work did not finish");
+        handle = nullptr;
+        leakShared(color_buf);
+        leakShared(motion_buf);
+        for (auto &b : out_bufs)
+            leakShared(b);
+        leakTex(color);
+        leakTex(motion);
+        leakTex(depth);
+        for (auto &t : outs)
+            leakTex(t);
+        width = height = 0;
+        sized = false;
+        fg_query_done = 0;
+        return idle;
+    }
 #if defined(CHIAKI_HAVE_STREAMLINE)
     if (sl_route)
         slDestroySized();
@@ -2805,6 +2904,8 @@ void Dx12Fg::Impl::destroySized()
         t = Tex();
     width = height = 0;
     sized = false;
+    fg_query_done = 0;
+    return true;
 }
 
 // ---- neural rendering ----
@@ -2900,17 +3001,28 @@ bool Dx12Fg::Impl::nrCreateFeature()
             stage = "nvngx_dlssnr CreateFeature";
             const auto r = static_cast<NVSDK_NGX_Result>(
                 gate.create(list.Get(), kFeatureNeuralRendering, nr_params, reinterpret_cast<void **>(&handle)));
-            executed = endList(*slot) && waitIdle() && executed;
-            if (NVSDK_NGX_FAILED(r) || !handle) {
-                log(1, "creating DLSS 5 neural rendering (feature 18, pass %d) failed: %s (0x%08x) %s", pass + 1,
-                    ngxResultString(r), static_cast<unsigned>(r), gate.fault());
+            const bool faulted = gateFaulted("CreateFeature");
+            if (faulted || NVSDK_NGX_FAILED(r) || !handle) {
+                // What the snippet recorded before it failed (or faulted half way) never runs.
+                list->Close();
+                if (!faulted)
+                    log(1, "creating DLSS 5 neural rendering (feature 18, pass %d) failed: %s (0x%08x)", pass + 1,
+                        ngxResultString(r), static_cast<unsigned>(r));
+                // A faulted snippet's handle is never released (it is not called again).
                 handle = nullptr;
                 return false;
             }
+            executed = endList(*slot) && waitIdle() && executed;
         }
         nr_tuning_set = nr_tuning;
         nr_tuning_valid = true;
-        return executed && (!nrUpscales() || nrCreateUpscaler());
+        if (!executed)
+            return false;
+        if (nrUpscales() && !nrCreateUpscaler()) {
+            nr_upscale_failed = true;
+            return false;
+        }
+        return true;
     }
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth = w;
@@ -2925,14 +3037,16 @@ bool Dx12Fg::Impl::nrCreateFeature()
         return false;
     stage = "NGX_D3D12_CREATE_DLSS_EXT";
     const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(list.Get(), 1, 1, &nr_handle, nr_params, &cp);
-    const bool executed = endList(*slot) && waitIdle();
     if (NVSDK_NGX_FAILED(r) || !nr_handle) {
+        list->Close();
         log(1, "creating DLSS Super Resolution (D3D12, neural rendering) failed: %s (0x%08x)", ngxResultString(r),
             static_cast<unsigned>(r));
         nr_handle = nullptr;
+        // One feature does both here: without the upscale (DLAA) it may work.
+        nr_upscale_failed = nrUpscales();
         return false;
     }
-    return executed;
+    return endList(*slot) && waitIdle();
 }
 
 // NVIDIA upscaling: NVIDIA's DLSS Super Resolution (nvngx_dlss.dll) from feature 18's output.
@@ -2955,14 +3069,14 @@ bool Dx12Fg::Impl::nrCreateUpscaler()
         return false;
     stage = "NGX_D3D12_CREATE_DLSS_EXT (upscaling after neural rendering)";
     const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(list.Get(), 1, 1, &nr_sr_handle, nr_sr_params, &cp);
-    const bool executed = endList(*slot) && waitIdle();
     if (NVSDK_NGX_FAILED(r) || !nr_sr_handle) {
+        list->Close();
         log(1, "creating DLSS Super Resolution for upscaling failed: %s (0x%08x)", ngxResultString(r),
             static_cast<unsigned>(r));
         nr_sr_handle = nullptr;
         return false;
     }
-    return executed;
+    return endList(*slot) && waitIdle();
 }
 
 bool Dx12Fg::Impl::createProxyPipeline()
@@ -3387,9 +3501,11 @@ bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
             stage = "nvngx_dlssnr EvaluateFeature";
             NVSDK_NGX_Handle *handle = pass == 0 ? nr_handle : nr_more[static_cast<size_t>(pass - 1)];
             const auto r = static_cast<NVSDK_NGX_Result>(gate.evaluate(list.Get(), handle, nr_params));
+            if (gateFaulted("EvaluateFeature"))
+                return false;
             if (NVSDK_NGX_FAILED(r)) {
-                log(log_level, "evaluating DLSS 5 neural rendering (feature 18, pass %d) failed: %s (0x%08x) %s",
-                    pass + 1, ngxResultString(r), static_cast<unsigned>(r), gate.fault());
+                log(log_level, "evaluating DLSS 5 neural rendering (feature 18, pass %d) failed: %s (0x%08x)",
+                    pass + 1, ngxResultString(r), static_cast<unsigned>(r));
                 return false;
             }
         }
@@ -3419,6 +3535,7 @@ bool Dx12Fg::Impl::nrEvaluate(bool reset, int log_level)
         if (NVSDK_NGX_FAILED(r)) {
             log(log_level, "evaluating DLSS Super Resolution (upscaling) failed: %s (0x%08x)", ngxResultString(r),
                 static_cast<unsigned>(r));
+            nr_upscale_failed = true;
             return false;
         }
         return true;
@@ -3478,60 +3595,82 @@ bool Dx12Fg::Impl::nrWarmUp()
             Slot *slot = nullptr;
             if (!beginList(&slot))
                 return false;
+            // The upscaler's failure of an earlier attempt does not count (a later one may work).
+            nr_upscale_failed = false;
             if (!nrEvaluate(true, attempt + 1 < kAttempts ? 0 : 1)) {
                 list->Close();
                 for (size_t k = 0; k < textures.size(); k++)
                     textures[k]->state = saved[k];
+                // A faulted snippet is not called again.
+                if (crashed)
+                    return false;
                 continue;
             }
             if (!endList(*slot) || !waitIdle())
                 return false;
             done = true;
         }
-        if (!done)
+        if (!done) {
+            // NeuralHub: the one feature does the upscale too; without it (DLAA) it may work.
+            if (!gate_ready && nrUpscales())
+                nr_upscale_failed = true;
             return false;
+        }
     }
     return true;
 }
 
-void Dx12Fg::Impl::destroyNr()
+bool Dx12Fg::Impl::destroyNr()
 {
-    if (queue)
-        waitIdle();
-    if (nr_handle) {
-        if (gate_ready)
-            gate.release(nr_handle);
-        else
-            NVSDK_NGX_D3D12_ReleaseFeature(nr_handle);
+    const bool had = nr_sized || nr_handle || nr_sr_handle || nr_in.res || nr_in_buf.res || nr_out_buf.res;
+    // The GPU may still run work on these when it did not finish: the features, textures and
+    // buffers are left as they are then (leaked), never released under it. After a crash the
+    // runtime is not called again: its features are leaked.
+    const bool idle = !had || !queue || waitIdle();
+    if (idle && !crashed) {
+        if (nr_handle) {
+            if (gate_ready) {
+                gate.release(nr_handle);
+                gateFaulted("ReleaseFeature");
+            } else {
+                NVSDK_NGX_D3D12_ReleaseFeature(nr_handle);
+            }
+        }
+        for (auto &h : nr_more) {
+            // A fault in one release: the snippet is not called for the next.
+            if (h && !crashed) {
+                gate.release(h);
+                gateFaulted("ReleaseFeature");
+            }
+        }
+        if (nr_sr_handle && !crashed)
+            NVSDK_NGX_D3D12_ReleaseFeature(nr_sr_handle);
     }
     nr_handle = nullptr;
-    for (auto &h : nr_more) {
-        if (h)
-            gate.release(h);
-        h = nullptr;
-    }
-    nr_tuning_valid = false;
-    if (nr_sr_handle)
-        NVSDK_NGX_D3D12_ReleaseFeature(nr_sr_handle);
+    nr_more = {};
     nr_sr_handle = nullptr;
-    freeShared(nr_in_buf);
-    freeShared(nr_out_buf);
-    nr_in = Tex();
-    nr_out = Tex();
-    nr_depth = Tex();
-    nr_motion = Tex();
-    nr_mid = Tex();
-    nr_proxy_in = Tex();
-    nr_proxy_out = Tex();
-    for (auto &t : nr_chain)
-        t = Tex();
+    nr_tuning_valid = false;
+    Tex *const textures[] = { &nr_in, &nr_out, &nr_depth, &nr_motion, &nr_mid, &nr_proxy_in, &nr_proxy_out,
+                              &nr_chain[0], &nr_chain[1], &nr_panel };
+    if (idle) {
+        freeShared(nr_in_buf);
+        freeShared(nr_out_buf);
+        for (Tex *t : textures)
+            *t = Tex();
+    } else {
+        log(1, "the neural rendering buffers are left allocated (the D3D12 GPU work did not finish)");
+        leakShared(nr_in_buf);
+        leakShared(nr_out_buf);
+        for (Tex *t : textures)
+            leakTex(*t);
+    }
     nr_cfg = NrConfig();
     nr_sized = false;
     nr_query_done = 0;
     panelHide();
-    nr_panel = Tex();
     panel_desc_ready = false;
     panel_failed = false;
+    return idle;
 }
 
 Dx12Fg::Dx12Fg(const VulkanDevice &vk, LogFn log, void *user)
@@ -3565,19 +3704,23 @@ Dx12Fg::~Dx12Fg()
 #endif
     if (d.semaphore)
         d.vkDestroySemaphore(d.vk.device, d.semaphore, nullptr);
-    if (d.params)
-        NVSDK_NGX_D3D12_DestroyParameters(d.params);
-    if (d.gate_ready && d.device)
-        d.gate.shutdown(d.device.Get());
-    if (d.nr_params)
-        NVSDK_NGX_D3D12_DestroyParameters(d.nr_params);
-    if (d.nr_sr_params)
-        NVSDK_NGX_D3D12_DestroyParameters(d.nr_sr_params);
-    if (d.ngx_up && d.device)
-        NVSDK_NGX_D3D12_Shutdown1(d.device.Get());
-    if (d.ngx_up)
-        g_ngx_d3d12_up.fetch_sub(1);
-    d.ngx_up = false;
+    // Users leak a crashed instance; should one be destroyed anyway, the runtime is not called
+    // (NGX stays up for the rest of the process).
+    if (!d.crashed) {
+        if (d.params)
+            NVSDK_NGX_D3D12_DestroyParameters(d.params);
+        if (d.gate_ready && d.device && !g_gate_faulted.load())
+            d.gate.shutdown(d.device.Get());
+        if (d.nr_params)
+            NVSDK_NGX_D3D12_DestroyParameters(d.nr_params);
+        if (d.nr_sr_params)
+            NVSDK_NGX_D3D12_DestroyParameters(d.nr_sr_params);
+        if (d.ngx_up && d.device)
+            NVSDK_NGX_D3D12_Shutdown1(d.device.Get());
+        if (d.ngx_up)
+            g_ngx_d3d12_up.fetch_sub(1);
+        d.ngx_up = false;
+    }
     d.swapchain.Reset();
     if (d.hwnd)
         DestroyWindow(d.hwnd);
@@ -3641,8 +3784,14 @@ bool Dx12Fg::sizeMatches(int w, int h, bool hdr) const
     return impl->sized && impl->width == w && impl->height == h && impl->fg_hdr == hdr;
 }
 
+bool Dx12Fg::sizeRefused() const
+{
+    return impl->size_refused;
+}
+
 void Dx12Fg::invalidate()
 {
+    // After a crash the runtime is not called (destroySized() leaks then).
     impl->destroySized();
 }
 
@@ -3651,15 +3800,22 @@ bool Dx12Fg::ensureSize(int w, int h, bool hdr)
     Impl &d = *impl;
     if (sizeMatches(w, h, hdr))
         return true;
-    d.destroySized();
+    d.size_refused = false;
+    if (d.crashed || d.stuck)
+        return false;
+    // No new buffers while the GPU may still use the old ones (they are leaked then).
+    if (!d.destroySized())
+        return false;
     if (!d.fg_available) {
         d.log(1, "DLSS Frame Generation is not available through NGX D3D12 on this GPU");
+        d.size_refused = true;
         return false;
     }
 #if defined(CHIAKI_DX12FG_TEST_HOOKS)
     // Test hook (dev builds only): the runtime refuses HDR buffers, to exercise the fallback.
     if (hdr && std::getenv("CHIAKI_DX12FG_REFUSE_HDR")) {
         d.log(1, "test hook: RGBA16F (HDR) frame generation refused");
+        d.size_refused = true;
         return false;
     }
 #endif
@@ -3672,6 +3828,7 @@ bool Dx12Fg::ensureSize(int w, int h, bool hdr)
         if (!d.slEnsureSize(w, h)) {
             d.log(1, "Streamline: frame generation could not be set up for %dx%d (%s)", w, h, kind);
             d.destroySized();
+            d.size_refused = true;
             return false;
         }
         d.sized = true;
@@ -3694,16 +3851,26 @@ bool Dx12Fg::ensureSize(int w, int h, bool hdr)
         d.destroySized();
         return false;
     }
+    // A failure of the runtime itself, unless a wait for the GPU gave up on the way.
+    const uint32_t timeouts = d.gpu_wait_timeouts;
+    d.fg_create_oom = false;
     if (!d.createFeature()) {
         d.destroySized();
+        d.size_refused = d.gpu_wait_timeouts == timeouts && !d.fg_create_oom;
         return false;
     }
     d.log(0, "warming up the D3D12 runtime (two evaluations, about 0.4 s)");
     if (!d.warmUp()) {
         d.log(1, "the warm-up evaluations failed");
         d.destroySized();
+        d.size_refused = d.gpu_wait_timeouts == timeouts;
         return false;
     }
+    // Timing is optional.
+    if (!d.fg_queries)
+        d.createTimer(d.fg_queries, d.fg_query_readback);
+    d.fg_query_done = 0;
+    d.fg_gpu_ms = 0.0;
     d.sized = true;
     d.log(0, "DLSS Frame Generation (D3D12) ready: %dx%d, %s", w, h, kind);
     return true;
@@ -3816,6 +3983,37 @@ static void testCrash(const char *what)
     if (++calls == std::atoi(spec.c_str() + len + 1))
         RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
 }
+
+// Test hook (dev builds only): CHIAKI_DX12FG_CRASH=gate:N makes the N-th feature 18 evaluation
+// through nrgate look faulted, as nrgate reports a fault it caught inside nvngx_dlssnr.dll (N counts
+// the warm-up evaluations too: two per warm-up and pass).
+// Test hook (dev builds only): CHIAKI_DX12FG_STALL=fg:N (or nr:N): in the N-th generate()
+// (neuralRender()) the D3D12 queue, after waiting for Vulkan, waits for a fence nobody signals: that
+// call's work and its shared fence signal never run, as D3D12 work stuck on the GPU.
+static bool testStall(const char *what)
+{
+    static const std::string spec = [] {
+        const char *v = std::getenv("CHIAKI_DX12FG_STALL");
+        return std::string(v ? v : "");
+    }();
+    static int fg_calls = 0;
+    static int nr_calls = 0;
+    const size_t len = std::strlen(what);
+    if (spec.size() <= len + 1 || spec.compare(0, len, what) != 0 || spec[len] != ':')
+        return false;
+    int &calls = std::strcmp(what, "fg") == 0 ? fg_calls : nr_calls;
+    return ++calls == std::atoi(spec.c_str() + len + 1);
+}
+
+static bool testGateFault()
+{
+    static const int at = [] {
+        const char *v = std::getenv("CHIAKI_DX12FG_CRASH");
+        return v && std::strncmp(v, "gate:", 5) == 0 ? std::atoi(v + 5) : 0;
+    }();
+    static int calls = 0;
+    return at > 0 && ++calls == at;
+}
 #endif
 
 bool Dx12Fg::generate(int count, uint64_t wait_value, uint64_t signal_value, bool reset, bool use_motion,
@@ -3828,8 +4026,16 @@ bool Dx12Fg::generate(int count, uint64_t wait_value, uint64_t signal_value, boo
 #endif
     count = std::clamp(count, 1, d.max_generated);
     d.stage = "queue wait";
-    // GPU side wait for the Vulkan copies; the fence value is set by Vulkan.
-    bool ok = d.sized && d.handle && SUCCEEDED(d.queue->Wait(d.shared_fence.Get(), wait_value));
+    // GPU side wait for the Vulkan copies; the fence value is set by Vulkan. Always queued, also
+    // when nothing runs: signalling `signal_value` before the copy signals `wait_value` would let
+    // that later signal move the counter back.
+    const bool waited = SUCCEEDED(d.queue->Wait(d.shared_fence.Get(), wait_value));
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+    if (testStall("fg"))
+        d.stallQueue();
+#endif
+    // After a crash the runtime is not called again.
+    bool ok = waited && !d.crashed && !d.stuck && d.sized && d.handle;
     if (ok) {
         // Texture states as the commands will leave them; restored if recording fails.
         const auto saved_color = d.color.state;
@@ -3838,6 +4044,8 @@ bool Dx12Fg::generate(int count, uint64_t wait_value, uint64_t signal_value, boo
         std::array<D3D12_RESOURCE_STATES, kMaxOutputs> saved_outs = {};
         for (size_t i = 0; i < saved_outs.size(); i++)
             saved_outs[i] = d.outs[i].state;
+        // GPU time of the evaluations (finding the previous measurement first).
+        const bool timed = d.fg_queries && d.collectTimer(d.fg_query_readback.Get(), d.fg_query_done, d.fg_gpu_ms);
         Impl::Slot *slot = nullptr;
         const bool begun = d.beginList(&slot);
         ok = begun;
@@ -3845,16 +4053,25 @@ bool Dx12Fg::generate(int count, uint64_t wait_value, uint64_t signal_value, boo
             d.copyBufferToTex(d.color, d.color_buf.res.Get());
             if (use_motion)
                 d.copyBufferToTex(d.motion, d.motion_buf.res.Get());
+            if (timed)
+                d.list->EndQuery(d.fg_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
 #if defined(CHIAKI_DX12FG_TEST_HOOKS)
             testCrash("fg");
 #endif
             ok = d.evaluate(count, reset, mvec_scale_x, mvec_scale_y);
+            if (ok && timed) {
+                d.list->EndQuery(d.fg_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                d.list->ResolveQueryData(d.fg_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                                         d.fg_query_readback.Get(), 0);
+            }
             for (int i = 0; ok && i < count; i++)
                 d.copyTexToBuffer(d.out_bufs[static_cast<size_t>(i)].res.Get(), d.outs[static_cast<size_t>(i)]);
         }
         if (ok) {
             d.stage = "ExecuteCommandLists";
             ok = d.endList(*slot);
+            if (ok && timed)
+                d.fg_query_done = slot->done_value;
         } else if (begun) {
             // Recording failed: nothing of this list runs.
             d.list->Close();
@@ -3876,14 +4093,130 @@ bool Dx12Fg::Impl::signalShared(uint64_t value)
     stage = "queue signal";
     if (SUCCEEDED(queue->Signal(shared_fence.Get(), value)))
         return true;
-    // The device is probably lost; let the Vulkan side go on from the host.
+    // The device is probably lost; let the Vulkan side go on from the host, after the Vulkan copy
+    // in front (`value - 1`), so its signal cannot move the counter back below `value`.
+    log(1, "the D3D12 queue could not signal the shared fence");
+    signalFromHostSafe(value);
+    return false;
+}
+
+float Dx12Fg::fgGpuTimeMs() const
+{
+    return static_cast<float>(impl->fg_gpu_ms);
+}
+
+bool Dx12Fg::Impl::gateFaulted(const char *call)
+{
+    const char *note = gate.fault ? gate.fault() : nullptr;
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+    if ((!note || !note[0]) && std::strcmp(call, "EvaluateFeature") == 0 && testGateFault())
+        note = "test hook: EvaluateFeature faulted";
+#endif
+    if (!note || !note[0])
+        return false;
+    g_gate_faulted.store(true);
+    if (!crashed) {
+        log(1, "nvngx_dlssnr.dll faulted in %s (%s): the shared NGX D3D12 runtime counts as crashed and is not "
+               "called again",
+            call, note);
+        // stage() keeps naming the call that faulted (the users log it after the call returned).
+        fault_stage = stage;
+    }
+    crashed = true;
+    return true;
+}
+
+uint64_t Dx12Fg::Impl::sharedCounter() const
+{
+    uint64_t current = 0;
+    if (vkGetSemaphoreCounterValue && vkGetSemaphoreCounterValue(vk.device, semaphore, &current) == VK_SUCCESS)
+        return current;
+    // Reading a fence does not call into the runtime.
+    return shared_fence ? shared_fence->GetCompletedValue() : 0;
+}
+
+void Dx12Fg::Impl::raiseShared(uint64_t value)
+{
+    if (!semaphore || !vkSignalSemaphore || value == 0 || sharedCounter() >= value)
+        return;
     VkSemaphoreSignalInfo signal_info = {};
     signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
     signal_info.semaphore = semaphore;
     signal_info.value = value;
-    vkSignalSemaphore(vk.device, &signal_info);
-    log(1, "the D3D12 queue could not signal the shared fence");
-    return false;
+    if (vkSignalSemaphore(vk.device, &signal_info) != VK_SUCCESS)
+        log(1, "raising the shared fence to %llu from the host failed", static_cast<unsigned long long>(value));
+}
+
+void Dx12Fg::Impl::signalFromHostSafe(uint64_t value)
+{
+    if (!semaphore || !vkSignalSemaphore || value == 0 || sharedCounter() >= value)
+        return;
+    if (value > 1 && vkWaitSemaphores) {
+        const uint64_t before = value - 1;
+        VkSemaphoreWaitInfo wait_info = {};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &semaphore;
+        wait_info.pValues = &before;
+        vkWaitSemaphores(vk.device, &wait_info, 1000000000ull);
+        if (sharedCounter() >= value)
+            return;
+    }
+    raiseShared(value);
+    log(1, "the shared fence was raised to %llu from the host (its D3D12 signal never ran)",
+        static_cast<unsigned long long>(value));
+}
+
+bool Dx12Fg::Impl::createTimer(ComPtr<ID3D12QueryHeap> &heap, ComPtr<ID3D12Resource> &readback)
+{
+    if (!timestamp_frequency && FAILED(queue->GetTimestampFrequency(&timestamp_frequency)))
+        timestamp_frequency = 0;
+    if (!timestamp_frequency)
+        return false;
+    D3D12_QUERY_HEAP_DESC qd = {};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = 2;
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = 2 * sizeof(UINT64);
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(device->CreateQueryHeap(&qd, IID_PPV_ARGS(&heap))) ||
+        FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&readback)))) {
+        heap.Reset();
+        readback.Reset();
+        return false;
+    }
+    return true;
+}
+
+bool Dx12Fg::Impl::collectTimer(ID3D12Resource *readback, uint64_t &done, double &ms)
+{
+    if (!readback)
+        return false;
+    if (done) {
+        if (idle_fence->GetCompletedValue() < done)
+            return false; // still measuring
+        void *p = nullptr;
+        const D3D12_RANGE range = { 0, 2 * sizeof(UINT64) };
+        if (SUCCEEDED(readback->Map(0, &range, &p))) {
+            const UINT64 *ts = static_cast<const UINT64 *>(p);
+            if (ts[1] > ts[0] && timestamp_frequency) {
+                const double t = static_cast<double>(ts[1] - ts[0]) * 1000.0 / static_cast<double>(timestamp_frequency);
+                ms = ms > 0.0 ? ms * 0.9 + t * 0.1 : t;
+            }
+            const D3D12_RANGE none = { 0, 0 };
+            readback->Unmap(0, &none);
+        }
+        done = 0;
+    }
+    return true;
 }
 
 bool Dx12Fg::fgAvailable() const
@@ -3909,7 +4242,13 @@ bool Dx12Fg::nrMatches(const NrConfig &config) const
 
 void Dx12Fg::nrInvalidate()
 {
+    // After a crash the runtime is not called (destroyNr() leaks then).
     impl->destroyNr();
+}
+
+bool Dx12Fg::nrUpscaleFailed() const
+{
+    return impl->nr_upscale_failed;
 }
 
 bool Dx12Fg::nrEnsure(const NrConfig &config)
@@ -3917,7 +4256,13 @@ bool Dx12Fg::nrEnsure(const NrConfig &config)
     Impl &d = *impl;
     if (nrMatches(config))
         return true;
-    d.destroyNr();
+    d.nr_upscale_failed = false;
+    if (d.crashed || d.stuck)
+        return false;
+    const uint32_t timeouts = d.gpu_wait_timeouts;
+    // No new buffers while the GPU may still use the old ones (they are leaked then).
+    if (!d.destroyNr())
+        return false;
     if (!nrAvailable()) {
         d.log(1, d.adapter_vendor == kVendorNvidia
                      ? "DLSS 5 neural rendering is not set up (nvngx_dlssnr.dll next to chiaki.exe, see above)"
@@ -3942,9 +4287,13 @@ bool Dx12Fg::nrEnsure(const NrConfig &config)
     const DXGI_FORMAT color = config.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     const UINT bpt = config.hdr ? 8 : 4;
     d.stage = "neural rendering textures";
-    bool ok = d.makeTex(d.nr_in, w, h, color, bpt) && d.makeTex(d.nr_out, ow, oh, color, bpt)
-              && d.makeTex(d.nr_depth, w, h, DXGI_FORMAT_R32_FLOAT, 4)
-              && d.makeTex(d.nr_motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4);
+    bool ok = d.makeTex(d.nr_in, w, h, color, bpt);
+    if (ok && !d.makeTex(d.nr_out, ow, oh, color, bpt)) {
+        // The output size's texture: without the upscale it may fit.
+        d.nr_upscale_failed = upscale;
+        ok = false;
+    }
+    ok = ok && d.makeTex(d.nr_depth, w, h, DXGI_FORMAT_R32_FLOAT, 4) && d.makeTex(d.nr_motion, w, h, DXGI_FORMAT_R16G16_FLOAT, 4);
     if (ok && d.gate_ready && upscale)
         ok = d.makeTex(d.nr_mid, w, h, color, bpt);
     // Between feature 18 passes: what the model reads and writes (RGBA8; HDR goes through the
@@ -3958,39 +4307,30 @@ bool Dx12Fg::nrEnsure(const NrConfig &config)
             d.writeProxyDescriptors();
     }
     d.stage = "neural rendering shared buffers";
-    ok = ok && d.makeShared(d.nr_in_buf, d.nr_in.total) && d.makeShared(d.nr_out_buf, d.nr_out.total);
+    ok = ok && d.makeShared(d.nr_in_buf, d.nr_in.total);
+    if (ok && !d.makeShared(d.nr_out_buf, d.nr_out.total)) {
+        d.nr_upscale_failed = upscale;
+        ok = false;
+    }
     if (!ok || !d.nrCreateFeature()) {
         d.destroyNr();
+        // A fault or a GPU wait that gave up is no upscaling matter.
+        if (d.crashed || d.gpu_wait_timeouts != timeouts)
+            d.nr_upscale_failed = false;
         return false;
     }
     d.log(0, "warming up neural rendering (the first evaluations build the model, a few seconds)");
     if (!d.nrWarmUp()) {
         d.log(1, "the neural rendering warm-up evaluations failed");
         d.destroyNr();
+        if (d.crashed || d.gpu_wait_timeouts != timeouts)
+            d.nr_upscale_failed = false;
         return false;
     }
+    d.nr_upscale_failed = false;
     // Timing is optional.
-    if (!d.nr_queries && SUCCEEDED(d.queue->GetTimestampFrequency(&d.timestamp_frequency))) {
-        D3D12_QUERY_HEAP_DESC qd = {};
-        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qd.Count = 2;
-        D3D12_HEAP_PROPERTIES hp = {};
-        hp.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC rd = {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = 2 * sizeof(UINT64);
-        rd.Height = 1;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels = 1;
-        rd.SampleDesc.Count = 1;
-        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(d.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&d.nr_queries))) ||
-            FAILED(d.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                                     nullptr, IID_PPV_ARGS(&d.nr_query_readback)))) {
-            d.nr_queries.Reset();
-            d.nr_query_readback.Reset();
-        }
-    }
+    if (!d.nr_queries)
+        d.createTimer(d.nr_queries, d.nr_query_readback);
     d.nr_query_done = 0;
     d.nr_gpu_ms = 0.0;
     d.nr_sized = true;
@@ -4065,11 +4405,20 @@ void Dx12Fg::recordNrOutput(VkCommandBuffer cmd, VkImage image)
 bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset)
 {
     Impl &d = *impl;
+    // After a crash the runtime is not called again.
+    const bool usable = !d.crashed && !d.stuck;
     // Before the queue waits for Vulkan: it may resize the swapchain (waits for the queue).
     d.stage = "NeuralHub's panel";
-    d.panelUpdate();
+    if (usable)
+        d.panelUpdate();
     d.stage = "queue wait";
-    bool ok = d.nr_sized && d.nr_handle && SUCCEEDED(d.queue->Wait(d.shared_fence.Get(), wait_value));
+    // Always queued, also when nothing runs (see generate()).
+    const bool waited = SUCCEEDED(d.queue->Wait(d.shared_fence.Get(), wait_value));
+#if defined(CHIAKI_DX12FG_TEST_HOOKS)
+    if (testStall("nr"))
+        d.stallQueue();
+#endif
+    bool ok = waited && usable && d.nr_sized && d.nr_handle;
     if (ok) {
         const std::vector<Impl::Tex *> textures = d.nrTextures();
         std::vector<D3D12_RESOURCE_STATES> saved;
@@ -4077,26 +4426,7 @@ bool Dx12Fg::neuralRender(uint64_t wait_value, uint64_t signal_value, bool reset
             saved.push_back(t->state);
         // Timestamps of an earlier evaluation are read once its list has finished; new
         // ones are only written when the readback buffer is free.
-        bool timed = false;
-        if (d.nr_queries) {
-            const uint64_t completed = d.idle_fence->GetCompletedValue();
-            if (d.nr_query_done && completed >= d.nr_query_done) {
-                void *p = nullptr;
-                const D3D12_RANGE range = { 0, 2 * sizeof(UINT64) };
-                if (SUCCEEDED(d.nr_query_readback->Map(0, &range, &p))) {
-                    const UINT64 *ts = static_cast<const UINT64 *>(p);
-                    if (ts[1] > ts[0] && d.timestamp_frequency) {
-                        const double ms = static_cast<double>(ts[1] - ts[0]) * 1000.0 /
-                                          static_cast<double>(d.timestamp_frequency);
-                        d.nr_gpu_ms = d.nr_gpu_ms > 0.0 ? d.nr_gpu_ms * 0.9 + ms * 0.1 : ms;
-                    }
-                    const D3D12_RANGE none = { 0, 0 };
-                    d.nr_query_readback->Unmap(0, &none);
-                }
-                d.nr_query_done = 0;
-            }
-            timed = d.nr_query_done == 0;
-        }
+        const bool timed = d.nr_queries && d.collectTimer(d.nr_query_readback.Get(), d.nr_query_done, d.nr_gpu_ms);
         Impl::Slot *slot = nullptr;
         const bool begun = d.beginList(&slot);
         ok = begun;
@@ -4166,39 +4496,60 @@ bool Dx12Fg::crashed() const
     return impl->crashed;
 }
 
+void Dx12Fg::markStuck()
+{
+    Impl &d = *impl;
+    if (!d.stuck)
+        d.log(1, "the D3D12 GPU work is stuck: neural rendering and frame generation through D3D12 stop");
+    d.stuck = true;
+    d.gpu_wait_short = true;
+}
+
+bool Dx12Fg::stuck() const
+{
+    return impl->stuck;
+}
+
 void Dx12Fg::signalFromHost(uint64_t value)
+{
+    impl->signalFromHostSafe(value);
+}
+
+bool Dx12Fg::raiseUntilDone(uint64_t value, VkSemaphore done, uint64_t done_value, int timeout_ms)
 {
     Impl &d = *impl;
     if (!d.semaphore || !d.vkSignalSemaphore || value == 0)
-        return;
-    auto reached = [&d]() -> uint64_t {
-        uint64_t current = 0;
-        if (d.vkGetSemaphoreCounterValue
-            && d.vkGetSemaphoreCounterValue(d.vk.device, d.semaphore, &current) == VK_SUCCESS)
-            return current;
-        // Reading a fence does not call into the runtime.
-        return d.shared_fence ? d.shared_fence->GetCompletedValue() : 0;
-    };
-    if (reached() >= value)
-        return;
-    if (value > 1 && d.vkWaitSemaphores) {
-        const uint64_t before = value - 1;
+        return false;
+    const bool watch = done && done_value && d.vkWaitSemaphores;
+    const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(std::max(timeout_ms, 0));
+    int raises = 0;
+    bool drained = !watch;
+    for (;;) {
+        if (d.sharedCounter() < value) {
+            d.raiseShared(value);
+            raises++;
+        }
+        if (drained)
+            break;
         VkSemaphoreWaitInfo wait_info = {};
         wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
         wait_info.semaphoreCount = 1;
-        wait_info.pSemaphores = &d.semaphore;
-        wait_info.pValues = &before;
-        d.vkWaitSemaphores(d.vk.device, &wait_info, 1000000000ull);
-        if (reached() >= value)
-            return;
+        wait_info.pSemaphores = &done;
+        wait_info.pValues = &done_value;
+        // Short slices: a copy that lowered the counter is caught before the waits behind it.
+        drained = d.vkWaitSemaphores(d.vk.device, &wait_info, 2000000ull) == VK_SUCCESS;
+        if (!drained && GetTickCount64() >= until)
+            break;
     }
-    VkSemaphoreSignalInfo signal_info = {};
-    signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
-    signal_info.semaphore = d.semaphore;
-    signal_info.value = value;
-    const VkResult res = d.vkSignalSemaphore(d.vk.device, &signal_info);
-    d.log(1, "the shared fence was raised to %llu from the host (its D3D12 signal never ran)%s",
-          static_cast<unsigned long long>(value), res == VK_SUCCESS ? "" : ", which failed");
+    // The last copy may have lowered it on its way out.
+    if (d.sharedCounter() < value) {
+        d.raiseShared(value);
+        raises++;
+    }
+    if (raises)
+        d.log(1, "the shared fence was raised to %llu from the host %d time(s) (the D3D12 work did not signal it)%s",
+              static_cast<unsigned long long>(value), raises, drained ? "" : "; the Vulkan work behind it is not through yet");
+    return drained && watch;
 }
 
 uint32_t Dx12Fg::gpuWaitTimeouts() const
@@ -4219,7 +4570,7 @@ std::shared_ptr<Dx12Fg> Dx12Fg::shared(const VulkanDevice &vk, LogFn log, void *
     std::lock_guard<std::mutex> lock(mutex);
     if (auto existing = instance.lock()) {
         if (instance_device == vk.device)
-            return existing->crashed() ? nullptr : existing;
+            return existing->crashed() || existing->stuck() ? nullptr : existing;
     }
     auto created = std::make_shared<Dx12Fg>(vk, log, user);
     if (!created->init())
@@ -4237,5 +4588,5 @@ std::shared_ptr<Dx12Fg> Dx12Fg::shared(const VulkanDevice &vk, LogFn log, void *
 
 const char *Dx12Fg::stage() const
 {
-    return impl->stage;
+    return impl->fault_stage ? impl->fault_stage : impl->stage;
 }

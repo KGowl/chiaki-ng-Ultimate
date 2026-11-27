@@ -19,8 +19,12 @@ Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
 
 namespace {
 
-// Rendered frames are cached per source frame so the frame mixer can reuse them.
+// Rendered frames are cached per source frame so the frame mixer can reuse them; with frames
+// coming one at a time (Direct Mapping) only the last two are kept (see processImpl()).
 constexpr size_t kMaxCachedFrames = 8;
+constexpr size_t kMinCachedFrames = 2;
+// How long unstickGpu() / a stuck GPU keeps the shared timeline raised for this side's copies.
+constexpr int kUnstickMs = 1000;
 // Two command buffers per frame (copy in, copy out).
 constexpr size_t kCommandSlots = 6;
 constexpr uint64_t kWaitTimeoutNs = 2000000000ull;
@@ -86,6 +90,17 @@ struct NeuralRender::Impl
     // wait timeouts before it began.
     bool gpu_wait_failed = false;
     uint32_t gpu_timeouts_seen = 0;
+    // DLSS Super Resolution could not be set up for these sizes: frames get no upscaling there.
+    struct UpscaleFailure
+    {
+        int w, h, out_w, out_h;
+        bool hdr;
+    };
+    std::vector<UpscaleFailure> upscale_failures;
+    // processImpl() calls since the last begin(): frames come one at a time while it is small.
+    int calls_since_begin = 1000;
+    // Cache limits logged so far (bit n = n frames), each once.
+    uint32_t limits_logged = 0;
     std::shared_ptr<Dx12Fg> runner;
     // NeuralHub's in-game panel: chiaki's window it is shown over, and whether NeuralHub runs
     // the neural rendering (read from the GUI thread).
@@ -132,10 +147,16 @@ struct NeuralRender::Impl
                 uint64_t shared_signal);
     bool ensureImage(Image &img, int w, int h, bool hdr);
     void destroyImage(Image &img);
-    CacheEntry &acquireCacheEntry(uint64_t key);
+    CacheEntry &acquireCacheEntry(uint64_t key, size_t limit);
+    // Whether this side's Vulkan work up to `value` is done (never waits).
+    bool reached(uint64_t value);
+    // Destroys the least recently used entries beyond `limit` whose copies are done (not the one
+    // used last, not a begun one).
+    void trimCache(size_t limit);
     // Steps (1) and (2) of a frame, then (3) unless `pending_output` is given: it then gets
-    // the D3D12 value to pass to copyBack() later.
-    bool run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed,
+    // the D3D12 value to pass to copyBack() later. `upscale_failed`: DLSS Super Resolution could
+    // not be set up for the config's upscale (neural rendering itself may work without it).
+    bool run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed, bool *upscale_failed,
              uint64_t *pending_output = nullptr);
     bool copyBack(Image &out, uint64_t output_value);
     void abandonRunner();
@@ -143,6 +164,11 @@ struct NeuralRender::Impl
     bool processImpl(const struct pl_frame *src, uint64_t signature, const NeuralRender::Options &options,
                      struct pl_frame *out_frame, uint64_t *out_signature, bool defer);
     void noteFailure(bool crashed);
+    // A host wait gave up in this processImpl() call, or the shared D3D12 work is stuck.
+    bool gpuStuck() const
+    {
+        return gpu_wait_failed || (runner && (runner->gpuWaitTimeouts() != gpu_timeouts_seen || runner->stuck()));
+    }
 };
 
 bool NeuralRender::Impl::loadFunctions()
@@ -355,9 +381,9 @@ void NeuralRender::Impl::destroyImage(Image &img)
     img = Image();
 }
 
-NeuralRender::Impl::CacheEntry &NeuralRender::Impl::acquireCacheEntry(uint64_t key)
+NeuralRender::Impl::CacheEntry &NeuralRender::Impl::acquireCacheEntry(uint64_t key, size_t limit)
 {
-    if (cache.size() < kMaxCachedFrames) {
+    if (cache.size() < limit) {
         cache.emplace_back();
         cache.back().key = key;
         return cache.back();
@@ -367,6 +393,37 @@ NeuralRender::Impl::CacheEntry &NeuralRender::Impl::acquireCacheEntry(uint64_t k
     });
     oldest->key = key;
     return *oldest;
+}
+
+bool NeuralRender::Impl::reached(uint64_t value)
+{
+    if (!sem_done || value == 0)
+        return true;
+    VkSemaphoreWaitInfo wait_info = {};
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores = &sem_done;
+    wait_info.pValues = &value;
+    return vkWaitSemaphores(vk->device, &wait_info, 0) == VK_SUCCESS;
+}
+
+void NeuralRender::Impl::trimCache(size_t limit)
+{
+    while (cache.size() > limit) {
+        auto victim = cache.end();
+        for (auto it = cache.begin(); it != cache.end(); ++it) {
+            // libplacebo keeps a texture its own queued work reads alive; this side's copies into
+            // it must be done.
+            if (it->last_use == use_counter || it->pending_output || !reached(it->done_value))
+                continue;
+            if (victim == cache.end() || it->last_use < victim->last_use)
+                victim = it;
+        }
+        if (victim == cache.end())
+            return; // the rest goes once its copies are done
+        destroyImage(victim->image);
+        cache.erase(victim);
+    }
 }
 
 // The runtime crashed: its state is unknown, so it is never called (or destroyed) again.
@@ -404,9 +461,20 @@ void NeuralRender::Impl::abandonGpuObjects()
 // D3D12 queue waits for it, runs the feature and signals the next value, (3) Vulkan waits for
 // that and copies the shared output buffer into `out`.
 bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool reset, bool *crashed,
-                             uint64_t *pending_output)
+                             bool *upscale_failed, uint64_t *pending_output)
 {
     *crashed = false;
+    *upscale_failed = false;
+    // nrgate turns a fault inside nvngx_dlssnr.dll into an error code; the runner then counts as
+    // crashed by itself.
+    auto runtime_crashed = [&]() {
+        if (!runner->crashed())
+            return false;
+        qCCritical(chiakiGui).nospace() << "[neural-render] The NGX D3D12 runtime crashed (nvngx_dlssnr.dll faulted, in "
+                                        << runner->stage() << ")";
+        *crashed = true;
+        return true;
+    };
     if (!runner->nrMatches(config)) {
         // The shared buffers are rebuilt: nothing may still use them.
         if (!waitDone(done_value))
@@ -422,8 +490,12 @@ bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool re
             *crashed = true;
             return false;
         }
-        if (!sized)
+        if (!sized) {
+            if (!runtime_crashed())
+                *upscale_failed = (config.out_width != config.width || config.out_height != config.height)
+                                  && runner->nrUpscaleFailed();
             return false;
+        }
         reset = true;
     }
 
@@ -470,8 +542,10 @@ bool NeuralRender::Impl::run(Image &out, const Dx12Fg::NrConfig &config, bool re
         *crashed = true;
         return false;
     }
-    if (!rendered)
+    if (!rendered) {
+        runtime_crashed();
         return false;
+    }
     if (pending_output) {
         *pending_output = output_value;
         return true;
@@ -520,6 +594,11 @@ void NeuralRender::Impl::shutdown()
     if (runner) {
         // Frame generation may keep the shared instance alive: drop this side's buffers.
         runner->nrInvalidate();
+        if (runner->crashed() || runner->stuck()) {
+            // A fault in a release, or D3D12 work that does not finish: never destroyed (its
+            // destructor would call into the runtime and wait for the GPU).
+            (void)new std::shared_ptr<Dx12Fg>(std::move(runner));
+        }
         runner.reset();
     }
     if (gpu) {
@@ -646,12 +725,29 @@ bool NeuralRender::beginDone() const
     return d.begun_value == 0 || !d.runner || d.runner->completedValue() >= d.begun_value;
 }
 
+void NeuralRender::unstickGpu()
+{
+    Impl &d = *impl;
+    if (!d.initialized || !d.runner)
+        return;
+    // Its D3D12 side is through: whatever the renderer waits for is not held up here.
+    if (!d.runner->crashed() && !d.runner->stuck() && d.runner->completedValue() >= d.runner->lastValue())
+        return;
+    qCWarning(chiakiGui) << "[neural-render] Disabling DLSS neural rendering for this session (the renderer's GPU wait "
+                            "timed out with its D3D12 work behind)";
+    d.runner->markStuck();
+    d.runner->raiseUntilDone(d.runner->lastValue(), d.sem_done, d.done_value, kUnstickMs);
+    d.abandonGpuObjects();
+    d.init_failed = true;
+}
+
 void NeuralRender::Impl::noteFailure(bool crashed)
 {
     reset_pending = true;
-    // A host wait that gave up (Vulkan here, or D3D12 inside the runtime): the GPU did not get
-    // through the work, so each retry would stall the stream again.
-    const bool gpu_stuck = gpu_wait_failed || (runner && runner->gpuWaitTimeouts() != gpu_timeouts_seen);
+    // A host wait that gave up (Vulkan here, or D3D12 inside the runtime), or frame generation
+    // saw the shared D3D12 work stuck: the GPU did not get through the work, so each retry would
+    // stall the stream again.
+    const bool gpu_stuck = gpuStuck();
     const auto now = std::chrono::steady_clock::now();
     while (!failure_times.empty() && now - failure_times.front() > kFailureWindow)
         failure_times.pop_front();
@@ -663,9 +759,14 @@ void NeuralRender::Impl::noteFailure(bool crashed)
                              : gpu_stuck ? "(the GPU did not finish its work in time)"
                                          : "(3 failures within 30 s)");
     // The D3D12 call that should signal the last value on the shared timeline may never run:
-    // let whatever waits for it go on.
-    if ((crashed || gpu_stuck) && runner)
+    // let whatever waits for it go on. Stuck work: frame generation stops too, and the timeline
+    // stays raised until this side's copies queued behind the stuck wait are through.
+    if (gpu_stuck && runner) {
+        runner->markStuck();
+        runner->raiseUntilDone(runner->lastValue(), sem_done, done_value, kUnstickMs);
+    } else if (crashed && runner) {
         runner->signalFromHost(runner->lastValue());
+    }
     if (crashed && runner)
         abandonRunner();
     if (gpu_stuck)
@@ -684,12 +785,20 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
         return false;
     d.gpu_wait_failed = false;
     d.gpu_timeouts_seen = d.runner ? d.runner->gpuWaitTimeouts() : 0;
+    // Frames one at a time (FrameGen's pipeline: begin(), then process() of the same frame).
+    const bool one_at_a_time = defer || d.calls_since_begin < 2;
+    d.calls_since_begin = defer ? 0 : std::min(d.calls_since_begin + 1, 1000);
     if (d.runner && d.runner->crashed()) {
         // Frame generation saw the shared runtime crash. The value it left as the last one on the
         // shared timeline may never be signalled, and the next run would make the Vulkan queue
         // wait for it: nothing is submitted, neural rendering gives the runtime up.
         qCWarning(chiakiGui) << "[neural-render] The shared NGX D3D12 runtime crashed in frame generation";
         d.noteFailure(true);
+        return false;
+    }
+    if (d.runner && d.runner->stuck()) {
+        qCWarning(chiakiGui) << "[neural-render] The shared D3D12 work is stuck on the GPU (seen by frame generation)";
+        d.noteFailure(false);
         return false;
     }
     const bool hdr = pl_color_space_is_hdr(&src->color);
@@ -709,7 +818,15 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
     config.out_width = config.width;
     config.out_height = config.height;
     if (options.out_width > config.width && options.out_height > config.height) {
-        if (d.runner->nrCanUpscale()) {
+        const bool failed_before = std::any_of(d.upscale_failures.begin(), d.upscale_failures.end(),
+                                               [&](const Impl::UpscaleFailure &f) {
+                                                   return f.w == config.width && f.h == config.height
+                                                          && f.out_w == options.out_width
+                                                          && f.out_h == options.out_height && f.hdr == hdr;
+                                               });
+        if (failed_before) {
+            // Logged when it failed: this size stays without upscaling.
+        } else if (d.runner->nrCanUpscale()) {
             config.out_width = options.out_width;
             config.out_height = options.out_height;
         } else if (!d.upscale_warned) {
@@ -836,7 +953,17 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
         return false;
     }
 
-    Impl::CacheEntry &entry = d.acquireCacheEntry(key);
+    const size_t limit = options.frames_in_use > 0
+                             ? std::clamp(static_cast<size_t>(options.frames_in_use) + 1, kMinCachedFrames, kMaxCachedFrames)
+                             : one_at_a_time ? kMinCachedFrames : kMaxCachedFrames;
+    if (!(d.limits_logged & (1u << limit))) {
+        d.limits_logged |= 1u << limit;
+        qCInfo(chiakiGui).nospace() << "[neural-render] Up to " << limit << " rendered frames kept"
+                                    << (options.frames_in_use > 0 ? " (frames in use given)"
+                                        : one_at_a_time           ? " (frames one at a time)"
+                                                                  : "");
+    }
+    Impl::CacheEntry &entry = d.acquireCacheEntry(key, limit);
     // A recycled entry is several frames old, so this wait normally returns at once.
     if (!d.waitDone(entry.done_value) || !d.ensureImage(entry.image, config.out_width, config.out_height, hdr)) {
         entry.key = 0;
@@ -844,10 +971,22 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
         return false;
     }
     bool crashed = false;
+    bool upscale_failed = false;
     uint64_t pending_output = 0;
-    const bool ok = d.run(entry.image, config, d.reset_pending, &crashed, defer ? &pending_output : nullptr);
+    const bool ok = d.run(entry.image, config, d.reset_pending, &crashed, &upscale_failed,
+                          defer ? &pending_output : nullptr);
     if (!ok) {
         entry.key = 0;
+        if (upscale_failed && !crashed && !d.gpuStuck()) {
+            // Not neural rendering's failure: the same frame again without the upscale (that size is
+            // not asked for again), not counted.
+            d.upscale_failures.push_back({ config.width, config.height, config.out_width, config.out_height, hdr });
+            qCWarning(chiakiGui).nospace() << "[neural-render] DLSS Super Resolution could not be set up for "
+                                           << config.width << "x" << config.height << " -> " << config.out_width << "x"
+                                           << config.out_height << (hdr ? " HDR" : " SDR") << ": DLSS 5 goes on at "
+                                           << config.width << "x" << config.height << " without upscaling";
+            return d.processImpl(src, signature, options, out_frame, out_signature, defer);
+        }
         d.noteFailure(crashed);
         return false;
     }
@@ -856,10 +995,12 @@ bool NeuralRender::Impl::processImpl(const struct pl_frame *src, uint64_t signat
         entry.pending_output = pending_output;
         entry.last_use = ++d.use_counter;
         d.begun_value = pending_output;
-        return true;
+    } else {
+        entry.done_value = d.done_value;
+        fill_frame(entry);
     }
-    entry.done_value = d.done_value;
-    fill_frame(entry);
+    // `entry` is not used after this.
+    d.trimCache(limit);
     return true;
 }
 
@@ -886,5 +1027,6 @@ bool NeuralRender::process(const struct pl_frame *, uint64_t, const Options &, s
 }
 bool NeuralRender::begin(const struct pl_frame *, uint64_t, const Options &) { return false; }
 bool NeuralRender::beginDone() const { return true; }
+void NeuralRender::unstickGpu() {}
 
 #endif // CHIAKI_HAVE_DX12FG
