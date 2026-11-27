@@ -671,6 +671,12 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
             ok = nr.begin(&src, static_cast<uint64_t>(k + 1), options);
             const double begin_ms = timer.nsecsElapsed() / 1e6;
             const double wait_ms = ok ? waitBegun([&]() { return nr.beginDone(); }) : -1.0;
+            if (ok && wait_ms < 0.0) {
+                // What the renderer does when its bounded GPU wait times out.
+                std::printf("frame %2d: the D3D12 side is not done after 5 s: unstickGpu()\n", k);
+                fg.unstickGpu();
+                nr.unstickGpu();
+            }
             ok = ok && wait_ms >= 0.0 && nr.process(&src, static_cast<uint64_t>(k + 1), options, &out, &signature);
             char buf[96];
             std::snprintf(buf, sizeof(buf), " | begin %.1f ms, D3D12 done after %.1f ms", begin_ms, wait_ms);
@@ -732,12 +738,20 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
             std::vector<struct pl_frame> fg_out;
             bool fg_ok;
             if (pipeline) {
-                fg_ok = fg.begin(&out, out_w, out_h, 2, 16.7f) && waitBegun([&]() { return fg.beginDone(); }) >= 0.0 &&
-                        fg.finish(fg_out);
+                fg_ok = fg.begin(&out, out_w, out_h, 2, 16.7f);
+                if (fg_ok && waitBegun([&]() { return fg.beginDone(); }) < 0.0) {
+                    std::printf("frame %2d: the FG D3D12 side is not done after 5 s: unstickGpu()\n", k);
+                    fg.unstickGpu();
+                    nr.unstickGpu();
+                    fg_ok = false;
+                }
+                fg_ok = fg_ok && fg.finish(fg_out);
             } else {
                 fg_ok = fg.process(&out, out_w, out_h, 2, 16.7f, fg_out);
             }
-            fg_note = fg_ok ? " | FG " + std::to_string(fg_out.size()) + " frame(s)" : " | FG failed";
+            char fg_buf[64];
+            std::snprintf(fg_buf, sizeof(fg_buf), " | FG %zu frame(s), FG GPU %.2f ms", fg_out.size(), fg.gpuTimeMs());
+            fg_note = fg_ok ? std::string(fg_buf) : " | FG failed";
             if (!fg_ok && k > 0)
                 failures++;
         }
@@ -1141,6 +1155,8 @@ int runEval(Rig &rig, const std::string &dir, const std::string &out_dir, FrameG
 
 int main(int argc, char **argv)
 {
+    // Unbuffered: the lines stay in order with the log (stderr), also when the process ends abruptly.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     QCoreApplication app(argc, argv);
 #if defined(_WIN32)
     // 1 ms timer resolution, as chiaki-ng sets it while streaming (windowsStreamTuning.cpp): waits
@@ -1309,8 +1325,14 @@ int main(int argc, char **argv)
             timer.start();
             bool ok;
             if (pipeline) {
-                ok = fg.begin(&src, phase.w, phase.h, phase.multiplier, 33.3f) &&
-                     waitBegun([&]() { return fg.beginDone(); }) >= 0.0 && fg.finish(outputs);
+                ok = fg.begin(&src, phase.w, phase.h, phase.multiplier, 33.3f);
+                if (ok && waitBegun([&]() { return fg.beginDone(); }) < 0.0) {
+                    // What the renderer does when its bounded GPU wait times out.
+                    std::printf("frame %2d: the D3D12 side is not done after 5 s: unstickGpu()\n", k);
+                    fg.unstickGpu();
+                    ok = false;
+                }
+                ok = ok && fg.finish(outputs);
             } else {
                 ok = fg.process(&src, phase.w, phase.h, phase.multiplier, 33.3f, outputs);
             }

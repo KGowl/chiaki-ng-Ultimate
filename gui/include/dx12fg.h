@@ -63,7 +63,13 @@ public:
     // hold the output's own values (BT.2020 PQ), not linear light. Otherwise RGBA8.
     bool ensureSize(int w, int h, bool hdr = false);
     bool sizeMatches(int w, int h, bool hdr = false) const;
-    // Drops the size dependent state. No GPU work may be pending.
+    // Whether the last failed ensureSize() failed in the runtime (it refused to create the feature
+    // or to evaluate it), not for want of memory or because a GPU wait gave up. An HDR size the
+    // runtime refuses while the same size in SDR works means it does not take RGBA16F.
+    bool sizeRefused() const;
+    // Drops the size dependent state. No GPU work may be pending. When the D3D12 GPU work does not
+    // finish (a wait that gave up) the buffers and the feature are left as they are (leaked), not
+    // freed under the GPU; after a crash nothing is done (the runtime is not called again).
     void invalidate();
 
     // Timeline semaphore shared with D3D12 and the last value that has been (or will be)
@@ -94,6 +100,9 @@ public:
     // itself), NVIDIA's own runtime uses them.
     bool generate(int count, uint64_t wait_value, uint64_t signal_value, bool reset, bool use_motion,
                   float mvec_scale_x, float mvec_scale_y);
+    // Average GPU time of the frame generation evaluations of one generate() call in milliseconds
+    // (0 if unknown; NGX route only).
+    float fgGpuTimeMs() const;
 
     // DLSS Frame Generation through NVIDIA Streamline (NVIDIA, with MFG Unlocker's version.dll
     // next to chiaki.exe, or CHIAKI_DLSSG_ROUTE=sl; MFG Unlocker opens DLSS-G on RTX 20 / RTX 30
@@ -146,6 +155,11 @@ public:
     // nrEnsure warms the model up (a few seconds). No GPU work may be pending on its buffers.
     bool nrEnsure(const NrConfig &config);
     bool nrMatches(const NrConfig &config) const;
+    // Whether the last failed nrEnsure() failed in the upscaling part of an upscaling config (DLSS
+    // Super Resolution's creation or warm-up evaluation, or the output-size buffers), not in neural
+    // rendering itself: the same config without upscaling (out = in) may well work.
+    bool nrUpscaleFailed() const;
+    // As invalidate(), for the neural rendering state.
     void nrInvalidate();
     // Copies between Vulkan images (VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM or
     // VK_FORMAT_R16G16B16A16_SFLOAT for HDR) and the shared input buffer (width x height) /
@@ -210,9 +224,17 @@ public:
     static bool ngxUpInProcess();
     // After a crash inside the runtime its state is unknown: the user that saw it calls
     // markCrashed() and leaks its reference (the instance is never destroyed), and
-    // shared() returns nullptr for that Vulkan device from then on.
+    // shared() returns nullptr for that Vulkan device from then on. A fault inside
+    // nvngx_dlssnr.dll, which nrgate turns into an error code, marks it crashed by itself: check
+    // crashed() after a failed neuralRender() / nrEnsure() / nrInvalidate().
     void markCrashed();
     bool crashed() const;
+    // D3D12 work on the shared queue did not finish (a host wait gave up, or the renderer's bounded
+    // wait for Vulkan work behind it timed out): the user that saw it calls markStuck(), the other
+    // user stops at its next call, and shared() returns nullptr from then on. Host waits for the
+    // D3D12 queue give up after 250 ms instead of 15 s from then on (until one succeeds).
+    void markStuck();
+    bool stuck() const;
     // Raises the shared timeline semaphore to `value` from the host when its counter is below it.
     // After a crash inside the runtime the D3D12 call that would have signalled `value` never ran,
     // and Vulkan work waiting for it on the GPU (holding up everything queued after it on the same
@@ -221,6 +243,14 @@ public:
     // lands after this one and moves the counter back. Vulkan calls only (never D3D12 or the
     // runtime): safe after markCrashed(). Call it with lastValue().
     void signalFromHost(uint64_t value);
+    // For D3D12 work that is stuck on the GPU (it may never signal): raises the shared timeline
+    // semaphore to `value` (call it with lastValue()) from the host and keeps it there until the
+    // caller's own Vulkan work is through (`done` reaches `done_value`, e.g. a user's own timeline of
+    // its submissions) or `timeout_ms` passed. Vulkan copies queued behind a wait that only the stuck
+    // D3D12 work would have satisfied still signal their lower values on the shared timeline as they
+    // run, which moves its counter back below the waits after them: it is raised again each time.
+    // Vulkan calls only. True when `done` reached `done_value`.
+    bool raiseUntilDone(uint64_t value, VkSemaphore done, uint64_t done_value, int timeout_ms);
     // How many host waits for D3D12 GPU work gave up (15 s) since the instance was created.
     uint32_t gpuWaitTimeouts() const;
 
