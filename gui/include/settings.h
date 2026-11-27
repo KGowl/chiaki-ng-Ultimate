@@ -216,6 +216,10 @@ class Settings : public QObject
 		int manual_hosts_id_next;
 		// Bumped by every change of the neural rendering passes or controls.
 		std::atomic<uint32_t> neural_render_tuning_rev{ 1 };
+		// Bumped (after the write) by every setter of a value the render thread caches, see
+		// GetRenderSettingsRevision().
+		std::atomic<uint32_t> render_settings_rev{ 1 };
+		void BumpRenderSettingsRevision() { render_settings_rev.fetch_add(1, std::memory_order_release); }
 
 		void LoadRegisteredHosts(QSettings *qsettings = nullptr);
 		void SaveRegisteredHosts(QSettings *qsettings = nullptr);
@@ -539,6 +543,7 @@ class Settings : public QObject
 			settings.setValue("settings/rtx_vsr_quality", quality);
 			if (quality)
 				settings.setValue("settings/rtx_vsr_last_quality", quality);
+			BumpRenderSettingsRevision();
 		}
 		// Mode restored when RTX VSR is switched back on from the stream menu.
 		int GetRtxVsrLastQuality() const
@@ -557,22 +562,23 @@ class Settings : public QObject
 			settings.setValue("settings/frame_gen_backend", backend);
 			if (backend)
 				settings.setValue("settings/frame_gen_last_backend", backend);
+			BumpRenderSettingsRevision();
 		}
 		// Backend restored when frame generation is switched back on from the stream menu (0 = never chosen).
 		int GetFrameGenLastBackend() const { return qBound(0, settings.value("settings/frame_gen_last_backend", 0).toInt(), 5); }
 		// DLSS neural rendering (DLSS 5) on the video through the NGX D3D12 bridge, see neuralrender.h.
 		bool GetNeuralRender() const { return settings.value("settings/neural_render", false).toBool(); }
-		void SetNeuralRender(bool enabled) { settings.setValue("settings/neural_render", enabled); }
+		void SetNeuralRender(bool enabled) { settings.setValue("settings/neural_render", enabled); BumpRenderSettingsRevision(); }
 		// Upscale after neural rendering (target below).
 		bool GetNeuralRenderUpscale() const { return settings.value("settings/neural_render_upscale", true).toBool(); }
-		void SetNeuralRenderUpscale(bool enabled) { settings.setValue("settings/neural_render_upscale", enabled); }
+		void SetNeuralRenderUpscale(bool enabled) { settings.setValue("settings/neural_render_upscale", enabled); BumpRenderSettingsRevision(); }
 		// Where that upscale goes: 0 = toward the window size (1.5x or 2x steps), 1 = 4K (2160 lines, at most 2x
 		// of the stream) whatever the window, downscaled to a smaller window.
 		int GetNeuralRenderUpscaleTarget() const { return qBound(0, settings.value("settings/neural_render_upscale_target", 0).toInt(), 1); }
-		void SetNeuralRenderUpscaleTarget(int target) { settings.setValue("settings/neural_render_upscale_target", qBound(0, target, 1)); }
+		void SetNeuralRenderUpscaleTarget(int target) { settings.setValue("settings/neural_render_upscale_target", qBound(0, target, 1)); BumpRenderSettingsRevision(); }
 		// NVIDIA feature 18 model: 0 = CC, 1 = HT.
 		int GetNeuralRenderModel() const { return settings.value("settings/neural_render_model", 0).toInt(); }
-		void SetNeuralRenderModel(int model) { settings.setValue("settings/neural_render_model", model); }
+		void SetNeuralRenderModel(int model) { settings.setValue("settings/neural_render_model", model); BumpRenderSettingsRevision(); }
 		// NVIDIA feature 18 passes in a row (1-3), and whether each pass has its own controls
 		// (otherwise all of them use pass 1's).
 		int GetNeuralRenderPasses() const { return qBound(1, settings.value("settings/neural_render_passes", 1).toInt(), NeuralRenderTuning::kMaxPasses); }
@@ -590,29 +596,33 @@ class Settings : public QObject
 		static NeuralRenderTuning ClampNeuralRenderTuning(NeuralRenderTuning tuning);
 		// Changes with every change of the passes or the controls (polled by the render thread).
 		uint32_t GetNeuralRenderTuningRevision() const { return neural_render_tuning_rev.load(std::memory_order_relaxed); }
+		// Changes after every change of a setting the render thread reads for every frame (the display target,
+		// the upscaler, RCAS, the ambient border, RTX VSR, DLSS 5 and frame generation): it reads them again
+		// then instead of from the registry for every frame (QmlMainWindow::refreshRenderSettings).
+		uint32_t GetRenderSettingsRevision() const { return render_settings_rev.load(std::memory_order_acquire); }
 		// AMD RCAS sharpening of the final image: 0 = off, 1-100 = strength in percent
 		int GetRcasStrength() const { return qBound(0, settings.value("settings/rcas_strength", 0).toInt(), 100); }
-		void SetRcasStrength(int strength) { settings.setValue("settings/rcas_strength", qBound(0, strength, 100)); }
+		void SetRcasStrength(int strength) { settings.setValue("settings/rcas_strength", qBound(0, strength, 100)); BumpRenderSettingsRevision(); }
 		// Fill the empty border around the video (ultrawide displays, Zoom off)
 		// with a blurred copy of the picture instead of black.
 		bool GetAmbientBorder() const { return settings.value("settings/ambient_border", false).toBool(); }
-		void SetAmbientBorder(bool enabled) { settings.setValue("settings/ambient_border", enabled); }
+		void SetAmbientBorder(bool enabled) { settings.setValue("settings/ambient_border", enabled); BumpRenderSettingsRevision(); }
 		// Flow frame generation analysis resolution: false = 1/4 (performance), true = 1/2 (quality)
 		bool GetFrameGenFlowHighQuality() const { return settings.value("settings/frame_gen_flow_high_quality", false).toBool(); }
-		void SetFrameGenFlowHighQuality(bool high) { settings.setValue("settings/frame_gen_flow_high_quality", high); }
+		void SetFrameGenFlowHighQuality(bool high) { settings.setValue("settings/frame_gen_flow_high_quality", high); BumpRenderSettingsRevision(); }
 		// NVIDIA VFG model quality: 0 Low, 1 Medium, 2 High.
 		int GetFrameGenVfgMode() const { return qBound(0, settings.value("settings/frame_gen_vfg_mode", 2).toInt(), 2); }
-		void SetFrameGenVfgMode(int mode) { settings.setValue("settings/frame_gen_vfg_mode", qBound(0, mode, 2)); }
+		void SetFrameGenVfgMode(int mode) { settings.setValue("settings/frame_gen_vfg_mode", qBound(0, mode, 2)); BumpRenderSettingsRevision(); }
 		// DLSS Frame Generation motion vectors: 0 = zero motion, 1 = Flow's motion search,
 		// 2 = Flow's motion search with the opposite sign (to compare the conventions).
 		int GetFrameGenDlssMotion() const { return qBound(0, settings.value("settings/frame_gen_dlss_motion", 1).toInt(), 2); }
-		void SetFrameGenDlssMotion(int mode) { settings.setValue("settings/frame_gen_dlss_motion", qBound(0, mode, 2)); }
+		void SetFrameGenDlssMotion(int mode) { settings.setValue("settings/frame_gen_dlss_motion", qBound(0, mode, 2)); BumpRenderSettingsRevision(); }
 		// Generated frame clean-up: 0 off, 1 static content (HUD), 2 static content + detail.
 		int GetFrameGenCleanup() const { return qBound(0, settings.value("settings/frame_gen_cleanup", 2).toInt(), 2); }
-		void SetFrameGenCleanup(int mode) { settings.setValue("settings/frame_gen_cleanup", qBound(0, mode, 2)); }
+		void SetFrameGenCleanup(int mode) { settings.setValue("settings/frame_gen_cleanup", qBound(0, mode, 2)); BumpRenderSettingsRevision(); }
 		// Output frames per stream frame (2 = one generated frame per real frame)
 		int GetFrameGenMultiplier() const { return qBound(2, settings.value("settings/frame_gen_multiplier", 2).toInt(), 4); }
-		void SetFrameGenMultiplier(int multiplier) { settings.setValue("settings/frame_gen_multiplier", qBound(2, multiplier, 4)); }
+		void SetFrameGenMultiplier(int multiplier) { settings.setValue("settings/frame_gen_multiplier", qBound(2, multiplier, 4)); BumpRenderSettingsRevision(); }
 		void SetPlaceboFrameMixer(PlaceboFrameMixer frame_mixer);
 
 		bool GetPlaceboDeinterlaceEnabled() const;

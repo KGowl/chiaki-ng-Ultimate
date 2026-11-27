@@ -193,6 +193,26 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ctrl_join(ChiakiCtrl *ctrl)
 	return chiaki_thread_join(&ctrl->thread, NULL);
 }
 
+CHIAKI_EXPORT void chiaki_ctrl_reset_for_retry(ChiakiCtrl *ctrl)
+{
+	chiaki_mutex_lock(&ctrl->notif_mutex);
+	ctrl->should_stop = false;
+	// Both are manual-reset (Windows event / pipe) and stay signaled after chiaki_ctrl_stop():
+	// without this the next ctrl connect returns "canceled" at once. The return value only
+	// says whether there was anything to drain.
+	chiaki_stop_pipe_reset(&ctrl->stop_pipe);
+	chiaki_stop_pipe_reset(&ctrl->notif_pipe);
+	free(ctrl->login_pin);
+	ctrl->login_pin = NULL;
+	ctrl->login_pin_size = 0;
+	ctrl->login_pin_entered = false;
+	ctrl->login_pin_requested = false;
+	ctrl->cant_displaya = false;
+	ctrl->cant_displayb = false;
+	ctrl->recv_buf_size = 0;
+	chiaki_mutex_unlock(&ctrl->notif_mutex);
+}
+
 CHIAKI_EXPORT void chiaki_ctrl_fini(ChiakiCtrl *ctrl)
 {
 	chiaki_stop_pipe_fini(&ctrl->stop_pipe);

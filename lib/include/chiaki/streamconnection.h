@@ -40,7 +40,12 @@ typedef struct chiaki_stream_connection_t
 
 	ChiakiPacketStats packet_stats;
 	ChiakiAudioReceiver *audio_receiver;
+	/**
+	 * Created and freed by the thread running chiaki_stream_connection_run() while it holds video_receiver_mutex.
+	 * Other threads use it only through the chiaki_stream_connection_*video* functions below, which take that mutex.
+	 */
 	ChiakiVideoReceiver *video_receiver;
+	ChiakiMutex video_receiver_mutex;
 	ChiakiAudioReceiver *haptics_receiver;
 	double packet_loss_max;
 	uint8_t motion_counter[4];
@@ -93,6 +98,22 @@ CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_toggle_mute_direct_message(
  * To be called from a thread other than the one chiaki_stream_connection_run() is running on to stop stream_connection
  */
 CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_stop(ChiakiStreamConnection *stream_connection);
+
+/**
+ * Clears what a finished chiaki_stream_connection_run() leaves behind (remote disconnect, keys of the last bang)
+ * for another run. Only while chiaki_stream_connection_run() is not running.
+ */
+CHIAKI_EXPORT void chiaki_stream_connection_reset_for_retry(ChiakiStreamConnection *stream_connection);
+
+/**
+ * Frames lost so far by the current video receiver, 0 when there is none. Safe from any thread.
+ */
+CHIAKI_EXPORT int32_t chiaki_stream_connection_get_frames_lost_total(ChiakiStreamConnection *stream_connection);
+
+/**
+ * chiaki_video_receiver_set_waiting_for_idr() on the current video receiver, if there is one. Safe from any thread.
+ */
+CHIAKI_EXPORT void chiaki_stream_connection_set_video_waiting_for_idr(ChiakiStreamConnection *stream_connection, bool waiting_for_idr);
 
 CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_corrupt_frame(ChiakiStreamConnection *stream_connection, ChiakiSeqNum16 start, ChiakiSeqNum16 end);
 CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_idr_request(ChiakiStreamConnection *stream_connection);

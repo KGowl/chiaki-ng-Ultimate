@@ -78,12 +78,19 @@ public:
         // the live controls of each pass (applied from this frame on). NeuralHub has its own.
         int passes = 1;
         std::array<NeuralRenderTuning, NeuralRenderTuning::kMaxPasses> tuning = {};
+        // How many of the frames process() returns the caller uses at once: 1 with Direct Mapping
+        // (one frame per render), the number of frames mixed with the frame mixer. The cache then
+        // keeps that many plus one rendered frames (at least 2) instead of up to 8 (at a 4K HDR
+        // output 66 MB each). 0 = not known: up to 8, or 2 while frames come through begin().
+        int frames_in_use = 0;
     };
 
     // Runs neural rendering on `src`. On success `out_frame` describes an RGB texture owned
     // by this object, valid at least until `process` is called for more distinct frames than
-    // the internal cache holds; its crop is the output size. The first frame of a size or
-    // setting waits for the model to warm up (a few seconds).
+    // the internal cache holds (Options::frames_in_use + 1, at least 2; 8 when not given); its
+    // crop is the output size. The first frame of a size or setting waits for the model to warm
+    // up (a few seconds). When DLSS Super Resolution cannot be set up for an upscaling size, that
+    // size is not asked for again: the frame is rendered at its own size (one log line).
     bool process(const struct pl_frame *src, uint64_t signature, const Options &options,
                  struct pl_frame *out_frame, uint64_t *out_signature);
 
@@ -96,6 +103,17 @@ public:
     // Starting another frame drops a begun frame nobody collected.
     bool begin(const struct pl_frame *src, uint64_t signature, const Options &options);
     bool beginDone() const;
+
+    // Render thread, after a bounded wait for Vulkan work timed out (the swapchain image, or a
+    // fence of the work queued for a render). Neural rendering's Vulkan copies wait on the GPU for
+    // its D3D12 work; when that work is behind on the GPU (stuck), this raises the shared D3D12
+    // timeline to the last value handed out from the host and keeps it there until neural
+    // rendering's own Vulkan work is through (at most about 1 s), then turns neural rendering off
+    // for the session: failed() is true from then on. What the GPU may still use (textures,
+    // command buffers, semaphores, the D3D12 buffers) is leaked, not freed; frames handed out
+    // earlier stay valid. Does nothing when the D3D12 side is not behind (the stall is elsewhere)
+    // or neural rendering is not running. Call FrameGen::unstickGpu() too, then retry the wait once.
+    void unstickGpu();
 
 private:
     struct Impl;

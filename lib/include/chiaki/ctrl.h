@@ -64,6 +64,10 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ctrl_init(ChiakiCtrl *ctrl, struct chiaki_s
 CHIAKI_EXPORT ChiakiErrorCode chiaki_ctrl_start(ChiakiCtrl *ctrl);
 CHIAKI_EXPORT void chiaki_ctrl_stop(ChiakiCtrl *ctrl);
 CHIAKI_EXPORT ChiakiErrorCode chiaki_ctrl_join(ChiakiCtrl *ctrl);
+/**
+ * Undo chiaki_ctrl_stop() for another chiaki_ctrl_start(). Only while the ctrl thread is not running (after chiaki_ctrl_join()).
+ */
+CHIAKI_EXPORT void chiaki_ctrl_reset_for_retry(ChiakiCtrl *ctrl);
 CHIAKI_EXPORT void chiaki_ctrl_fini(ChiakiCtrl *ctrl);
 CHIAKI_EXPORT ChiakiErrorCode chiaki_ctrl_send_message(ChiakiCtrl *ctrl, uint16_t type, const uint8_t *payload, size_t payload_size);
 CHIAKI_EXPORT ChiakiErrorCode ctrl_message_toggle_microphone(ChiakiCtrl *ctrl, bool muted);

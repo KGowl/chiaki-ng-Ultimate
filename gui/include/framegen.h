@@ -109,6 +109,18 @@ public:
     bool beginDone() const;
     bool finish(std::vector<struct pl_frame> &outputs);
 
+    // Render thread, after a bounded wait for Vulkan work timed out (the swapchain image, or a
+    // fence of the work queued for a render). DLSS Frame Generation through D3D12 queues Vulkan
+    // copies that wait on the GPU for its D3D12 work; when that work is behind on the GPU (stuck),
+    // this raises the shared D3D12 timeline to the last value handed out from the host and keeps it
+    // there until frame generation's own Vulkan work is through (at most about 1 s), then turns the
+    // backend off for the session (backendFailed(Backend::Dlss12) is true, backend() None). What the
+    // GPU may still use (images, command buffers, the D3D12 buffers) is leaked, not freed; frames
+    // handed out earlier stay valid, a begun call is dropped. Does nothing with another backend or
+    // when the D3D12 side is not behind (the stall is elsewhere). Call NeuralRender::unstickGpu()
+    // too, then retry the wait once.
+    void unstickGpu();
+
     struct Impl;
 
 private:

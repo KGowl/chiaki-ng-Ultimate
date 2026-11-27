@@ -98,6 +98,10 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_thread_join(ChiakiThread *thread, void **re
 		return CHIAKI_ERR_THREAD;
 	if(retval)
 		*retval = thread->ret;
+	// Joined like pthread_join(): release the handle, or every thread ever started leaks one.
+	// NULL makes a second join fail (WAIT_FAILED) instead of waiting on a recycled handle.
+	CloseHandle(thread->thread);
+	thread->thread = NULL;
 #else
 	int r = pthread_join(thread->thread, retval);
 	if(r != 0)
@@ -309,6 +313,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_thread_timedjoin(ChiakiThread *thread, void
 		return CHIAKI_ERR_THREAD;
 	if(retval)
 		*retval = thread->ret;
+	CloseHandle(thread->thread);
+	thread->thread = NULL;
 #elif defined(__ANDROID__)
 	// Android Bionic lacks pthread_clockjoin_np/pthread_timedjoin_np.
 	// Use a helper thread + condvar to implement timed join portably.

@@ -21,6 +21,14 @@
 //              16.7 ms like a 60 fps stream, nothing read back, median / p90 / max per phase. The
 //              checks read every frame back on the CPU and leave the GPU idle long enough to clock
 //              down, so their times are not what a stream gets.
+//        chiaki-fgdx12test --eval <dir> [--backend 5] [--multiplier 2-4] [--cleanup 0-2] [--dlss-motion 0-2]
+//                          [--flow-hq] [--sdr] [--fps 60] [--start N] [--count N] [--out <dir>] [--save-worst N]
+//   --eval     frame generation on a real 60 fps capture (PNG files in name order; 16-bit = HDR, PQ BT.2020
+//              as decoded): every multiplier-th frame is fed as a real frame and each generated frame is
+//              compared with the real frame it stands for, next to showing the last real frame again and
+//              to a plain blend. Per frame: luma PSNR / MAE, "art" = 16x16 blocks off by more than 12/255,
+//              "worse" = blocks clearly worse than repeating the last real frame. --out keeps the worst
+//              frames as truth | generated | difference pictures. Scene cuts reset it as in the renderer.
 // For backend 5 and --nr on a GPU without NVIDIA's runtime, NeuralHub's dxgi.dll and
 // neuralhub.ini must sit next to the executable.
 
@@ -36,6 +44,7 @@
 #include <nvsdk_ngx_vk.h>
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QLoggingCategory>
 
@@ -662,6 +671,12 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
             ok = nr.begin(&src, static_cast<uint64_t>(k + 1), options);
             const double begin_ms = timer.nsecsElapsed() / 1e6;
             const double wait_ms = ok ? waitBegun([&]() { return nr.beginDone(); }) : -1.0;
+            if (ok && wait_ms < 0.0) {
+                // What the renderer does when its bounded GPU wait times out.
+                std::printf("frame %2d: the D3D12 side is not done after 5 s: unstickGpu()\n", k);
+                fg.unstickGpu();
+                nr.unstickGpu();
+            }
             ok = ok && wait_ms >= 0.0 && nr.process(&src, static_cast<uint64_t>(k + 1), options, &out, &signature);
             char buf[96];
             std::snprintf(buf, sizeof(buf), " | begin %.1f ms, D3D12 done after %.1f ms", begin_ms, wait_ms);
@@ -723,12 +738,20 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
             std::vector<struct pl_frame> fg_out;
             bool fg_ok;
             if (pipeline) {
-                fg_ok = fg.begin(&out, out_w, out_h, 2, 16.7f) && waitBegun([&]() { return fg.beginDone(); }) >= 0.0 &&
-                        fg.finish(fg_out);
+                fg_ok = fg.begin(&out, out_w, out_h, 2, 16.7f);
+                if (fg_ok && waitBegun([&]() { return fg.beginDone(); }) < 0.0) {
+                    std::printf("frame %2d: the FG D3D12 side is not done after 5 s: unstickGpu()\n", k);
+                    fg.unstickGpu();
+                    nr.unstickGpu();
+                    fg_ok = false;
+                }
+                fg_ok = fg_ok && fg.finish(fg_out);
             } else {
                 fg_ok = fg.process(&out, out_w, out_h, 2, 16.7f, fg_out);
             }
-            fg_note = fg_ok ? " | FG " + std::to_string(fg_out.size()) + " frame(s)" : " | FG failed";
+            char fg_buf[64];
+            std::snprintf(fg_buf, sizeof(fg_buf), " | FG %zu frame(s), FG GPU %.2f ms", fg_out.size(), fg.gpuTimeMs());
+            fg_note = fg_ok ? std::string(fg_buf) : " | FG failed";
             if (!fg_ok && k > 0)
                 failures++;
         }
@@ -763,8 +786,414 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
 
 } // namespace
 
+// ---- --eval: frame generation against held-out real frames ----
+// A 60 fps capture as PNG files (8-bit: SDR; 16-bit: HDR, PQ BT.2020 values as decoded, no tone
+// mapping). Every `multiplier`-th frame goes through FrameGen as a real frame, so the generated ones
+// sit where the frames in between were: those are the ground truth. Every generated frame is
+// compared with it, and so are two things frame generation must beat: the last real frame shown
+// again (what the display shows without it) and a plain blend of the two real frames.
+struct EvalPlane
+{
+    int w = 0, h = 0;
+    std::vector<float> y; // luma of the encoded values (SDR: gamma, HDR: PQ), 0..255
+    std::vector<float> rgb; // encoded values 0..255, 3 per pixel (for the pictures saved)
+};
+
+struct EvalScore
+{
+    double mae = 0.0;   // mean absolute luma difference to the truth (0..255)
+    double psnr = 0.0;  // luma PSNR (dB)
+    double art = 0.0;   // % of 16x16 blocks whose mean difference is above 12: visible errors
+    double worse = 0.0; // % of blocks clearly worse than showing the last real frame again
+    std::vector<float> blocks; // mean difference per block
+};
+
+bool evalLoad(const QString &path, bool want_hdr, EvalPlane &plane, std::vector<uint8_t> *rgba8, std::vector<uint16_t> *rgba16)
+{
+    QImage img(path);
+    if (img.isNull())
+        return false;
+    plane.w = img.width();
+    plane.h = img.height();
+    const size_t n = static_cast<size_t>(plane.w) * plane.h;
+    plane.y.resize(n);
+    plane.rgb.resize(n * 3);
+    if (want_hdr) {
+        img = img.convertToFormat(QImage::Format_RGBA64);
+        if (rgba16)
+            rgba16->resize(n * 4);
+        for (int yy = 0; yy < plane.h; yy++) {
+            const uint16_t *row = reinterpret_cast<const uint16_t *>(img.constScanLine(yy));
+            for (int x = 0; x < plane.w; x++) {
+                const size_t i = static_cast<size_t>(yy) * plane.w + x;
+                const float r = row[4 * x] / 257.0f, g = row[4 * x + 1] / 257.0f, b = row[4 * x + 2] / 257.0f;
+                plane.rgb[3 * i] = r;
+                plane.rgb[3 * i + 1] = g;
+                plane.rgb[3 * i + 2] = b;
+                plane.y[i] = 0.2627f * r + 0.6780f * g + 0.0593f * b;
+                if (rgba16) {
+                    std::memcpy(rgba16->data() + 4 * i, row + 4 * x, 3 * sizeof(uint16_t));
+                    (*rgba16)[4 * i + 3] = 0xffff;
+                }
+            }
+        }
+    } else {
+        img = img.convertToFormat(QImage::Format_RGBA8888);
+        if (rgba8)
+            rgba8->resize(n * 4);
+        for (int yy = 0; yy < plane.h; yy++) {
+            const uint8_t *row = img.constScanLine(yy);
+            for (int x = 0; x < plane.w; x++) {
+                const size_t i = static_cast<size_t>(yy) * plane.w + x;
+                const float r = row[4 * x], g = row[4 * x + 1], b = row[4 * x + 2];
+                plane.rgb[3 * i] = r;
+                plane.rgb[3 * i + 1] = g;
+                plane.rgb[3 * i + 2] = b;
+                plane.y[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                if (rgba8) {
+                    std::memcpy(rgba8->data() + 4 * i, row + 4 * x, 3);
+                    (*rgba8)[4 * i + 3] = 255;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// Compares `got` with `truth`; `repeat` (the last real frame) only for the `worse` count.
+EvalScore evalScore(const EvalPlane &got, const EvalPlane &truth, const EvalScore *repeat)
+{
+    EvalScore s;
+    const int w = truth.w, h = truth.h;
+    double sum = 0.0, sq = 0.0;
+    const int bw = (w + 15) / 16, bh = (h + 15) / 16;
+    std::vector<double> bsum(static_cast<size_t>(bw) * bh, 0.0);
+    std::vector<int> bcount(static_cast<size_t>(bw) * bh, 0);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            const double d = std::fabs(static_cast<double>(got.y[i]) - truth.y[i]);
+            sum += d;
+            sq += d * d;
+            const size_t b = static_cast<size_t>(y / 16) * bw + x / 16;
+            bsum[b] += d;
+            bcount[b]++;
+        }
+    }
+    const double n = static_cast<double>(w) * h;
+    s.mae = sum / n;
+    const double mse = sq / n;
+    s.psnr = mse > 1e-9 ? 10.0 * std::log10(255.0 * 255.0 / mse) : 99.0;
+    s.blocks.resize(bsum.size());
+    int art = 0, worse = 0;
+    for (size_t b = 0; b < bsum.size(); b++) {
+        const float m = static_cast<float>(bsum[b] / std::max(bcount[b], 1));
+        s.blocks[b] = m;
+        if (m > 12.0f)
+            art++;
+        if (repeat && m > 6.0f && m > repeat->blocks[b] + 4.0f)
+            worse++;
+    }
+    s.art = 100.0 * art / std::max<size_t>(bsum.size(), 1);
+    s.worse = 100.0 * worse / std::max<size_t>(bsum.size(), 1);
+    return s;
+}
+
+// truth | generated | difference (16x16 block error in red, x4), side by side, 8-bit.
+void evalSave(const std::string &dir, const std::string &name, const EvalPlane &truth, const EvalPlane &got,
+              const EvalScore &score)
+{
+    const int w = truth.w, h = truth.h, bw = (w + 15) / 16;
+    QImage out(w * 3, h, QImage::Format_RGB888);
+    for (int y = 0; y < h; y++) {
+        uchar *row = out.scanLine(y);
+        for (int x = 0; x < w; x++) {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            for (int c = 0; c < 3; c++) {
+                row[3 * x + c] = static_cast<uchar>(std::clamp(truth.rgb[3 * i + c], 0.0f, 255.0f));
+                row[3 * (w + x) + c] = static_cast<uchar>(std::clamp(got.rgb[3 * i + c], 0.0f, 255.0f));
+            }
+            const float d = std::fabs(got.y[i] - truth.y[i]);
+            const float blk = score.blocks[static_cast<size_t>(y / 16) * bw + x / 16];
+            const uchar base = static_cast<uchar>(std::clamp(truth.y[i] * 0.25f, 0.0f, 255.0f));
+            row[3 * (2 * w + x)] = static_cast<uchar>(std::clamp(base + d * 4.0f + (blk > 12.0f ? 60.0f : 0.0f), 0.0f, 255.0f));
+            row[3 * (2 * w + x) + 1] = base;
+            row[3 * (2 * w + x) + 2] = base;
+        }
+    }
+    out.save(QString::fromStdString(dir + "/" + name + ".png"));
+}
+
+int runEval(Rig &rig, const std::string &dir, const std::string &out_dir, FrameGen::Backend backend, int multiplier,
+            int cleanup, int dlss_motion, bool flow_hq, bool force_sdr, int start, int count, double fps, int save_worst)
+{
+    QDir d(QString::fromStdString(dir));
+    QStringList files = d.entryList(QStringList() << "*.png", QDir::Files, QDir::Name);
+    if (files.size() < multiplier + 1) {
+        std::printf("VERDICT: --eval needs at least %d PNG frames in %s (found %lld)\n", multiplier + 1, dir.c_str(),
+                    static_cast<long long>(files.size()));
+        return 2;
+    }
+    EvalPlane probe;
+    QImage first(d.filePath(files[0]));
+    const bool hdr = !force_sdr && first.depth() == 64;
+    if (!evalLoad(d.filePath(files[0]), hdr, probe, nullptr, nullptr)) {
+        std::printf("VERDICT: cannot read %s\n", qPrintable(files[0]));
+        return 2;
+    }
+    const int w = probe.w, h = probe.h;
+    const double interval_ms = 1000.0 / fps * multiplier;
+    std::printf("eval: %lld frames %dx%d %s in %s; every %dth frame real (%.1f ms apart), %s, clean-up %d, DLSS motion %d%s\n",
+                static_cast<long long>(files.size()), w, h, hdr ? "HDR (PQ BT.2020)" : "SDR", dir.c_str(), multiplier,
+                interval_ms, FrameGen::backendName(backend), cleanup, dlss_motion, flow_hq ? ", Flow 1/2" : "");
+    if (!rig.resize(w, h)) {
+        std::printf("VERDICT: textures\n");
+        return 3;
+    }
+    pl_tex src16 = nullptr;
+    struct pl_color_space pq = {};
+    pq.primaries = PL_COLOR_PRIM_BT_2020;
+    pq.transfer = PL_COLOR_TRC_PQ;
+    pq.hdr.max_luma = 10000.0f;
+    pq.hdr.min_luma = 0.0f;
+    pq.hdr.prim = *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+    if (hdr) {
+        struct pl_tex_params p = {};
+        p.w = w;
+        p.h = h;
+        p.format = pl_find_named_fmt(rig.gpu, "rgba16");
+        p.sampleable = true;
+        p.host_writable = true;
+        src16 = p.format ? pl_tex_create(rig.gpu, &p) : nullptr;
+        if (!src16) {
+            std::printf("VERDICT: no rgba16 texture\n");
+            return 3;
+        }
+    }
+    FrameGen fg(rig.log);
+    fg.setCleanup(cleanup);
+    fg.setDlssMotion(dlss_motion);
+    fg.setFlowHighQuality(flow_hq);
+    if (!fg.ensureInitialized(rig.vk, backend)) {
+        std::printf("VERDICT: backend could not start (see the log above)\n");
+        if (src16)
+            pl_tex_destroy(rig.gpu, &src16);
+        return 3;
+    }
+    struct Worst
+    {
+        double art;
+        int index;
+    };
+    std::vector<Worst> worst;
+    double sum_static_bad = 0, sum_static_err = 0, sum_moving_bad = 0, sum_static_share = 0;
+    double sum_fg_mae = 0, sum_fg_psnr = 0, sum_fg_art = 0, sum_fg_worse = 0, sum_rep_mae = 0, sum_rep_psnr = 0,
+           sum_rep_art = 0, sum_blend_mae = 0, sum_blend_psnr = 0, sum_blend_art = 0, sum_real_mae = 0;
+    int scored = 0, cuts = 0, failures = 0, warmup = 6, real_reads = 0;
+    EvalPlane prev;
+    bool have_prev = false;
+    const int last = count > 0 ? std::min<int>(files.size() - 1, start + count) : static_cast<int>(files.size()) - 1;
+    for (int k = start; k <= last; k += multiplier) {
+        EvalPlane real;
+        std::vector<uint8_t> rgba8;
+        std::vector<uint16_t> rgba16;
+        if (!evalLoad(d.filePath(files[k]), hdr, real, hdr ? nullptr : &rgba8, hdr ? &rgba16 : nullptr) ||
+            real.w != w || real.h != h) {
+            std::printf("frame %d: cannot read %s or another size\n", k, qPrintable(files[k]));
+            failures++;
+            break;
+        }
+        // A scene cut: chiaki-ng's duplicate-frame detector resets frame generation there.
+        bool cut = false;
+        if (have_prev) {
+            EvalScore jump = evalScore(prev, real, nullptr);
+            if (jump.mae > 30.0) {
+                cut = true;
+                cuts++;
+                fg.reset();
+            }
+        }
+        struct pl_frame src = rig.sourceFrame();
+        if (hdr) {
+            struct pl_tex_transfer_params up = {};
+            up.tex = src16;
+            up.ptr = rgba16.data();
+            up.row_pitch = static_cast<size_t>(w) * 8;
+            pl_tex_upload(rig.gpu, &up);
+            src.planes[0].texture = src16;
+            src.color = pq;
+        } else {
+            rig.uploadRgba(rgba8.data());
+        }
+        std::vector<struct pl_frame> outputs;
+        if (!fg.process(&src, w, h, multiplier, static_cast<float>(interval_ms), outputs) || outputs.empty()) {
+            std::printf("frame %d: process() failed\n", k);
+            failures++;
+            prev = std::move(real);
+            have_prev = true;
+            continue;
+        }
+        auto readPlane = [&](const struct pl_frame &f, EvalPlane &p) {
+            p.w = w;
+            p.h = h;
+            const size_t n = static_cast<size_t>(w) * h;
+            p.y.resize(n);
+            p.rgb.resize(n * 3);
+            if (hdr) {
+                std::vector<float> fl;
+                if (!rig.readFloat(f, w, h, pq, fl))
+                    return false;
+                for (size_t i = 0; i < n; i++) {
+                    const float r = fl[4 * i] * 255.0f, g = fl[4 * i + 1] * 255.0f, b = fl[4 * i + 2] * 255.0f;
+                    p.rgb[3 * i] = r;
+                    p.rgb[3 * i + 1] = g;
+                    p.rgb[3 * i + 2] = b;
+                    p.y[i] = 0.2627f * r + 0.6780f * g + 0.0593f * b;
+                }
+            } else {
+                std::vector<uint8_t> rgba;
+                if (!rig.readRgba(f, rgba))
+                    return false;
+                for (size_t i = 0; i < n; i++) {
+                    const float r = rgba[4 * i], g = rgba[4 * i + 1], b = rgba[4 * i + 2];
+                    p.rgb[3 * i] = r;
+                    p.rgb[3 * i + 1] = g;
+                    p.rgb[3 * i + 2] = b;
+                    p.y[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                }
+            }
+            return true;
+        };
+        // The real frame frame generation hands back: must be the source as it was.
+        EvalPlane back;
+        if (readPlane(outputs.back(), back)) {
+            sum_real_mae += evalScore(back, real, nullptr).mae;
+            real_reads++;
+        }
+        const size_t generated = outputs.size() - 1;
+        if (have_prev && !cut && generated == static_cast<size_t>(multiplier - 1) && warmup <= 0) {
+            for (size_t j = 0; j < generated; j++) {
+                const int ti = k - multiplier + 1 + static_cast<int>(j);
+                EvalPlane truth, got;
+                if (!evalLoad(d.filePath(files[ti]), hdr, truth, nullptr, nullptr) || !readPlane(outputs[j], got)) {
+                    std::printf("frame %d: reading failed\n", ti);
+                    failures++;
+                    continue;
+                }
+                const float t = static_cast<float>(j + 1) / multiplier;
+                EvalPlane blend = truth;
+                for (size_t i = 0; i < blend.y.size(); i++)
+                    blend.y[i] = prev.y[i] * (1.0f - t) + real.y[i] * t;
+                const EvalScore rep = evalScore(prev, truth, nullptr);
+                const EvalScore bl = evalScore(blend, truth, nullptr);
+                const EvalScore s = evalScore(got, truth, &rep);
+                // Static blocks (HUD, text, still parts): the same in the two real frames and in the truth. Any
+                // error there shows; the moving blocks are where interpolation has to work.
+                {
+                    const int bw = (w + 15) / 16, bh = (h + 15) / 16;
+                    std::vector<double> still(static_cast<size_t>(bw) * bh, 0.0);
+                    std::vector<int> cnt(still.size(), 0);
+                    for (int yy = 0; yy < h; yy++)
+                        for (int x = 0; x < w; x++) {
+                            const size_t i = static_cast<size_t>(yy) * w + x;
+                            const size_t b = static_cast<size_t>(yy / 16) * bw + x / 16;
+                            still[b] += std::max(std::fabs(prev.y[i] - real.y[i]), std::fabs(prev.y[i] - truth.y[i]));
+                            cnt[b]++;
+                        }
+                    int n_static = 0, bad_static = 0, n_moving = 0, bad_moving = 0;
+                    double err_static = 0.0;
+                    for (size_t b = 0; b < still.size(); b++) {
+                        const bool is_static = still[b] / std::max(cnt[b], 1) < 1.0;
+                        if (is_static) {
+                            n_static++;
+                            err_static += s.blocks[b];
+                            if (s.blocks[b] > 4.0f)
+                                bad_static++;
+                        } else {
+                            n_moving++;
+                            if (s.blocks[b] > 12.0f)
+                                bad_moving++;
+                        }
+                    }
+                    sum_static_bad += n_static ? 100.0 * bad_static / n_static : 0.0;
+                    sum_static_err += n_static ? err_static / n_static : 0.0;
+                    sum_moving_bad += n_moving ? 100.0 * bad_moving / n_moving : 0.0;
+                    sum_static_share += 100.0 * n_static / std::max<size_t>(still.size(), 1);
+                }
+                std::printf("frame %5d (t=%.2f): FG psnr %5.2f mae %5.2f art %5.2f%% worse %5.2f%% | repeat psnr %5.2f art %5.2f%% "
+                            "| blend psnr %5.2f art %5.2f%%\n",
+                            ti, t, s.psnr, s.mae, s.art, s.worse, rep.psnr, rep.art, bl.psnr, bl.art);
+                std::fflush(stdout);
+                sum_fg_mae += s.mae;
+                sum_fg_psnr += s.psnr;
+                sum_fg_art += s.art;
+                sum_fg_worse += s.worse;
+                sum_rep_mae += rep.mae;
+                sum_rep_psnr += rep.psnr;
+                sum_rep_art += rep.art;
+                sum_blend_mae += bl.mae;
+                sum_blend_psnr += bl.psnr;
+                sum_blend_art += bl.art;
+                scored++;
+                worst.push_back({ s.art + s.worse, ti });
+                if (!out_dir.empty() && save_worst > 0) {
+                    // Keep the pictures of the worst frames so far (written now: the planes are gone later).
+                    std::sort(worst.begin(), worst.end(), [](const Worst &a, const Worst &b) { return a.art > b.art; });
+                    const bool among = std::any_of(worst.begin(), worst.begin() + std::min<size_t>(worst.size(), save_worst),
+                                                   [&](const Worst &x) { return x.index == ti; });
+                    if (among) {
+                        char name[64];
+                        std::snprintf(name, sizeof(name), "frame%05d", ti);
+                        evalSave(out_dir, name, truth, got, s);
+                    }
+                }
+            }
+        }
+        if (warmup > 0)
+            warmup--;
+        prev = std::move(real);
+        have_prev = true;
+    }
+    fg.destroy();
+    if (src16)
+        pl_tex_destroy(rig.gpu, &src16);
+    if (scored == 0) {
+        std::printf("VERDICT: nothing scored (%d failures)\n", failures);
+        return 1;
+    }
+    std::sort(worst.begin(), worst.end(), [](const Worst &a, const Worst &b) { return a.art > b.art; });
+    if (!out_dir.empty() && save_worst > 0) {
+        // Pictures were written for frames that were among the worst at the time: keep the final ones.
+        QDir od(QString::fromStdString(out_dir));
+        for (const QString &f : od.entryList(QStringList() << "frame*.png", QDir::Files)) {
+            const int index = f.mid(5, 5).toInt();
+            const bool keep = std::any_of(worst.begin(), worst.begin() + std::min<size_t>(worst.size(), save_worst),
+                                          [&](const Worst &x) { return x.index == index; });
+            if (!keep)
+                od.remove(f);
+        }
+    }
+    std::printf("\n-- %d generated frames scored, %d scene cuts skipped, real frames handed back with mae %.3f\n", scored, cuts,
+                sum_real_mae / std::max(1, real_reads));
+    std::printf("-- FG      psnr %.2f dB, mae %.2f, art %.2f%% of blocks, worse than repeating %.2f%%\n", sum_fg_psnr / scored,
+                sum_fg_mae / scored, sum_fg_art / scored, sum_fg_worse / scored);
+    std::printf("-- repeat  psnr %.2f dB, mae %.2f, art %.2f%%\n", sum_rep_psnr / scored, sum_rep_mae / scored, sum_rep_art / scored);
+    std::printf("-- FG static blocks (%.1f%% of the frame: HUD, text, still parts): mean error %.2f, %.2f%% off by more than 4; "
+                "moving blocks: %.2f%% off by more than 12\n",
+                sum_static_share / scored, sum_static_err / scored, sum_static_bad / scored, sum_moving_bad / scored);
+    std::printf("-- blend   psnr %.2f dB, mae %.2f, art %.2f%%\n", sum_blend_psnr / scored, sum_blend_mae / scored,
+                sum_blend_art / scored);
+    std::printf("-- worst frames (art + worse):");
+    for (size_t i = 0; i < std::min<size_t>(worst.size(), 8); i++)
+        std::printf(" %d (%.1f)", worst[i].index, worst[i].art);
+    std::printf("\nVERDICT: EVAL DONE%s\n", failures ? " (with failures, see above)" : "");
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
+    // Unbuffered: the lines stay in order with the log (stderr), also when the process ends abruptly.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     QCoreApplication app(argc, argv);
 #if defined(_WIN32)
     // 1 ms timer resolution, as chiaki-ng sets it while streaming (windowsStreamTuning.cpp): waits
@@ -775,6 +1204,11 @@ int main(int argc, char **argv)
     bool nr_mode = false, with_fg = false, hdr = false, pipeline = false, timing = false;
     float scale = 1.0f;
     std::string image_path, out_path;
+    // --eval
+    std::string eval_dir;
+    int eval_multiplier = 2, eval_cleanup = 2, eval_motion = 1, eval_start = 0, eval_count = 0, eval_save = 6;
+    bool eval_flow_hq = false, eval_sdr = false;
+    double eval_fps = 60.0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--backend" && i + 1 < argc) backend_value = std::atoi(argv[++i]);
@@ -793,6 +1227,35 @@ int main(int argc, char **argv)
         else if (a == "--tune-at" && i + 1 < argc) tune_at = std::atoi(argv[++i]);
         else if (a == "--pipeline") pipeline = true;
         else if (a == "--timing") timing = true;
+        else if (a == "--eval" && i + 1 < argc) eval_dir = argv[++i];
+        else if (a == "--multiplier" && i + 1 < argc) eval_multiplier = std::clamp(std::atoi(argv[++i]), 2, 4);
+        else if (a == "--cleanup" && i + 1 < argc) eval_cleanup = std::clamp(std::atoi(argv[++i]), 0, 2);
+        else if (a == "--dlss-motion" && i + 1 < argc) eval_motion = std::clamp(std::atoi(argv[++i]), 0, 2);
+        else if (a == "--flow-hq") eval_flow_hq = true;
+        else if (a == "--sdr") eval_sdr = true;
+        else if (a == "--start" && i + 1 < argc) eval_start = std::max(0, std::atoi(argv[++i]));
+        else if (a == "--count" && i + 1 < argc) eval_count = std::max(0, std::atoi(argv[++i]));
+        else if (a == "--fps" && i + 1 < argc) eval_fps = std::max(1.0, std::atof(argv[++i]));
+        else if (a == "--save-worst" && i + 1 < argc) eval_save = std::max(0, std::atoi(argv[++i]));
+    }
+    if (!eval_dir.empty()) {
+        const auto eval_backend = static_cast<FrameGen::Backend>(backend_value);
+        if (!FrameGen::backendCompiledIn(eval_backend)) {
+            std::printf("VERDICT: backend not compiled in\n");
+            return 2;
+        }
+        Rig rig;
+        if (!rig.init()) {
+            std::printf("VERDICT: could not create the libplacebo Vulkan device\n");
+            rig.destroy();
+            return 3;
+        }
+        if (!out_path.empty())
+            QDir().mkpath(QString::fromStdString(out_path));
+        const int result = runEval(rig, eval_dir, out_path, eval_backend, eval_multiplier, eval_cleanup, eval_motion,
+                                   eval_flow_hq, eval_sdr, eval_start, eval_count, eval_fps, eval_save);
+        rig.destroy();
+        return result;
     }
     if (nr_mode) {
         if (!NeuralRender::compiledIn()) {
@@ -899,8 +1362,14 @@ int main(int argc, char **argv)
             timer.start();
             bool ok;
             if (pipeline) {
-                ok = fg.begin(&src, phase.w, phase.h, phase.multiplier, 33.3f) &&
-                     waitBegun([&]() { return fg.beginDone(); }) >= 0.0 && fg.finish(outputs);
+                ok = fg.begin(&src, phase.w, phase.h, phase.multiplier, 33.3f);
+                if (ok && waitBegun([&]() { return fg.beginDone(); }) < 0.0) {
+                    // What the renderer does when its bounded GPU wait times out.
+                    std::printf("frame %2d: the D3D12 side is not done after 5 s: unstickGpu()\n", k);
+                    fg.unstickGpu();
+                    ok = false;
+                }
+                ok = ok && fg.finish(outputs);
             } else {
                 ok = fg.process(&src, phase.w, phase.h, phase.multiplier, 33.3f, outputs);
             }

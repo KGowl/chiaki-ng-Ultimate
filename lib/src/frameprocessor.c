@@ -7,6 +7,7 @@
 #include <jerasure.h>
 
 #include <string.h>
+#include <stdio.h>
 #include <assert.h>
 
 #ifndef _WIN32
@@ -270,6 +271,55 @@ static ChiakiErrorCode chiaki_frame_processor_fec(ChiakiFrameProcessor *frame_pr
 	return err;
 }
 
+/**
+ * The missing units of one frame as ranges ("0x1b, 0x20-0x29, ..."), logged as a single line: this runs on the
+ * receive thread, where a line per missing unit added a disk write each during a loss burst.
+ */
+typedef struct missing_units_t
+{
+	size_t count;
+	size_t range_begin;
+	size_t range_end;
+	char str[200];
+	size_t str_len;
+	bool truncated;
+} MissingUnits;
+
+static void missing_units_close_range(MissingUnits *m)
+{
+	if(m->truncated)
+		return;
+	char part[48];
+	int n;
+	if(m->range_begin == m->range_end)
+		n = snprintf(part, sizeof(part), "%s%#llx", m->str_len ? ", " : "", (unsigned long long)m->range_begin);
+	else
+		n = snprintf(part, sizeof(part), "%s%#llx-%#llx", m->str_len ? ", " : "",
+				(unsigned long long)m->range_begin, (unsigned long long)m->range_end);
+	if(n < 0 || m->str_len + (size_t)n >= sizeof(m->str))
+	{
+		m->truncated = true;
+		return;
+	}
+	memcpy(m->str + m->str_len, part, (size_t)n + 1);
+	m->str_len += (size_t)n;
+}
+
+static void missing_units_add(MissingUnits *m, size_t unit)
+{
+	if(m->count > 0 && unit == m->range_end + 1)
+	{
+		m->range_end = unit;
+		m->count++;
+		return;
+	}
+	if(m->count > 0)
+		missing_units_close_range(m);
+	m->range_begin = unit;
+	m->range_end = unit;
+	m->count++;
+}
+
 CHIAKI_EXPORT ChiakiFrameProcessorFlushResult chiaki_frame_processor_flush(ChiakiFrameProcessor *frame_processor, uint8_t **frame, size_t *frame_size)
 {
 	if(frame_processor->units_source_expected == 0 || frame_processor->flushed)
@@ -290,12 +340,13 @@ CHIAKI_EXPORT ChiakiFrameProcessorFlushResult chiaki_frame_processor_flush(Chiak
 	}
 
 	size_t cur = 0;
+	MissingUnits missing = { 0 };
 	for(size_t i=0; i<frame_processor->units_source_expected; i++)
 	{
 		ChiakiFrameUnit *unit = frame_processor->unit_slots + i;
 		if(!unit->data_size)
 		{
-			CHIAKI_LOGW(frame_processor->log, "Missing unit %#llx", (unsigned long long)i);
+			missing_units_add(&missing, i);
 			continue;
 		}
 		if(unit->data_size < 2)
@@ -308,6 +359,14 @@ CHIAKI_EXPORT ChiakiFrameProcessorFlushResult chiaki_frame_processor_flush(Chiak
 		uint8_t *buf_ptr = frame_processor->frame_buf + i*frame_processor->buf_stride_per_unit;
 		memmove(frame_processor->frame_buf + cur, buf_ptr + 2, part_size);
 		cur += part_size;
+	}
+
+	if(missing.count > 0)
+	{
+		missing_units_close_range(&missing);
+		CHIAKI_LOGW(frame_processor->log, "Missing %llu of %u source units: %s%s",
+				(unsigned long long)missing.count, (unsigned int)frame_processor->units_source_expected,
+				missing.str, missing.truncated ? (missing.str_len ? ", ..." : "...") : "");
 	}
 
 	chiaki_stream_stats_frame(&frame_processor->stream_stats, (uint64_t)cur);

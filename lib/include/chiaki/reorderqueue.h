@@ -41,6 +41,8 @@ typedef struct chiaki_reorder_queue_t
 	ChiakiReorderQueueDropStrategy drop_strategy;
 	ChiakiReorderQueueDropCb drop_cb;
 	void *drop_cb_user;
+	ChiakiReorderQueueDropCb evict_cb;
+	void *evict_cb_user;
 } ChiakiReorderQueue;
 
 /**
@@ -71,6 +73,17 @@ static inline void chiaki_reorder_queue_set_drop_cb(ChiakiReorderQueue *queue, C
 {
 	queue->drop_cb = cb;
 	queue->drop_cb_user = user;
+}
+
+/**
+ * With CHIAKI_REORDER_QUEUE_DROP_STRATEGY_BEGIN: when a push has to remove elements from the beginning to make
+ * room, the received ones are handed to this callback in order (as if pulled, the missing ones in between are
+ * given up) instead of being dropped through the drop callback. NULL (the default) keeps dropping them.
+ */
+static inline void chiaki_reorder_queue_set_evict_cb(ChiakiReorderQueue *queue, ChiakiReorderQueueDropCb cb, void *user)
+{
+	queue->evict_cb = cb;
+	queue->evict_cb_user = user;
 }
 
 static inline size_t chiaki_reorder_queue_size(ChiakiReorderQueue *queue)

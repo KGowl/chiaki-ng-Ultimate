@@ -5801,6 +5801,14 @@ renderer_backend_ready:
         const int rcas_strength_status = rcas_status_strength.loadRelaxed();
         if (rcas_strength_status > 0)
             parts << QStringLiteral("RCAS %1%").arg(rcas_strength_status);
+        // Ctrl+R: the video stream being saved.
+        if (session) {
+            const int capture_state = session->VideoCaptureState();
+            if (capture_state == 1)
+                parts << tr("REC: waiting for a keyframe");
+            else if (capture_state == 2)
+                parts << tr("REC %1 s").arg(session->VideoCaptureSeconds());
+        }
         const QString status = parts.join(QStringLiteral(" · "));
         if (status != video_enhancement_status) {
             video_enhancement_status = status;
@@ -6512,7 +6520,7 @@ void QmlMainWindow::createSwapchain()
     VkWin32SurfaceCreateInfoKHR surfaceInfo = {};
     surfaceInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
     surfaceInfo.hinstance = GetModuleHandle(nullptr);
-    surfaceInfo.hwnd = reinterpret_cast<HWND>(winId());
+    surfaceInfo.hwnd = reinterpret_cast<HWND>(renderWindowHandle());
     err = vk_funcs.vkCreateWin32SurfaceKHR(placebo_vk_inst->instance, &surfaceInfo, nullptr, &surface);
 #endif
 
@@ -6523,7 +6531,7 @@ void QmlMainWindow::createSwapchain()
                 << "result=" << err;
             handleVulkanDeviceLost(QStringLiteral("vkCreateSurfaceKHR returned VK_ERROR_DEVICE_LOST"));
         } else {
-            const bool surface_renderable = isExposed() && width() > 0 && height() > 0;
+            const bool surface_renderable = window_renderable.load(std::memory_order_relaxed);
             const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
             int failures = 0;
             qint64 failure_duration_us = 0;
@@ -6634,7 +6642,10 @@ void QmlMainWindow::resizeSwapchain()
         return;
 
     const double dpr = screen_dpr.load(std::memory_order_relaxed);
-    const QSize window_size(static_cast<int>(width() * dpr), static_cast<int>(height() * dpr));
+    const quint64 logical_size = window_logical_size.load(std::memory_order_relaxed);
+    const int logical_w = static_cast<int>(logical_size >> 32);
+    const int logical_h = static_cast<int>(logical_size & 0xffffffffu);
+    const QSize window_size(static_cast<int>(logical_w * dpr), static_cast<int>(logical_h * dpr));
     // A minimized window has no size; textures cannot be created at 0x0.
     if (window_size.isEmpty())
         return;
@@ -6754,6 +6765,21 @@ void QmlMainWindow::cacheScreenState()
     screen_refresh_hz.store(hz > 1.0 ? hz : 60.0, std::memory_order_relaxed);
     const double dpr = devicePixelRatio();
     screen_dpr.store(dpr > 0.0 ? dpr : 1.0, std::memory_order_relaxed);
+    // winId() would create the platform window: only once it exists.
+    if (handle())
+        window_native_id.store(static_cast<quintptr>(winId()), std::memory_order_relaxed);
+    const int w = width(), h = height();
+    window_renderable.store(isExposed() && w > 0 && h > 0, std::memory_order_relaxed);
+    window_logical_size.store((static_cast<quint64>(static_cast<quint32>(qMax(0, w))) << 32) |
+                                  static_cast<quint32>(qMax(0, h)),
+                              std::memory_order_relaxed);
+}
+
+void *QmlMainWindow::renderWindowHandle()
+{
+    const quintptr id = window_native_id.load(std::memory_order_relaxed);
+    // (Not cached yet: what the render thread used to read itself.)
+    return reinterpret_cast<void *>(id ? id : static_cast<quintptr>(winId()));
 }
 
 void QmlMainWindow::updateSwapchain()
@@ -6834,6 +6860,9 @@ void QmlMainWindow::beginFrame()
 
     if (!quick_tex || !quick_sem || !quick_vk_image)
         return;
+    // Lost (or given up on, below): the app relaunches; no more waits on the GPU queue meanwhile.
+    if (vulkan_device_lost.loadAcquire() != 0)
+        return;
     quick_sem_value += 1;
 
     const qint64 quick_hold_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
@@ -6846,7 +6875,15 @@ void QmlMainWindow::beginFrame()
             .value = quick_sem_value,
         }
     };
-    pl_vulkan_hold_ex(placebo_vulkan->gpu, &hold_params);
+    if (!pl_vulkan_hold_ex(placebo_vulkan->gpu, &hold_params)) {
+        // Nothing will signal quick_sem_value, so no wait for it (the next hold signals a higher value,
+        // which a timeline semaphore allows), and no release: the texture is not held. Qt Quick skips
+        // this frame; the next beginFrame tries again.
+        quick_hold_failures++;
+        if ((quick_hold_failures & (quick_hold_failures - 1)) == 0) // the 1st, 2nd, 4th, 8th, ...
+            qCWarning(chiakiGui) << "Failed to hold the Qt Quick texture for rendering, failures:" << quick_hold_failures;
+        return;
+    }
     const qint64 quick_hold_after_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     if (quick_hold_after_us >= quick_hold_begin_us) {
         const qint64 quick_hold_us = quick_hold_after_us - quick_hold_begin_us;
@@ -6864,7 +6901,33 @@ void QmlMainWindow::beginFrame()
         .pSemaphores = &quick_sem,
         .pValues = &quick_sem_value,
     };
-    const VkResult wait_result = vk_funcs.vkWaitSemaphores(placebo_vulkan->device, &wait_info, UINT64_MAX);
+    // The value is signalled once everything queued before it on libplacebo's graphics queue is done,
+    // which includes the Vulkan halves of DLSS 5 and DLSS FG that wait for their D3D12 side. This runs in
+    // sync(), which the GUI thread calls blocking (BlockingQueuedConnection): a D3D12 value that never
+    // comes would hang the window, the controller input (polled on the GUI thread) and closing with an
+    // unbounded wait. So it waits in steps, and a queue still stalled after the last one is handled like
+    // a lost device (the GPU itself is idle then, so Vulkan reports no device loss of its own).
+    constexpr uint64_t kQuickWaitStepNs = 2000000000ull; // 2 s
+    constexpr int kQuickWaitSteps = 3;
+    VkResult wait_result = VK_TIMEOUT;
+    for (int step = 1; step <= kQuickWaitSteps; step++) {
+        wait_result = vk_funcs.vkWaitSemaphores(placebo_vulkan->device, &wait_info, kQuickWaitStepNs);
+        if (wait_result != VK_TIMEOUT)
+            break;
+        qCWarning(chiakiGui).nospace()
+            << "The GPU queue has not finished the Qt Quick frame's work after "
+            << step * static_cast<int>(kQuickWaitStepNs / 1000000000ull) << " s (value "
+            << quick_sem_value << ")" << (step < kQuickWaitSteps ? ", waiting on" : ", giving up");
+        if (step == 1) {
+            // The queue most likely waits for a D3D12 fence value of DLSS 5 or DLSS FG that will not come:
+            // both signal their side's values from the host (so the queue drains) and turn themselves off
+            // for the session; nothing happens when they are not running on D3D12. Render thread only.
+            if (frame_gen)
+                frame_gen->unstickGpu();
+            if (neural_render)
+                neural_render->unstickGpu();
+        }
+    }
     if (wait_result != VK_SUCCESS) {
         qCWarning(chiakiGui)
             << "Failed waiting for Qt Quick Vulkan semaphore"
@@ -6877,6 +6940,9 @@ void QmlMainWindow::beginFrame()
         pl_vulkan_release_ex(placebo_vulkan->gpu, &release_params);
         if (wait_result == VK_ERROR_DEVICE_LOST) {
             handleVulkanDeviceLost(QStringLiteral("vkWaitSemaphores returned VK_ERROR_DEVICE_LOST"));
+        } else if (wait_result == VK_TIMEOUT) {
+            handleVulkanDeviceLost(QStringLiteral("the GPU queue stalled: the Qt Quick frame's work was not done after %1 s")
+                                       .arg(kQuickWaitSteps * static_cast<int>(kQuickWaitStepNs / 1000000000ull)));
         } else {
             swapchain_recreate_pending.storeRelease(1);
             QMetaObject::invokeMethod(this, [this]() {
@@ -7204,6 +7270,21 @@ void QmlMainWindow::render()
     if (placebo_reset_pending.fetchAndStoreRelaxed(0) != 0)
         resetPlaceboQueue();
 
+    // A new session, or the end of one: the frames generated from the last session's pictures (and a
+    // pipelined one of them) are not shown, also when there is no swapchain now (a stream that ended
+    // while the window was minimized would otherwise show them on restore, or before the next
+    // session's first picture). take_incoming_frame below consumes the reset itself (frame generation's
+    // and DLSS 5's history, direct_frame).
+    const bool session_reset_waiting = direct_frame_reset.loadAcquire() != 0;
+    if (session_reset_waiting || stream_session_active.loadAcquire() == 0) {
+        fgDropFrames();
+        // The next session's first picture takes the window's size as it is (settledVideoSize()).
+        if (session_reset_waiting) {
+            video_size_settled_w = 0;
+            video_size_settled_h = 0;
+        }
+    }
+
     if (!placebo_swapchain)
     {
         bool scheduled_pending = finalize_render();
@@ -7216,8 +7297,10 @@ void QmlMainWindow::render()
     if (renderer_cache_flush_pending.fetchAndStoreRelaxed(0) && placebo_renderer)
         pl_renderer_flush_cache(placebo_renderer);
 
+    refreshRenderSettings();
+    const RenderSettings &rs = render_settings;
     const struct pl_render_params *render_params = &pl_render_default_params;
-    const PlaceboUpscaler configured_upscaler = settings->GetPlaceboUpscaler();
+    const PlaceboUpscaler configured_upscaler = rs.placebo_upscaler;
     switch (video_preset) {
     case VideoPreset::Fast:
         render_params = &pl_render_fast_params;
@@ -7281,10 +7364,10 @@ void QmlMainWindow::render()
     const bool mixer_active = params.frame_mixer != nullptr;
     const bool has_settings = settings != nullptr;
     const bool apply_display_target = has_settings && stream_session_active.loadAcquire() != 0;
-    const int target_trc = apply_display_target ? settings->GetDisplayTargetTrc() : 0;
-    const int target_prim = apply_display_target ? settings->GetDisplayTargetPrim() : 0;
-    const int target_peak = apply_display_target ? settings->GetDisplayTargetPeak() : 0;
-    const int target_contrast = apply_display_target ? settings->GetDisplayTargetContrast() : 0;
+    const int target_trc = apply_display_target ? rs.display_target_trc : 0;
+    const int target_prim = apply_display_target ? rs.display_target_prim : 0;
+    const int target_peak = apply_display_target ? rs.display_target_peak : 0;
+    const int target_contrast = apply_display_target ? rs.display_target_contrast : 0;
 
     uint64_t ts_pre_update = chiaki_time_now_monotonic_us();
     double refresh_rate = screen_refresh_hz.load(std::memory_order_relaxed);
@@ -7405,11 +7488,11 @@ void QmlMainWindow::render()
             }
             reset_direct_frame = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
         }
-        // After a loss or a scene cut, frame generation (and DLSS 5's history) starts afresh instead of
-        // blending into it.
+        // After a loss or a scene cut, and in a new session, frame generation and DLSS 5's history start
+        // afresh instead of blending into the last pictures.
         if ((reset_direct_frame || incoming_fg_reset) && frame_gen)
             frame_gen->reset();
-        if (incoming_fg_reset && neural_render)
+        if ((reset_direct_frame || incoming_fg_reset) && neural_render)
             neural_render->resetHistory();
         if (reset_direct_frame) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
@@ -7612,7 +7695,7 @@ void QmlMainWindow::render()
     {
         QMutexLocker locker(&placebo_swapchain_mutex);
         if (!pl_swapchain_start_frame(placebo_swapchain, &sw_frame)) {
-            const bool surface_renderable = isExposed() && width() > 0 && height() > 0;
+            const bool surface_renderable = window_renderable.load(std::memory_order_relaxed);
             const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
             int failures = 0;
             qint64 failure_duration_us = 0;
@@ -8082,6 +8165,13 @@ void QmlMainWindow::render()
                 quick_begin_wait_last_us > 1500 ? 1 : 0;
         }
     }
+    // beginFrame found the device lost or gave up on a stalled GPU queue: the app relaunches, and this
+    // render queues nothing more on that queue (no render, no present).
+    if (vulkan_device_lost.loadAcquire() != 0) {
+        close_started_frame(false);
+        finalize_render();
+        return;
+    }
 
     {
     const qint64 render_setup_after_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
@@ -8136,8 +8226,14 @@ void QmlMainWindow::render()
         return;
     }
 
-    if (hint_frame) {
-        pl_rect2df crop = hint_frame->crop;
+    // Where the video goes comes from the stream frame, also in a render that shows a frame generation
+    // made: that one has frame generation's output size, which comes from this rect, so Zoom's factor
+    // would apply to it again (the zoom pumping within each batch, and pipelined output sizes growing or
+    // shrinking without end). Direct Mapping's stream frame is direct_frame (in a render without frame
+    // generation it is the hint frame itself).
+    const struct pl_frame *video_crop_frame = bypass_frame_queue && direct_frame.num_planes > 0 ? &direct_frame : hint_frame;
+    if (hint_frame && video_crop_frame) {
+        pl_rect2df crop = video_crop_frame->crop;
         switch (video_mode) {
         case VideoMode::Normal:
             pl_rect2df_aspect_copy(&target_frame.crop, &crop, 0.0);
@@ -8158,6 +8254,11 @@ void QmlMainWindow::render()
             break;
         }
     }
+    // The video area for frame generation's output and DLSS 5's upscale toward the window: it follows a
+    // window that is being resized only once the size holds (see settledVideoSize()).
+    const QSize settled_video_size = settledVideoSize(static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop)))),
+                                                      static_cast<int>(lroundf(fabsf(pl_rect_h(target_frame.crop)))),
+                                                      static_cast<qint64>(chiaki_time_now_monotonic_us()));
     // Disable background transparency by default if the swapchain does not
     // appear to support alpha transaprency
     if (sw_frame.color_repr.alpha == PL_ALPHA_NONE)
@@ -8165,7 +8266,7 @@ void QmlMainWindow::render()
 #if PL_API_VER >= 355
     // Ambient border: fill the bars around the video (e.g. 16:9 on an
     // ultrawide display) with a heavily blurred copy of the picture.
-    if (hint_frame && has_settings && settings->GetAmbientBorder()) {
+    if (hint_frame && has_settings && rs.ambient_border) {
         params.border = PL_CLEAR_BLUR;
         params.blur_radius = 48.0f;
     }
@@ -8189,7 +8290,7 @@ void QmlMainWindow::render()
         active_hooks[num_active_hooks++] = fsrcnnx_hook;
     // AMD RCAS on the final image: after scaling, RTX VSR and frame
     // generation, so it also sharpens 1:1 output.
-    const int rcas_strength = has_settings ? settings->GetRcasStrength() : 0;
+    const int rcas_strength = has_settings ? rs.rcas_strength : 0;
     if (hint_frame && rcas_hook && rcas_strength > 0) {
         // 100% = 0 stops (strongest RCAS), 1% = ~2.5 stops (very light).
         const float stops = 2.5f * (1.0f - static_cast<float>(rcas_strength) / 100.0f);
@@ -8270,7 +8371,7 @@ void QmlMainWindow::render()
     int nr_out_h = 0;
     bool nr_hdr = false;
     const bool nr_user_off_now = nr_user_off.loadRelaxed() != 0;
-    const bool nr_wanted = neural_render && has_settings && settings->GetNeuralRender() && stream_active && !nr_user_off_now;
+    const bool nr_wanted = neural_render && has_settings && rs.neural_render && stream_active && !nr_user_off_now;
     // Back on after the End key: start a fresh history instead of blending in old frames.
     if (nr_wanted && nr_user_off_seen)
         neural_render->resetHistory();
@@ -8305,20 +8406,26 @@ void QmlMainWindow::render()
     // window gets that picture downscaled (by frame generation's input copy or the final render).
     auto nr_options_for = [&](const struct pl_frame *src) {
         NeuralRender::Options options;
-        options.model = settings->GetNeuralRenderModel();
+        options.model = rs.neural_render_model;
         options.passes = nr_passes;
         options.tuning = nr_tuning;
-        if (!settings->GetNeuralRenderUpscale() || !src)
+        // Frames DLSS 5's output cache must keep: one at a time with Direct Mapping (the cache then
+        // holds 2, not 8 4K pictures), the frames of a blend in the frame queue path.
+        options.frames_in_use = bypass_frame_queue ? 1 : qMax(1, frame_mix.num_frames);
+        if (!rs.neural_render_upscale || !src)
             return options;
         const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
         if (src_w < 1.0f || src_h < 1.0f)
             return options;
         float scale = 1.0f;
-        if (settings->GetNeuralRenderUpscaleTarget() == 1) {
+        if (rs.neural_render_upscale_target == 1) {
             const float to_4k = qMin(2160.0f / src_h, 2.0f);
             scale = to_4k >= 1.05f ? to_4k : 1.0f;
         } else {
-            const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
+            // The settled size: a window drag across the 1.5x / 2x steps does not rebuild DLSS 5 (a warm-up of
+            // a few seconds) at every step.
+            const float dst_w = static_cast<float>(settled_video_size.width());
+            const float dst_h = static_cast<float>(settled_video_size.height());
             const float ratio = qMin(dst_w / src_w, dst_h / src_h);
             scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
         }
@@ -8341,13 +8448,13 @@ void QmlMainWindow::render()
         const int refresh_cap = source_interval_s > 0.0
             ? static_cast<int>(std::floor(refresh_hz * source_interval_s + 0.15))
             : 2;
-        const int multiplier = qMin(settings->GetFrameGenMultiplier() * cadence, refresh_cap);
+        const int multiplier = qMin(rs.frame_gen_multiplier * cadence, refresh_cap);
         // When the display holds back the multiplier asked for, the status says what it would take.
         // Counted per source picture like the status's own number: 4x of a 30 fps stream needs 120 Hz.
         // Never more than the backend can make (4 until it has started), so a half-rate source with 4x
         // at 150 Hz, already at the backend's 4 per picture, gets no note.
         const int fg_max_known = frame_gen && frame_gen->maxMultiplier() > 1 ? frame_gen->maxMultiplier() : 4;
-        const int fg_requested = qMin(settings->GetFrameGenMultiplier() * cadence, fg_max_known);
+        const int fg_requested = qMin(rs.frame_gen_multiplier * cadence, fg_max_known);
         const bool fg_capped = refresh_cap < fg_requested && source_interval_s > 0.0;
         fg_status_requested.storeRelaxed(fg_capped ? fg_requested : 0);
         fg_status_needed_hz.storeRelaxed(fg_capped ? static_cast<int>(std::lround(fg_requested / source_interval_s)) : 0);
@@ -8374,7 +8481,7 @@ void QmlMainWindow::render()
         // 8-bit only and never runs on HDR streams, which go DLSS 5 (HDR) -> DLSS FG (HDR, RGBA16F).
         const NeuralRender::Options pipe_nr_options = nr_on ? nr_options_for(&direct_frame) : NeuralRender::Options();
         const bool nr_will_upscale = nr_on && pipe_nr_options.out_width > 0 && neural_render->canUpscale();
-        const bool vsr_would_run = rtx_vsr && nvidia_card && settings->GetRtxVsrQuality() > 0 && !rtx_vsr->failed() &&
+        const bool vsr_would_run = rtx_vsr && nvidia_card && rs.rtx_vsr_quality > 0 && !rtx_vsr->failed() &&
                                    !nr_will_upscale && !pl_color_space_is_hdr(&direct_frame.color);
         // Fewer than 2 frames, RTX VSR, or a failure: the frame stays Taken and goes down the
         // normal path once the last stream frame's frames are out.
@@ -8383,17 +8490,18 @@ void QmlMainWindow::render()
         } else if (multiplier >= 2 && frame_gen->backend() == FrameGen::Backend::Dlss12) {
             fg_pipe_multiplier = multiplier;
             fg_pipe_cadence = cadence;
-            fg_pipe_out_w = static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop))));
-            fg_pipe_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(target_frame.crop))));
+            // (Not the window's size while it is being resized: see settledVideoSize().)
+            fg_pipe_out_w = settled_video_size.width();
+            fg_pipe_out_h = settled_video_size.height();
             fg_pipe_interval_ms = static_cast<float>(source_interval_s * 1000.0);
             fg_pipe_nr = nr_on;
-            frame_gen->setFlowHighQuality(settings->GetFrameGenFlowHighQuality());
-            frame_gen->setDlssMotion(settings->GetFrameGenDlssMotion());
-            frame_gen->setCleanup(settings->GetFrameGenCleanup());
-            frame_gen->setVfgMode(settings->GetFrameGenVfgMode());
+            frame_gen->setFlowHighQuality(rs.frame_gen_flow_high_quality);
+            frame_gen->setDlssMotion(rs.frame_gen_dlss_motion);
+            frame_gen->setCleanup(rs.frame_gen_cleanup);
+            frame_gen->setVfgMode(rs.frame_gen_vfg_mode);
             if (nr_on) {
 #ifdef Q_OS_WIN
-                neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
+                neural_render->setPanelWindow(renderWindowHandle());
 #endif
                 fg_pipe_nr_options = pipe_nr_options;
                 if (neural_render->begin(&direct_frame, direct_frame_serial, fg_pipe_nr_options))
@@ -8409,7 +8517,7 @@ void QmlMainWindow::render()
     if (!fg_override && nr_wanted && neural_render->ensureInitialized(placebo_vulkan)) {
 #ifdef Q_OS_WIN
         // NeuralHub's in-game panel (End) is shown over the video in this window.
-        neural_render->setPanelWindow(reinterpret_cast<void *>(winId()));
+        neural_render->setPanelWindow(renderWindowHandle());
 #endif
         if (bypass_frame_queue) {
             struct pl_frame rendered = {};
@@ -8470,7 +8578,7 @@ void QmlMainWindow::render()
     std::array<const struct pl_frame *, kRtxVsrMaxMixFrames> vsr_frame_ptrs;
     std::array<uint64_t, kRtxVsrMaxMixFrames> vsr_signatures;
     bool vsr_applied = false;
-    const int rtx_vsr_quality = rtx_vsr && has_settings ? settings->GetRtxVsrQuality() : 0;
+    const int rtx_vsr_quality = rtx_vsr && has_settings ? rs.rtx_vsr_quality : 0;
     // HDR streams: RTX VSR is 8-bit SDR only, so it stays off (the frames keep their HDR values for
     // DLSS 5 and DLSS FG, and the HDR10 swapchain).
     const struct pl_frame *vsr_probe = bypass_frame_queue ? &direct_render_frame
@@ -8518,7 +8626,7 @@ void QmlMainWindow::render()
     // Frame generation (Direct Mapping only): turn each new stream frame into
     // `multiplier` frames. The first one is presented now, the rest by the
     // following renders, spaced by the presentation throttle.
-    const int fg_backend = frame_gen && has_settings ? settings->GetFrameGenBackend() : 0;
+    const int fg_backend = frame_gen && has_settings ? rs.frame_gen_backend : 0;
     if (fg_backend != fg_last_backend) {
         fg_last_backend = fg_backend;
         fg_pending_frames.clear();
@@ -8553,8 +8661,10 @@ void QmlMainWindow::render()
     bool fg_applied = fg_override;
     if (!fg_override && direct_frame_fresh && fg_run_backend > 0 && stream_active && direct_render_frame.num_planes > 0) {
         const auto backend_choice = static_cast<FrameGen::Backend>(fg_run_backend);
-        // With repeats dropped a picture lasts `cadence` stream frames; the
-        // multiplier stays relative to the stream rate, so output fps is kept.
+        // With repeats dropped a picture lasts `cadence` stream frames. The multiplier asked for counts per
+        // stream frame (the setting x cadence), so the output stays the setting's times the stream rate,
+        // but only up to the display's refresh rate and to frame generation's maxMultiplier() frames per
+        // picture (4): a 30 fps game (cadence 2) at 4x gets 4 frames per picture, 120 fps, not 240.
         const int cadence = direct_frame_gap;
         const double source_interval_s = stream_interval_s * cadence;
         int multiplier = plan_fg_multiplier(cadence, source_interval_s, refresh_rate);
@@ -8568,8 +8678,9 @@ void QmlMainWindow::render()
         }
         if (multiplier >= 2 && frame_gen->ensureInitialized(placebo_vulkan, backend_choice)) {
             multiplier = qMin(multiplier, frame_gen->maxMultiplier());
-            const int fg_out_w = static_cast<int>(lroundf(fabsf(pl_rect_w(target_frame.crop))));
-            const int fg_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(target_frame.crop))));
+            // (Not the window's size while it is being resized: see settledVideoSize().)
+            const int fg_out_w = settled_video_size.width();
+            const int fg_out_h = settled_video_size.height();
             std::vector<struct pl_frame> fg_outputs;
             if (!fg_crash_guard_armed && fg_crash_guard_good_frames == 0) {
                 // Cleared once generated frames have been shown for a while.
@@ -8582,10 +8693,10 @@ void QmlMainWindow::render()
                     fg_crash_guard_armed = true;
                 }
             }
-            frame_gen->setFlowHighQuality(settings->GetFrameGenFlowHighQuality());
-            frame_gen->setDlssMotion(settings->GetFrameGenDlssMotion());
-            frame_gen->setCleanup(settings->GetFrameGenCleanup());
-            frame_gen->setVfgMode(settings->GetFrameGenVfgMode());
+            frame_gen->setFlowHighQuality(rs.frame_gen_flow_high_quality);
+            frame_gen->setDlssMotion(rs.frame_gen_dlss_motion);
+            frame_gen->setCleanup(rs.frame_gen_cleanup);
+            frame_gen->setVfgMode(rs.frame_gen_vfg_mode);
             if (multiplier >= 2 &&
                 frame_gen->process(&direct_render_frame, fg_out_w, fg_out_h, multiplier,
                                    static_cast<float>(source_interval_s * 1000.0), fg_outputs) &&
@@ -8597,12 +8708,16 @@ void QmlMainWindow::render()
                 direct_render_frame = fg_outputs.front();
                 fg_pending_frames.assign(fg_outputs.begin() + 1, fg_outputs.end());
                 fg_pending_real_decoded_us = direct_frame_decoded_us;
-                if (fg_active_multiplier == 1 || fg_logged_setting != settings->GetFrameGenMultiplier()) {
-                    fg_logged_setting = settings->GetFrameGenMultiplier();
+                if (fg_active_multiplier == 1 || fg_logged_setting != rs.frame_gen_multiplier) {
+                    fg_logged_setting = rs.frame_gen_multiplier;
+                    // The setting is per stream frame; what a picture gets is capped (see `cadence` above).
                     qCInfo(chiakiGui).nospace() << "Frame generation active: " << FrameGen::backendName(backend_choice)
-                                      << " " << fg_logged_setting << "x of the stream rate, game pictures only (now "
+                                      << " " << fg_logged_setting << "x set, game pictures only (now "
                                       << multiplier << " frames from a picture that stood for " << cadence
-                                      << " stream frame" << (cadence == 1 ? ")" : "s)");
+                                      << " stream frame" << (cadence == 1 ? "" : "s") << ", at most "
+                                      << frame_gen->maxMultiplier() << " per picture: "
+                                      << qRound(source_interval_s > 0.0 ? multiplier / source_interval_s : 0.0)
+                                      << " fps)";
                 }
                 fg_active_multiplier = multiplier;
                 fg_active_cadence = cadence;
@@ -8624,13 +8739,16 @@ void QmlMainWindow::render()
     if (fg_pipe_present) {
         // The first frame made from a pipelined stream frame: what the block above does for a
         // stream frame processed in this render.
-        if (fg_active_multiplier == 1 || (has_settings && fg_logged_setting != settings->GetFrameGenMultiplier())) {
-            fg_logged_setting = has_settings ? settings->GetFrameGenMultiplier() : 0;
+        if (fg_active_multiplier == 1 || (has_settings && fg_logged_setting != rs.frame_gen_multiplier)) {
+            fg_logged_setting = has_settings ? rs.frame_gen_multiplier : 0;
             qCInfo(chiakiGui).nospace() << "Frame generation active: "
                 << FrameGen::backendName(FrameGen::Backend::Dlss12) << " " << fg_logged_setting
-                << "x of the stream rate, game pictures only, pipelined (now " << fg_pipe_multiplier
+                << "x set, game pictures only, pipelined (now " << fg_pipe_multiplier
                 << " frames from a picture that stood for " << fg_pipe_cadence << " stream frame"
-                << (fg_pipe_cadence == 1 ? ")" : "s)");
+                << (fg_pipe_cadence == 1 ? "" : "s") << ", at most "
+                << (frame_gen ? frame_gen->maxMultiplier() : fg_pipe_multiplier) << " per picture: "
+                << qRound(fg_pipe_interval_ms > 0.0f ? fg_pipe_multiplier * 1000.0 / fg_pipe_interval_ms : 0.0)
+                << " fps)";
         }
         if (!fg_pipe_logged) {
             fg_pipe_logged = true;
@@ -8782,6 +8900,70 @@ void QmlMainWindow::fgPipeCancel()
     fg_pipe_fg_src = {};
 }
 
+void QmlMainWindow::fgDropFrames()
+{
+    fg_pending_frames.clear();
+    fgPipeCancel();
+    fg_pipe_allowed = false;
+    fg_active_multiplier = 1;
+    fg_active_cadence = 1;
+    fg_pending_real_decoded_us = 0;
+}
+
+// The video area (a size of target_frame.crop) for what is expensive to resize: frame generation's
+// output (every new size rebuilds DLSS-G with a warm-up of about 0.4 s on the render thread, while the
+// GUI thread may wait in a blocking sync) and DLSS 5's upscale toward the window (a warm-up of a few
+// seconds). A window drag, F11, a maximize or a restore goes through many sizes: the size returned
+// changes only once the video area has stayed the same for kVideoSizeSettleUs, and pl_render_image
+// scales the frames to the window meanwhile. The first size (none yet) is taken at once.
+QSize QmlMainWindow::settledVideoSize(int width, int height, qint64 now_us)
+{
+    constexpr qint64 kVideoSizeSettleUs = 250000;
+    if (width != video_size_seen_w || height != video_size_seen_h) {
+        video_size_seen_w = width;
+        video_size_seen_h = height;
+        video_size_seen_since_us = now_us;
+    }
+    if (video_size_settled_w <= 0 || video_size_settled_h <= 0 || now_us - video_size_seen_since_us >= kVideoSizeSettleUs) {
+        if ((width != video_size_settled_w || height != video_size_settled_h) && video_size_settled_w > 0 && width > 0 && height > 0)
+            qCInfo(chiakiGui).nospace() << "Video area settled at " << width << "x" << height << " (was "
+                                        << video_size_settled_w << "x" << video_size_settled_h << ")";
+        video_size_settled_w = width;
+        video_size_settled_h = height;
+    }
+    return QSize(video_size_settled_w, video_size_settled_h);
+}
+
+void QmlMainWindow::refreshRenderSettings()
+{
+    if (!settings)
+        return;
+    // The revision first: a write after this read is read again with the next one.
+    const uint32_t rev = settings->GetRenderSettingsRevision();
+    if (rev == render_settings.rev)
+        return;
+    RenderSettings &rs = render_settings;
+    rs.rev = rev;
+    rs.placebo_upscaler = settings->GetPlaceboUpscaler();
+    rs.display_target_trc = settings->GetDisplayTargetTrc();
+    rs.display_target_prim = settings->GetDisplayTargetPrim();
+    rs.display_target_peak = settings->GetDisplayTargetPeak();
+    rs.display_target_contrast = settings->GetDisplayTargetContrast();
+    rs.ambient_border = settings->GetAmbientBorder();
+    rs.rcas_strength = settings->GetRcasStrength();
+    rs.neural_render = settings->GetNeuralRender();
+    rs.neural_render_model = settings->GetNeuralRenderModel();
+    rs.neural_render_upscale = settings->GetNeuralRenderUpscale();
+    rs.neural_render_upscale_target = settings->GetNeuralRenderUpscaleTarget();
+    rs.rtx_vsr_quality = settings->GetRtxVsrQuality();
+    rs.frame_gen_backend = settings->GetFrameGenBackend();
+    rs.frame_gen_multiplier = settings->GetFrameGenMultiplier();
+    rs.frame_gen_flow_high_quality = settings->GetFrameGenFlowHighQuality();
+    rs.frame_gen_dlss_motion = settings->GetFrameGenDlssMotion();
+    rs.frame_gen_cleanup = settings->GetFrameGenCleanup();
+    rs.frame_gen_vfg_mode = settings->GetFrameGenVfgMode();
+}
+
 void QmlMainWindow::fgPipeAdvance(bool drain)
 {
     if (fg_pipe_stage == FgPipeStage::NeuralRender && (drain || !neural_render || neural_render->beginDone())) {
@@ -8863,6 +9045,11 @@ bool QmlMainWindow::handleShortcut(QKeyEvent *event)
     case Qt::Key_M:
         if (session)
             session->ToggleMute();
+        return true;
+    case Qt::Key_R:
+        // Saves the video stream for frame generation tests (see videocapture.h), or stops it.
+        if (session)
+            session->ToggleVideoCapture();
         return true;
     case Qt::Key_O:
         emit menuRequested();
@@ -9012,6 +9199,11 @@ bool QmlMainWindow::event(QEvent *event)
     }
 
     bool ret = QWindow::event(event);
+
+    // The render thread reads the window's state from this cache (also when hidden or minimized, where
+    // updateSwapchain() is not called).
+    if (event->type() == QEvent::Expose || event->type() == QEvent::Resize)
+        cacheScreenState();
 
     switch (event->type()) {
     case QEvent::Expose:

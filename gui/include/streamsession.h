@@ -29,6 +29,7 @@
 
 #include "exception.h"
 #include "sessionlog.h"
+#include "videocapture.h"
 #include "controllermanager.h"
 #include "settings.h"
 
@@ -253,6 +254,11 @@ class StreamSession : public QObject
 
 		ChiakiFfmpegDecoder *ffmpeg_decoder;
 		void TriggerFfmpegFrameAvailable();
+		// Ctrl+R: the video stream saved as it arrives (frame generation tests, see videocapture.h).
+		VideoCapture video_capture;
+		bool capture_hevc = true;
+		bool capture_hdr = false;
+		static bool VideoSampleCb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user);
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 		ChiakiPiDecoder *pi_decoder;
 #endif
@@ -263,6 +269,10 @@ class StreamSession : public QObject
 		SDL_AudioDeviceID audio_out;
 		SDL_AudioDeviceID audio_in;
 		size_t audio_out_sample_size;
+		// audio_out and what PushAudioFrame() (the receive thread) reads of the mic/echo state, against InitAudio()
+		// and InitMic() on this object's thread. The receive thread only try-locks it and drops that frame, so it
+		// never waits for this thread (InitAudio() is queued, not blocking). Recursive: InitAudio() -> ToggleMute() -> InitMic().
+		QRecursiveMutex audio_out_mutex;
 		QMutex audio_out_ring_mutex;
 		QByteArray audio_out_ring_buf;
 		size_t audio_out_ring_read_pos = 0;
@@ -287,7 +297,10 @@ class StreamSession : public QObject
 		QMutex echo_to_cancel_mutex;
 		QQueue<QByteArray> echo_to_cancel;
 #endif
+		// Written on this object's thread only, under haptics_output_mutex; PushHapticsFrame() (the receive thread)
+		// queues to it under the same mutex, so the device is never closed while SDL_QueueAudio() uses it.
 		SDL_AudioDeviceID haptics_output;
+		QMutex haptics_output_mutex;
 		SDL_AudioCVT haptics_cvt;
 		uint8_t *haptics_resampler_buf;
 		MicBuf mic_buf;
@@ -349,6 +362,10 @@ class StreamSession : public QObject
 		void GoToBed();
 	Q_INVOKABLE bool RequestIDR();
 		void ToggleMute();
+		// Starts saving the video stream (up to 30 s from the next keyframe) or stops it.
+		void ToggleVideoCapture();
+		int VideoCaptureState() { return video_capture.currentState(); }
+		int VideoCaptureSeconds() { return video_capture.seconds(); }
 		void SetLoginPIN(const QString &pin);
 		void GoHome();
 		QString GetHost() { return host; }

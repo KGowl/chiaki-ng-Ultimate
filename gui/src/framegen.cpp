@@ -71,6 +71,9 @@ constexpr int kMaxConsecutiveFailures = 3;
 // As many failures within this long turn the backend off too, successes in between or not: a backend that
 // fails every few frames (each failure can hold the render thread for a GPU wait) is not kept on.
 constexpr auto kFailureWindow = std::chrono::seconds(30);
+// How long the shared D3D12 timeline is kept raised for this side's copies when its D3D12 work is
+// stuck (FrameGen::unstickGpu(), a wait that gave up).
+constexpr int kUnstickMs = 1000;
 
 } // namespace
 
@@ -164,6 +167,10 @@ struct FrameGen::Impl
     VkGpuTimer timer;
     VkSemaphore sem_done = VK_NULL_HANDLE;
     uint64_t done_value = 0;
+    // In the current call: a wait for this side's GPU work gave up (waitDone), and the D3D12
+    // runner's host wait timeouts before it began (dx12Snapshot()).
+    bool gpu_wait_failed = false;
+    uint32_t dx_timeouts_seen = 0;
 
     std::array<FrameSet, kFrameSets> sets;
     // The sets of the size before the last size (or HDR) change: frames handed out from them may still be
@@ -220,6 +227,12 @@ struct FrameGen::Impl
     bool initCommon(pl_vulkan vk);
     void shutdownCommon();
     void destroyBackend();
+    // A failure that is not the backend's own (texture allocation): counted as one, turns the
+    // backend off after repeated ones.
+    bool countFailure();
+    // The GPU may still run this side's work (a wait gave up): command buffers, semaphore and images
+    // are left as they are (leaked) instead of destroyed; frames handed out stay valid.
+    void abandonCommon();
     bool loadFunctions();
     bool waitDone(uint64_t value);
     bool ensureImage(FgImage &img, int w, int h, pl_fmt fmt, bool renderable, bool clearable);
@@ -250,8 +263,25 @@ struct FrameGen::Impl
                      std::vector<struct pl_frame> &outputs,
                      const std::function<void(const char *)> &trace_step, bool defer = false);
     bool dx12Download(FrameSet &set, int count, uint64_t output_value, std::vector<struct pl_frame> &outputs);
+    // A failure: counted (repeated ones turn the backend off), or with the GPU stuck dx12Abandon().
     bool dx12Fail(const char *what);
+    // D3D12 work on the GPU did not finish (a wait gave up in this call, or the runner was marked
+    // stuck): the shared timeline is raised from the host until this side's copies queued behind it
+    // are through, and the backend is turned off for the session with everything the GPU may still
+    // use leaked (the runner's buffers, this side's command buffers and images).
+    void dx12Abandon(const char *why);
+    bool dx12Stuck() const;
 #endif
+    // At the start of a call: no wait gave up yet in it.
+    void dx12Snapshot();
+    // Experiment (CHIAKI_DX12FG_FLOW_MOTION=1, measured with chiaki-fgdx12test --eval): DLSS Frame
+    // Generation through D3D12 gets Flow's motion search as its motion vectors. Without it, it gets
+    // zero motion and finds the motion with its own optical flow.
+    static bool dx12FlowMotion()
+    {
+        static const bool on = qEnvironmentVariableIntValue("CHIAKI_DX12FG_FLOW_MOTION") == 1;
+        return on;
+    }
     // What DLSS-G is told about the color buffers (colorBuffersHDR): HDR when they are;
     // CHIAKI_DLSSG_HDR_FLAG=0/1 overrides it for HDR frames (A/B tests).
     static bool dlssHdrFlag(bool hdr)
@@ -392,6 +422,7 @@ bool FrameGen::Impl::waitDone(uint64_t value)
     const VkResult res = vkWaitSemaphores(vk->device, &wait_info, kWaitTimeoutNs);
     if (res != VK_SUCCESS) {
         qCWarning(chiakiGui) << "[framegen] Waiting for frame generation work failed, result" << static_cast<int>(res);
+        gpu_wait_failed = true;
         return false;
     }
     return true;
@@ -671,7 +702,16 @@ void FrameGen::Impl::fillFrame(const FgImage &img, struct pl_frame *frame) const
 void FrameGen::Impl::destroyBackend()
 {
     if (backend_impl) {
-        waitDone(done_value);
+        const bool idle = waitDone(done_value);
+#if defined(CHIAKI_HAVE_DX12FG)
+        // Its D3D12 work did not finish: nothing it may still use is freed.
+        if (backend == FrameGen::Backend::Dlss12 && (!idle || dx12Stuck())) {
+            dx12Abandon("(the GPU did not finish its work in time)");
+            return;
+        }
+#else
+        (void)idle;
+#endif
         backend_impl->shutdown();
         backend_impl.reset();
     }
@@ -679,12 +719,57 @@ void FrameGen::Impl::destroyBackend()
     have_history = false;
 }
 
+bool FrameGen::Impl::countFailure()
+{
+    have_history = false;
+    last_real = nullptr;
+    if ((++consecutive_failures >= kMaxConsecutiveFailures || tooManyFailures())) {
+        qCWarning(chiakiGui) << "[framegen] Disabling" << FrameGen::backendName(backend) << "after repeated failures";
+        backend_failed[static_cast<size_t>(backend)] = true;
+        destroyBackend();
+    }
+    return false;
+}
+
+void FrameGen::Impl::abandonCommon()
+{
+    for (auto *list : { &sets, &retired_sets }) {
+        for (auto &set : *list)
+            set = FrameSet();
+    }
+    mvec = FgImage();
+    depth = FgImage();
+    width = height = 0;
+    last_real = nullptr;
+    pool = VK_NULL_HANDLE;
+    cmd_slots = {};
+    sem_done = VK_NULL_HANDLE;
+    done_value = 0;
+    // libplacebo keeps what its own queued work uses alive: these go as usual. The timer's queries
+    // are only written by the Vulkan backends' command buffers, never with the D3D12 one.
+    motion_flow.reset();
+    fixup.reset();
+    timer.destroy();
+    pl_renderer_destroy(&renderer);
+    deferred = {};
+    common_ready = false;
+    vk = nullptr;
+    gpu = nullptr;
+}
+
 void FrameGen::Impl::shutdownCommon()
 {
     if (!vk)
         return;
-    if (vkWaitSemaphores)
-        waitDone(done_value);
+    const bool idle = !vkWaitSemaphores || waitDone(done_value);
+#if defined(CHIAKI_HAVE_DX12FG)
+    if (backend == FrameGen::Backend::Dlss12 && backend_impl && (!idle || dx12Stuck())) {
+        dx12Abandon("(the GPU did not finish its work in time)");
+        return;
+    }
+#else
+    (void)idle;
+#endif
     destroyBackend();
     motion_flow.reset();
     fixup.reset();
@@ -1279,7 +1364,9 @@ public:
     const char *stage() const override { return runner ? runner->stage() : ""; }
     void invalidate() override
     {
-        if (runner)
+        // Neural rendering may have seen the shared runtime crash (in the same render, before
+        // processDx12 checks it): it is not called again.
+        if (runner && !runner->crashed())
             runner->invalidate();
     }
     void shutdown() override
@@ -1287,6 +1374,10 @@ public:
         // Neural rendering may keep the shared instance alive: drop this side's buffers.
         if (runner && !runner->crashed())
             runner->invalidate();
+        // A crashed runtime, or D3D12 work that does not finish: never destroyed (its destructor
+        // would call into the runtime and wait for the GPU).
+        if (runner && (runner->crashed() || runner->stuck()))
+            (void)new std::shared_ptr<Dx12Fg>(std::move(runner));
         runner.reset();
     }
 };
@@ -1440,6 +1531,13 @@ float FrameGen::gpuTimeMs() const
         auto *vfg = static_cast<VfgBackend *>(impl->backend_impl.get());
         return vfg->runner ? vfg->runner->gpuTimeMs() : 0.0f;
     }
+#if defined(CHIAKI_HAVE_DX12FG)
+    if (impl->backend == Backend::Dlss12 && impl->backend_impl) {
+        // Measured on the D3D12 queue (timestamps around the evaluations of each real frame).
+        const auto *dx = static_cast<const Dx12Backend *>(impl->backend_impl.get());
+        return dx->runner ? dx->runner->fgGpuTimeMs() : 0.0f;
+    }
+#endif
     return impl->timer.averageMs();
 }
 
@@ -1688,20 +1786,22 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
         have_history = false;
         return false;
     }
+    if (runner->stuck()) {
+        // Neural rendering saw the shared D3D12 work stuck on the GPU.
+        dx12Abandon("(its D3D12 work is stuck on the GPU)");
+        return false;
+    }
     auto disable = [&](const char *why) {
+        if (dx12Stuck()) {
+            dx12Abandon("(the GPU did not finish its work in time)");
+            return false;
+        }
         qCWarning(chiakiGui) << "[framegen] Disabling" << backendName(backend) << why;
         backend_failed[static_cast<size_t>(backend)] = true;
         destroyBackend();
         return false;
     };
-    auto fail = [&](const char *what) {
-        qCWarning(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << what;
-        have_history = false;
-        last_real = nullptr;
-        if ((++consecutive_failures >= kMaxConsecutiveFailures || tooManyFailures()))
-            return disable("after repeated failures");
-        return false;
-    };
+    auto fail = [&](const char *what) { return dx12Fail(what); };
     auto crashed = [&](unsigned long code, const char *stage) {
         qCCritical(chiakiGui).nospace() << "[framegen] DLSS Frame Generation (D3D12) crashed inside its runtime (exception 0x"
                                         << Qt::hex << code << Qt::dec << ", in " << stage << ")";
@@ -1731,25 +1831,47 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
     const int w = set.real.w;
     const int h = set.real.h;
     if (!runner->sizeMatches(w, h, color_hdr)) {
-        // The shared buffers are rebuilt: nothing may still use them.
+        // The shared buffers are rebuilt: nothing may still use them. A wait that gave up is a
+        // failure (stuck: the backend goes), not something to try again at every frame.
         if (!waitDone(done_value))
-            return false;
+            return fail("the GPU did not finish the frames before the D3D12 buffers are rebuilt");
         unsigned long seh_code = 0;
-        const bool sized = guardedCall([&]() { return runner->ensureSize(w, h, color_hdr); }, &seh_code);
+        bool sized = guardedCall([&]() { return runner->ensureSize(w, h, color_hdr); }, &seh_code);
         if (seh_code)
             return crashed(seh_code, runner->stage());
-        if (!sized && color_hdr) {
-            // Not the backend's fault in general: only HDR frames go without it.
-            hdr_refused[static_cast<size_t>(backend)] = true;
-            have_history = false;
-            last_real = nullptr;
-            qCWarning(chiakiGui) << "[framegen]" << backendName(backend)
-                                 << "does not take RGBA16F (HDR) frames: HDR streams keep DLSS 5 / the picture in HDR"
-                                    " and frame generation stays off for them";
-            return false;
-        }
-        if (!sized)
+        if (!sized) {
+            if (dx12Stuck()) {
+                dx12Abandon("(the GPU did not finish its work in time)");
+                return false;
+            }
+            // Memory, or the like: counted, tried again with the next frame.
+            if (!runner->sizeRefused())
+                return fail("the D3D12 buffers could not be set up (see above)");
+            if (!color_hdr)
+                return disable("(the D3D12 side could not be set up, see above)");
+            // The runtime refused HDR: RGBA16F, or frame generation as a whole? The same size in SDR
+            // tells (it is kept for the SDR frames).
+            sized = guardedCall([&]() { return runner->ensureSize(w, h, false); }, &seh_code);
+            if (seh_code)
+                return crashed(seh_code, runner->stage());
+            if (sized) {
+                // Not the backend's fault in general: only HDR frames go without it.
+                hdr_refused[static_cast<size_t>(backend)] = true;
+                have_history = false;
+                last_real = nullptr;
+                qCWarning(chiakiGui) << "[framegen]" << backendName(backend)
+                                     << "does not take RGBA16F (HDR) frames: HDR streams keep DLSS 5 / the picture in HDR"
+                                        " and frame generation stays off for them";
+                return false;
+            }
+            if (dx12Stuck()) {
+                dx12Abandon("(the GPU did not finish its work in time)");
+                return false;
+            }
+            if (!runner->sizeRefused())
+                return fail("the D3D12 buffers could not be set up (see above)");
             return disable("(the D3D12 side could not be set up, see above)");
+        }
         reset_pending = true;
         trace_step("dx12 buffers ready");
     }
@@ -1757,28 +1879,40 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
     runner->setFrameInterval(frame_interval_ms);
     count = std::clamp(count, 1, runner->maxGenerated());
 
-    // (1) Real frame -> shared color buffer.
+    // (1) Real frame -> shared color buffer. By default DLSS-G gets zero motion and finds it with
+    // its own optical flow; dx12FlowMotion() (an experiment) gives it Flow's motion search too.
+    const bool give_motion = dx12FlowMotion();
     CommandSlot *slot = begin_slot();
     if (!slot)
         return fail("command buffer unavailable");
     if (!hold(set.real))
         return fail("could not take the frame from libplacebo");
+    if (give_motion && !hold(mvec)) {
+        release(set.real, set.real.sem, set.real.value);
+        return fail("could not take the motion vectors");
+    }
     runner->recordColor(slot->cmd, set.real.image);
+    if (give_motion)
+        runner->recordMotion(slot->cmd, mvec.image); // zero when Flow had none (first frame, scene start)
     bool ok = vkEndCommandBuffer(slot->cmd) == VK_SUCCESS;
     const uint64_t input_value = runner->lastValue() + 1;
     {
-        FgImage *waits[] = { &set.real };
+        FgImage *waits[] = { &set.real, &mvec };
         // D3D12 has finished with the buffer being overwritten.
         const SemValue extra_waits[] = { { runner->semaphore(), runner->lastValue() } };
         const SemValue input_signal[] = { { runner->semaphore(), input_value } };
-        ok = ok && submitEx(slot->cmd, waits, 1, extra_waits, 1, input_signal, 1);
+        ok = ok && submitEx(slot->cmd, waits, give_motion ? 2 : 1, extra_waits, 1, input_signal, 1);
     }
     if (ok) {
         slot->done_value = done_value;
         runner->setLastValue(input_value);
         release(set.real, sem_done, done_value);
+        if (give_motion)
+            release(mvec, sem_done, done_value);
     } else {
         release(set.real, set.real.sem, set.real.value);
+        if (give_motion)
+            release(mvec, mvec.sem, mvec.value);
         return fail("copying the frame failed");
     }
     trace_step("dx12 input copied");
@@ -1786,8 +1920,13 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
     // (2) The D3D12 half; it always signals `output_value`.
     const uint64_t output_value = input_value + 1;
     unsigned long seh_code = 0;
+    // Flow's vectors are the displacement to the previous frame in pixels: DLSS-G takes them
+    // normalized and reversed (as the Vulkan route, FrameGen::Backend::Dlss).
+    const bool motion_scaled = give_motion && mvecs_from_flow;
+    const float msx = motion_scaled ? -1.0f / static_cast<float>(w) : 1.0f;
+    const float msy = motion_scaled ? -1.0f / static_cast<float>(h) : 1.0f;
     const bool generated_ok = guardedCall([&]() {
-        return runner->generate(fresh ? 1 : count, input_value, output_value, fresh, false, 1.0f, 1.0f);
+        return runner->generate(fresh ? 1 : count, input_value, output_value, fresh, give_motion, msx, msy);
     }, &seh_code);
     runner->setLastValue(output_value);
     if (seh_code)
@@ -1828,15 +1967,60 @@ bool FrameGen::Impl::processDx12(FrameSet &set, int count, float frame_interval_
 bool FrameGen::Impl::dx12Fail(const char *what)
 {
     qCWarning(chiakiGui) << "[framegen] DLSS Frame Generation (D3D12):" << what;
-    have_history = false;
-    last_real = nullptr;
-    if ((++consecutive_failures >= kMaxConsecutiveFailures || tooManyFailures())) {
-        qCWarning(chiakiGui) << "[framegen] Disabling" << FrameGen::backendName(backend) << "after repeated failures";
-        backend_failed[static_cast<size_t>(backend)] = true;
-        destroyBackend();
+    if (dx12Stuck()) {
+        // Every retry would stall the stream again, and freeing would free what the GPU still uses.
+        dx12Abandon("(the GPU did not finish its work in time)");
+        return false;
     }
-    return false;
+    return countFailure();
 }
+
+bool FrameGen::Impl::dx12Stuck() const
+{
+    if (gpu_wait_failed)
+        return true;
+    if (backend != FrameGen::Backend::Dlss12 || !backend_impl)
+        return false;
+    const auto *dx = static_cast<const Dx12Backend *>(backend_impl.get());
+    return dx->runner && (dx->runner->stuck() || dx->runner->gpuWaitTimeouts() != dx_timeouts_seen);
+}
+
+void FrameGen::Impl::dx12Abandon(const char *why)
+{
+    qCWarning(chiakiGui) << "[framegen] Disabling" << FrameGen::backendName(FrameGen::Backend::Dlss12) << "for this session"
+                         << why;
+    backend_failed[static_cast<size_t>(FrameGen::Backend::Dlss12)] = true;
+    if (backend != FrameGen::Backend::Dlss12 || !backend_impl)
+        return;
+    auto *dx = static_cast<Dx12Backend *>(backend_impl.get());
+    if (dx->runner) {
+        // Neural rendering stops at its next call too. The D3D12 calls that would signal the last
+        // values may never run: whatever waits for them on the Vulkan queue goes on.
+        dx->runner->markStuck();
+        dx->runner->raiseUntilDone(dx->runner->lastValue(), sem_done, done_value, kUnstickMs);
+        (void)new std::shared_ptr<Dx12Fg>(std::move(dx->runner));
+    }
+    (void)backend_impl.release();
+    backend = FrameGen::Backend::None;
+    have_history = false;
+    abandonCommon();
+}
+#endif // CHIAKI_HAVE_DX12FG
+
+void FrameGen::Impl::dx12Snapshot()
+{
+    gpu_wait_failed = false;
+    dx_timeouts_seen = 0;
+#if defined(CHIAKI_HAVE_DX12FG)
+    if (backend == FrameGen::Backend::Dlss12 && backend_impl) {
+        const auto *dx = static_cast<const Dx12Backend *>(backend_impl.get());
+        if (dx->runner)
+            dx_timeouts_seen = dx->runner->gpuWaitTimeouts();
+    }
+#endif
+}
+
+#if defined(CHIAKI_HAVE_DX12FG)
 
 // (3) Shared output buffers -> generated textures; the copy waits for `output_value` on the
 // GPU. Then `outputs` gets the frames in presentation order, the real frame last.
@@ -1993,6 +2177,22 @@ bool FrameGen::begin(const struct pl_frame *src, int out_w, int out_h, int multi
 #endif
 }
 
+void FrameGen::unstickGpu()
+{
+#if defined(CHIAKI_HAVE_DX12FG)
+    Impl &d = *impl;
+    if (d.backend != Backend::Dlss12 || !d.backend_impl)
+        return;
+    const auto *dx = static_cast<const Dx12Backend *>(d.backend_impl.get());
+    if (!dx->runner)
+        return;
+    // Its D3D12 side is through: whatever the renderer waits for is not held up here.
+    if (!dx->runner->crashed() && !dx->runner->stuck() && dx->runner->completedValue() >= dx->runner->lastValue())
+        return;
+    d.dx12Abandon("(the renderer's GPU wait timed out with its D3D12 work behind)");
+#endif
+}
+
 bool FrameGen::beginDone() const
 {
 #if defined(CHIAKI_HAVE_DX12FG)
@@ -2015,6 +2215,7 @@ bool FrameGen::finish(std::vector<struct pl_frame> &outputs)
 {
     Impl &d = *impl;
     outputs.clear();
+    d.dx12Snapshot();
     Impl::Deferred deferred = std::move(d.deferred);
     d.deferred = {};
     if (!deferred.active)
@@ -2042,6 +2243,7 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
     outputs.clear();
     if (!d.backend_impl || !src || src->num_planes <= 0 || out_w <= 0 || out_h <= 0)
         return false;
+    d.dx12Snapshot();
     const bool hdr = pl_color_space_is_hdr(&src->color);
     if (hdr && d.hdr_refused[static_cast<size_t>(d.backend)])
         return false; // logged when it was refused
@@ -2087,8 +2289,13 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
                                         << " (" << trace_timer.elapsed() << " ms)";
     };
     if (!d.ensureSize(out_w, out_h, hdr, trace_step)) {
+        // Counted: each try can stall on a GPU wait (a stuck D3D12 backend goes at once).
+#if defined(CHIAKI_HAVE_DX12FG)
+        if (d.backend == Backend::Dlss12)
+            return d.dx12Fail("could not allocate frame generation textures");
+#endif
         qCWarning(chiakiGui) << "[framegen] Could not allocate frame generation textures";
-        return false;
+        return d.countFailure();
     }
     trace_step("textures ready");
 
@@ -2122,7 +2329,8 @@ bool FrameGen::processFrames(const struct pl_frame *src, int out_w, int out_h, i
     // chosen) and FSR as their motion vectors, and for the clean-up passes.
     const bool cleanup = d.cleanup_mode > 0 && !d.fixup_failed;
     const bool motion_for_backend = (d.backend == FrameGen::Backend::Dlss && d.dlss_flow_motion) ||
-                                    d.backend == FrameGen::Backend::Fsr;
+                                    d.backend == FrameGen::Backend::Fsr ||
+                                    (d.backend == FrameGen::Backend::Dlss12 && d.dx12FlowMotion());
     const bool want_motion = motion_for_backend ||
                              (cleanup && d.backend != FrameGen::Backend::Dlss && d.backend != FrameGen::Backend::Fsr);
     if (want_motion && !d.motion_flow_failed) {
@@ -2362,5 +2570,6 @@ bool FrameGen::process(const struct pl_frame *, int, int, int, float, std::vecto
 bool FrameGen::begin(const struct pl_frame *, int, int, int, float) { return false; }
 bool FrameGen::beginDone() const { return true; }
 bool FrameGen::finish(std::vector<struct pl_frame> &) { return false; }
+void FrameGen::unstickGpu() {}
 
 #endif // CHIAKI_HAVE_FRAMEGEN
