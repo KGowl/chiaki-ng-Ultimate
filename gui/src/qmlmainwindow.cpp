@@ -6919,12 +6919,13 @@ void QmlMainWindow::beginFrame()
             << step * static_cast<int>(kQuickWaitStepNs / 1000000000ull) << " s (value "
             << quick_sem_value << ")" << (step < kQuickWaitSteps ? ", waiting on" : ", giving up");
         if (step == 1) {
-            // TODO(unstickGpu): the queue most likely waits for a D3D12 fence value of DLSS 5 or DLSS FG
-            // that will not come. Once FrameGen::unstickGpu() and NeuralRender::unstickGpu() exist (they
-            // signal those values from the host so the queue drains), call them here, on this (the
-            // render) thread, before the next wait:
-            //     if (frame_gen) frame_gen->unstickGpu();
-            //     if (neural_render) neural_render->unstickGpu();
+            // The queue most likely waits for a D3D12 fence value of DLSS 5 or DLSS FG that will not come:
+            // both signal their side's values from the host (so the queue drains) and turn themselves off
+            // for the session; nothing happens when they are not running on D3D12. Render thread only.
+            if (frame_gen)
+                frame_gen->unstickGpu();
+            if (neural_render)
+                neural_render->unstickGpu();
         }
     }
     if (wait_result != VK_SUCCESS) {
@@ -8408,6 +8409,9 @@ void QmlMainWindow::render()
         options.model = rs.neural_render_model;
         options.passes = nr_passes;
         options.tuning = nr_tuning;
+        // Frames DLSS 5's output cache must keep: one at a time with Direct Mapping (the cache then
+        // holds 2, not 8 4K pictures), the frames of a blend in the frame queue path.
+        options.frames_in_use = bypass_frame_queue ? 1 : qMax(1, frame_mix.num_frames);
         if (!rs.neural_render_upscale || !src)
             return options;
         const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
