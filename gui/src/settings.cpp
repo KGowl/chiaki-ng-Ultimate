@@ -366,6 +366,7 @@ void Settings::ImportSettings(QString filepath)
 			settings.setValue( *i, settings_backup.value( *i ) );
 		}
 		MigrateLegacyFrameMixerSetting(&settings, &placebo_settings, nullptr, true);
+		BumpRenderSettingsRevision();
 		SetCurrentProfile(std::move(profile));
 	}
 	else
@@ -396,6 +397,7 @@ void Settings::ImportPlaceboSettings(QString filepath)
 		placebo_settings.setValue( *i, settings_backup.value( *i ) );
 	}
 	MigrateLegacyFrameMixerSetting(&settings, &placebo_settings, nullptr, true);
+	BumpRenderSettingsRevision();
 }
 
 uint32_t Settings::GetLogLevelMask()
@@ -1208,6 +1210,7 @@ int Settings::GetDisplayTargetContrast() const
 void Settings::SetDisplayTargetContrast(int contrast)
 {
 	settings.setValue("settings/display_target_contrast", contrast);
+	BumpRenderSettingsRevision();
 }
 
 int Settings::GetDisplayTargetPeak() const
@@ -1218,6 +1221,7 @@ int Settings::GetDisplayTargetPeak() const
 void Settings::SetDisplayTargetPeak(int peak)
 {
 	settings.setValue("settings/display_target_peak", peak);
+	BumpRenderSettingsRevision();
 }
 
 int Settings::GetDisplayTargetTrc() const
@@ -1228,6 +1232,7 @@ int Settings::GetDisplayTargetTrc() const
 void Settings::SetDisplayTargetTrc(int trc)
 {
 	settings.setValue("settings/display_target_trc", trc);
+	BumpRenderSettingsRevision();
 }
 
 int Settings::GetDisplayTargetPrim() const
@@ -1238,6 +1243,7 @@ int Settings::GetDisplayTargetPrim() const
 void Settings::SetDisplayTargetPrim(int prim)
 {
 	settings.setValue("settings/display_target_prim", prim);
+	BumpRenderSettingsRevision();
 }
 
 
@@ -1269,6 +1275,7 @@ PlaceboUpscaler Settings::GetPlaceboUpscaler() const
 void Settings::SetPlaceboUpscaler(PlaceboUpscaler upscaler)
 {
 	placebo_settings.setValue("placebo_settings/upscaler", placebo_upscaler_values[upscaler]);
+	BumpRenderSettingsRevision();
 }
 
 static const PlaceboUpscaler placebo_plane_upscaler_default = PlaceboUpscaler::None;
