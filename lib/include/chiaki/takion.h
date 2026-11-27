@@ -157,6 +157,19 @@ typedef struct chiaki_takion_t
 	bool video_queue_initialized;
 	int64_t video_queue_head_wait_start_us;
 	uint64_t video_queue_head_wait_seq_num;
+	/**
+	 * What the video reorder queue gave up on since the last summary line, logged at most once per second
+	 * from the receive thread instead of a line per packet.
+	 */
+	struct
+	{
+		uint64_t dropped; // late or duplicate packets
+		uint64_t dropped_last_index;
+		uint64_t timeout_skips; // reorder timeouts that gave up on the missing packets before a received one
+		uint64_t timeout_skipped_packets;
+		uint64_t evicted; // received packets delivered early because the queue was full (the missing ones before them are lost)
+		int64_t last_log_us;
+	} video_queue_stats;
 	ChiakiTakionSendBuffer send_buffer;
 	/**
 	 * send_buffer only exists from the end of the handshake until the receive loop ends.

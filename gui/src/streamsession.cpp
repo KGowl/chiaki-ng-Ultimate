@@ -18,6 +18,7 @@
 #include <QStandardPaths>
 #include <QtMath>
 #include <atomic>
+#include <mutex>
 
 #include <algorithm>
 
@@ -697,16 +698,14 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 			average_packet_loss = packet_loss;
 			emit AveragePacketLossChanged();
 		}
-		if(session.stream_connection.video_receiver)
+		// Through the stream connection, which locks against the session thread freeing the video receiver.
+		int32_t total = chiaki_stream_connection_get_frames_lost_total(&session.stream_connection);
+		if(total > pending_frames_lost)
 		{
-			int32_t total = chiaki_video_receiver_get_frames_lost_total(session.stream_connection.video_receiver);
-			if(total > pending_frames_lost)
-			{
-				frames_lost += total - pending_frames_lost;
-				emit FramesLostChanged();
-			}
-			pending_frames_lost = total;
+			frames_lost += total - pending_frames_lost;
+			emit FramesLostChanged();
 		}
+		pending_frames_lost = total;
 	});
 
 	StartAudioOutDrainThread();
@@ -716,8 +715,12 @@ StreamSession::~StreamSession()
 {
 	mic_active.storeRelaxed(false);
 	StopAudioOutDrainThread();
-	if(audio_out)
-		SDL_CloseAudioDevice(audio_out);
+	{
+		QMutexLocker audio_locker(&audio_out_mutex);
+		if(audio_out)
+			SDL_CloseAudioDevice(audio_out);
+		audio_out = 0;
+	}
 	{
 		QMutexLocker locker(&audio_out_ring_mutex);
 		audio_out_ring_buf.clear();
@@ -778,11 +781,7 @@ StreamSession::~StreamSession()
 		chiaki_ffmpeg_decoder_fini(ffmpeg_decoder);
 		delete ffmpeg_decoder;
 	}
-	if (haptics_output > 0)
-	{
-		SDL_CloseAudioDevice(haptics_output);
-		haptics_output = 0;
-	}
+	DisconnectHaptics();
 	if (haptics_resampler_buf)
 	{
 		free(haptics_resampler_buf);
@@ -858,6 +857,12 @@ void StreamSession::RetryStart()
 	{
 		chiaki_session_join(&session);
 		session_started = false;
+	}
+	// Stop() stops retry_timer, so this does not run after it; check anyway, the reset must not undo a stop.
+	if(stop_requested || chiaki_session_reset_for_retry(&session) != CHIAKI_ERR_SUCCESS)
+	{
+		EndSession(CHIAKI_QUIT_REASON_STOPPED);
+		return;
 	}
 	try
 	{
@@ -1205,6 +1210,8 @@ void StreamSession::HandleDpadTouchEvent(ChiakiControllerState *state, bool plac
 void StreamSession::UpdateGamepads()
 {
 #if CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+	bool haptics_closed = false;
+	bool haptics_wait_scheduled = false;
 	for(auto controller_id : controllers.keys())
 	{
 		auto controller = controllers[controller_id];
@@ -1214,6 +1221,9 @@ void StreamSession::UpdateGamepads()
 			controllers.remove(controller_id);
 			if (controller->IsDualSense() || controller->IsDualSenseEdge())
 			{
+				// Audio devices can't be matched to controllers, so this closes the haptics device whichever
+				// DualSense left; it is reopened below if another one is still connected.
+				haptics_closed = haptics_closed || haptics_output > 0;
 				DisconnectHaptics();
 			}
 			if (!controller->IsHandheld() && !controller->IsSteamVirtualUnmasked())
@@ -1221,6 +1231,20 @@ void StreamSession::UpdateGamepads()
 				haptics_handheld++;
 			}
 			controller->Unref();
+		}
+	}
+	if(haptics_closed)
+	{
+		for(auto controller : std::as_const(controllers))
+		{
+			if(controller->IsDualSense() || controller->IsDualSenseEdge())
+			{
+				// Delayed like for a new controller, so that the audio device that left is gone from the list.
+				CHIAKI_LOGI(log.GetChiakiLog(), "A DualSense is still connected, reopening haptics");
+				QTimer::singleShot(1000, this, &StreamSession::WaitHaptics);
+				haptics_wait_scheduled = true;
+				break;
+			}
 		}
 	}
 
@@ -1267,10 +1291,11 @@ void StreamSession::UpdateGamepads()
 				uint8_t trigger_intensity = (ps5_trigger_intensity < 0) ? 0xF0 : ps5_trigger_intensity;
 				uint8_t rumble_intensity = (ps5_rumble_intensity < 0) ? 0x0F : ps5_rumble_intensity;
 				controller->SetDualsenseMic(muted);
-				if(this->haptics_output > 0)
+				if(this->haptics_output > 0 || haptics_wait_scheduled)
 					continue;
 				// Connect haptics audio device with a delay to give the sound system time to set up
 				QTimer::singleShot(1000, this, &StreamSession::WaitHaptics);
+				haptics_wait_scheduled = true;
 			}
 		}
 	}
@@ -1400,6 +1425,8 @@ void StreamSession::SendFeedbackState()
 void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 {
 	StopAudioOutDrainThread();
+	// Until this returns, PushAudioFrame() on the receive thread drops its frames instead of using audio_out.
+	QMutexLocker audio_locker(&audio_out_mutex);
 	allow_unmute = true;
 	if(start_mic_unmuted)
 		ToggleMute();
@@ -1465,6 +1492,8 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 
 void StreamSession::InitMic(unsigned int channels, unsigned int rate)
 {
+	// PushAudioFrame() reads mic_buf and the echo buffers freed and reallocated here.
+	QMutexLocker audio_locker(&audio_out_mutex);
 	auto clear_mic_buffers = [this]() {
 		if(mic_buf.buf)
 		{
@@ -1821,11 +1850,16 @@ void StreamSession::InitHaptics()
 
 void StreamSession::DisconnectHaptics()
 {
-	if (this->haptics_output > 0)
+	// PushHapticsFrame() queues to the device under haptics_output_mutex: once it reads 0 here nothing uses
+	// the old device any more, and the close (which can take a while) runs without holding the mutex.
+	SDL_AudioDeviceID dev = 0;
 	{
-		SDL_CloseAudioDevice(haptics_output);
-		this->haptics_output = 0;
+		QMutexLocker locker(&haptics_output_mutex);
+		dev = haptics_output;
+		haptics_output = 0;
 	}
+	if (dev > 0)
+		SDL_CloseAudioDevice(dev);
 }
 
 void StreamSession::ConnectRumbleHaptics()
@@ -1869,6 +1903,22 @@ void StreamSession::ConnectRumbleHaptics()
 void StreamSession::QueueRumbleHaptics(uint16_t strength)
 {
 	if(!rumble_haptics_connected)
+		return;
+	// Only for a controller that would rumble with it. Checked here on this object's thread, not in
+	// PushHapticsFrame(): that runs on the receive thread, where controllers changes under it.
+	bool send_rumble_haptics = false;
+	for(auto controller : std::as_const(controllers))
+	{
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+		if(haptics_handheld < 1 && (controller->IsHandheld() || (sdeck && controller->IsSteamVirtualUnmasked())))
+#else
+		if(haptics_handheld < 1 && controller->IsHandheld())
+#endif
+			continue;
+		send_rumble_haptics = true;
+		break;
+	}
+	if(!send_rumble_haptics)
 		return;
 	rumble_haptics.enqueue(strength);
 }
@@ -1978,8 +2028,11 @@ void StreamSession::ConnectHaptics()
 		}
 		if (candidate.channels != 4)
 			CHIAKI_LOGW(log.GetChiakiLog(), "Haptics audio device '%s' reports %d channels, not 4; haptics may be wrong (set settings/haptics_audio_device to pick another device)", device_name, candidate.channels);
-		haptics_output = dev;
-		SDL_PauseAudioDevice(haptics_output, 0);
+		SDL_PauseAudioDevice(dev, 0);
+		{
+			QMutexLocker locker(&haptics_output_mutex);
+			haptics_output = dev;
+		}
 		CHIAKI_LOGI(log.GetChiakiLog(), "Haptics Audio Device '%s' opened with %d channels @ %d Hz, buffer size %u (driver=%s)", device_name, have.channels, have.freq, have.size, SDL_GetCurrentAudioDriver());
 		QMetaObject::invokeMethod(this, [this]() {
 			const uint8_t clear_effect[10] = { 0 };
@@ -2047,7 +2100,10 @@ void StreamSession::StopSdeckHaptics()
 
 void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
 {
-	if(!audio_out || !audio_volume)
+	// The receive thread must never wait for this object's thread: while InitAudio()/InitMic() reopen a
+	// device there, this frame is dropped.
+	std::unique_lock<QRecursiveMutex> audio_lock(audio_out_mutex, std::try_to_lock);
+	if(!audio_lock.owns_lock() || !audio_out || !audio_volume)
 		return;
 
 	QByteArray buf((int)(samples_count * audio_out_sample_size), 0);
@@ -2336,8 +2392,12 @@ void StreamSession::PushHapticsFrame(uint8_t *buf, size_t buf_size)
 		return;
 	}
 #endif
+	// Held while this queues to the device, so DisconnectHaptics() (this object's thread) cannot close it
+	// meanwhile; that side holds it only to swap the id.
+	std::unique_lock<QMutex> haptics_lock(haptics_output_mutex);
 	if((rumble_haptics_intensity != RumbleHapticsIntensity::Off) && haptics_output == 0)
 	{
+		haptics_lock.unlock();
 		int16_t amplitudel = 0, amplituder = 0;
 		uint32_t suml = 0, sumr = 0;
 		const size_t sample_size = 2 * sizeof(int16_t); // stereo samples
@@ -2395,19 +2455,8 @@ void StreamSession::PushHapticsFrame(uint8_t *buf, size_t buf_size)
 		left = ((left > 0 && left < (1 << 9)) ? (1 << 9) : left);
 		right = ((right > 0 && right < (1 << 9)) ? (1 << 9) : right);
 		uint16_t strength = (left > right) ? left : right;
-		bool send_rumble_haptics = false;
-		for(auto controller : controllers)
-		{
-#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
-			if(haptics_handheld < 1 && (controller->IsHandheld() || (sdeck && controller->IsSteamVirtualUnmasked())))
-#else
-			if(haptics_handheld < 1 && controller->IsHandheld())
-#endif
-				continue;
-			send_rumble_haptics = true;
-		}
-		if(send_rumble_haptics)
-			emit RumbleHapticPushed(strength);
+		// QueueRumbleHaptics() (queued to this object's thread) checks for a controller to rumble.
+		emit RumbleHapticPushed(strength);
 		return;
 	}
 	if(haptics_output == 0)
@@ -2937,8 +2986,7 @@ bool StreamSession::RequestIDR()
 	ChiakiErrorCode err = chiaki_session_request_idr(&session);
 	if(err == CHIAKI_ERR_SUCCESS)
 	{
-		if(session.stream_connection.video_receiver)
-			chiaki_video_receiver_set_waiting_for_idr(session.stream_connection.video_receiver, true);
+		chiaki_stream_connection_set_video_waiting_for_idr(&session.stream_connection, true);
 		return true;
 	}
 	CHIAKI_LOGW(log.GetChiakiLog(), "StreamSession failed to request IDR frame: %s", chiaki_error_string(err));
@@ -2948,14 +2996,17 @@ bool StreamSession::RequestIDR()
 class StreamSessionPrivate
 {
 	public:
+		// Queued, never blocking: this runs on the Takion receive thread with the stream connection's state_mutex
+		// held (streaminfo), and Stop() on this object's thread waits for that mutex, so waiting here for
+		// this object's thread deadlocked. PushAudioFrame() drops frames until InitAudio() has opened the device.
 		static void InitAudio(StreamSession *session, uint32_t channels, uint32_t rate)
 		{
-			QMetaObject::invokeMethod(session, "InitAudio", Qt::ConnectionType::BlockingQueuedConnection, Q_ARG(unsigned int, channels), Q_ARG(unsigned int, rate));
+			QMetaObject::invokeMethod(session, "InitAudio", Qt::ConnectionType::QueuedConnection, Q_ARG(unsigned int, channels), Q_ARG(unsigned int, rate));
 		}
 
 		static void InitMic(StreamSession *session, uint32_t channels, uint32_t rate)
 		{
-			QMetaObject::invokeMethod(session, "InitMic", Qt::ConnectionType::BlockingQueuedConnection, Q_ARG(unsigned int, channels), Q_ARG(unsigned int, rate));
+			QMetaObject::invokeMethod(session, "InitMic", Qt::ConnectionType::QueuedConnection, Q_ARG(unsigned int, channels), Q_ARG(unsigned int, rate));
 		}
 
 		static void PushAudioFrame(StreamSession *session, int16_t *buf, size_t samples_count)	{ session->PushAudioFrame(buf, samples_count); }

@@ -328,16 +328,33 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_stop(ChiakiSession *session)
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_join(ChiakiSession *session)
 {
-	ChiakiErrorCode err = chiaki_thread_join(&session->session_thread, NULL);
-#ifdef _WIN32
-	// chiaki_thread_join() only waits: without this every started session thread leaks its handle.
-	if(err == CHIAKI_ERR_SUCCESS)
+	// chiaki_thread_join() also releases the thread handle on Windows.
+	return chiaki_thread_join(&session->session_thread, NULL);
+}
+
+CHIAKI_EXPORT ChiakiErrorCode chiaki_session_reset_for_retry(ChiakiSession *session)
+{
+	chiaki_mutex_lock(&session->state_mutex);
+	if(session->should_stop)
 	{
-		CloseHandle(session->session_thread.thread);
-		session->session_thread.thread = NULL;
+		// Stopped for good: the next attempt has to quit at once, so keep should_stop and the stop pipe.
+		chiaki_mutex_unlock(&session->state_mutex);
+		return CHIAKI_ERR_CANCELED;
 	}
-#endif
-	return err;
+	session->ctrl_failed = false;
+	session->ctrl_session_id_received = false;
+	session->ctrl_login_pin_requested = false;
+	session->ctrl_first_heartbeat_received = false;
+	session->psn_regist_succeeded = false;
+	session->stream_connection_switch_received = false;
+	session->quit_reason = CHIAKI_QUIT_REASON_NONE;
+	free(session->quit_reason_str);
+	session->quit_reason_str = NULL;
+	chiaki_mutex_unlock(&session->state_mutex);
+
+	chiaki_ctrl_reset_for_retry(&session->ctrl);
+	chiaki_stream_connection_reset_for_retry(&session->stream_connection);
+	return CHIAKI_ERR_SUCCESS;
 }
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_request_idr(ChiakiSession *session)
@@ -697,6 +714,7 @@ ctrl_failed:
 			session->quit_reason = CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN;
 		else
 			session->quit_reason = CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED;
+		free(session->quit_reason_str);
 		session->quit_reason_str = strdup(session->stream_connection.remote_disconnect_reason);
 	}
 	else if(err != CHIAKI_ERR_SUCCESS && err != CHIAKI_ERR_CANCELED)

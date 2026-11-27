@@ -285,6 +285,13 @@ CHIAKI_EXPORT void chiaki_session_fini(ChiakiSession *session);
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_start(ChiakiSession *session);
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_stop(ChiakiSession *session);
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_join(ChiakiSession *session);
+/**
+ * Clears what one connect attempt leaves behind (ctrl stop request and stop pipes, ctrl failure, session id,
+ * quit reason, remote disconnect, stream keys) so that chiaki_session_start() can try again on the same session.
+ * Call it only while no session thread runs: after chiaki_session_join() of the failed attempt.
+ * chiaki_session_stop() is final: after it this returns CHIAKI_ERR_CANCELED and keeps the stop state.
+ */
+CHIAKI_EXPORT ChiakiErrorCode chiaki_session_reset_for_retry(ChiakiSession *session);
 
 CHIAKI_EXPORT void chiaki_session_send_event(ChiakiSession *session, ChiakiEvent *event);
 
