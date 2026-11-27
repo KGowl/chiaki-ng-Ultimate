@@ -80,7 +80,7 @@ Notes:
 
 | Feature | GPU | Where |
 |---|---|---|
-| **DLSS 5 neural rendering** – NVIDIA's neural rendering model on each stream frame, at the stream size or upscaled 1.5x / 2x toward the window by DLSS Super Resolution (1080p → 4K); SDR and HDR | NVIDIA RTX (`nvngx_dlssnr.dll`, not bundled); AMD Radeon through NeuralHub (not bundled) | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
+| **DLSS 5 neural rendering** – NVIDIA's neural rendering model on each stream frame, at the stream size, upscaled 1.5x / 2x toward the window by DLSS Super Resolution (1080p → 4K), or always to 4K (2160 lines, downscaled to a smaller window); SDR and HDR | NVIDIA RTX (`nvngx_dlssnr.dll`, not bundled); AMD Radeon through NeuralHub (not bundled) | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
 | **DLSS Frame Generation via D3D12** – DLSS FG through the same bridge, 2x–4x; the next stream frame's DLSS work runs on D3D12 while the frames generated from the last one are presented | AMD through NeuralHub; NVIDIA next to DLSS 5 (NGX refuses Vulkan DLSS FG once its D3D12 side is up) or when Vulkan DLSS FG fails | Settings → Video, Ctrl+O → Enhancement, RTX settings panel |
 | **RTX settings panel** – in-stream panel with *RTX* and *Eye Candy* tabs (DLSS 5, upscaling, sharpness, frame generation multiplier, stats overlay, RTX VSR, clean-up, border fill); a button at the top right when the mouse moves, End on NVIDIA | all | while streaming |
 | **DLSS 5 controls (NVIDIA)** – model CC / HT, 1–3 passes, each with its own preset and controls, applied at once | NVIDIA RTX | RTX settings panel (End) |
@@ -97,7 +97,7 @@ Notes:
 ### In-stream controls and stats
 
 - **Enhancement panel (Ctrl+O → Enhancement)**: change RTX VSR mode, frame generation backend / multiplier / Flow quality, RCAS strength and border fill while streaming, without leaving the stream; it shows what is active and the stream / display fps.
-- **Stats overlay**: stream fps / display fps, bitrate, packet loss, plus RTX VSR / frame generation state and GPU time (e.g. `VFG 4x 6.8 ms`). Styles Mini / Compact (one line) / Default / Full and nine positions (e.g. one line at the top center); it follows the stream window instead of staying above other applications.
+- **Stats overlay**: stream fps / display fps, latency (decoded → shown, with DLSS 5, DLSS SR and frame generation in it), bitrate, packet loss, plus RTX VSR / frame generation state and GPU time (e.g. `VFG 4x 6.8 ms`). Styles Mini / Compact (one line) / Default / Full and nine positions (e.g. one line at the top center); it follows the stream window instead of staying above other applications.
 - **Disconnect dialog**: Cancel button and × to keep streaming instead of always closing the stream.
 
 ### Streaming and stability

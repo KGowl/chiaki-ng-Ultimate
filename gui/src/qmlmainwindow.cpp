@@ -188,6 +188,8 @@ public:
         // Two lines: the frames the stream brings, and the frames the display shows (frame generation's too).
         fpsRow = makeRow(tr("stream fps"), QColor(QStringLiteral("#ffe082")), fpsValue);
         displayFpsRow = makeRow(tr("display fps"), QColor(QStringLiteral("#ffcc80")), displayFpsValue);
+        // Decoded -> shown time of the real pictures (DLSS 5, DLSS SR, frame generation and pacing).
+        latencyRow = makeRow(tr("latency"), QColor(QStringLiteral("#ce93d8")), latencyValue);
         queueRow = makeRow(tr("queue depth avg"), QColor(QStringLiteral("#90caf9")), queueDepthValue);
         pendingRow = makeRow(tr("pending frame age"), QColor(QStringLiteral("#90caf9")), pendingAgeValue);
         packetLossRow = makeRow(tr("packet loss"), QColor(QStringLiteral("#ef9a9a")), packetLossValue);
@@ -310,6 +312,8 @@ public:
         const QString fps = owner ? QStringLiteral("%1 → %2").arg(owner->streamFps(), 0, 'f', 0).arg(owner->displayFps(), 0, 'f', 0) : QString();
         const QString streamFps = owner ? owner->streamFpsText() : QString();
         const QString displayFps = owner ? owner->displayFpsText() : QString();
+        const QString latency = owner ? owner->latencyText() : QString();
+        const double latencyAvgMs = owner ? owner->latencyAvgMs() : -1.0;
 
         if (style == Mini || style == Compact) {
             QStringList items;
@@ -324,6 +328,8 @@ public:
                 } else {
                     item(fps, "#ffe082", tr("fps"));
                 }
+                if (latencyAvgMs >= 0.0)
+                    item(QString::number(latencyAvgMs, 'f', 0), "#ce93d8", style == Compact ? tr("ms latency") : tr("ms"));
                 item(QString::number(bitrate, 'f', 1), "#00a7ff", tr("Mbps"));
                 if (style == Compact || packetLoss > 0.0)
                     item(QStringLiteral("%1%").arg(packetLoss * 100.0, 0, 'f', 1), "#ef9a9a", tr("loss"));
@@ -354,6 +360,8 @@ public:
         fpsValue->setText(hasSession ? streamFps : QString());
         displayFpsRow->setVisible(hasSession);
         displayFpsValue->setText(hasSession ? displayFps : QString());
+        latencyRow->setVisible(hasSession && !latency.isEmpty());
+        latencyValue->setText(hasSession ? latency : QString());
 
         queueRow->setVisible(full);
         queueDepthValue->setText(QString::number(owner ? owner->queueDepthAverage() : 0.0, 'f', 1));
@@ -408,7 +416,7 @@ private:
     {
         const bool line = style == Mini || style == Compact;
         lineLabel->setVisible(line);
-        for (QWidget *row : { gpuRow, bitrateRow, fpsRow, displayFpsRow, queueRow, pendingRow, packetLossRow, droppedFramesRow, lostFramesRow, enhancementRow })
+        for (QWidget *row : { gpuRow, bitrateRow, fpsRow, displayFpsRow, latencyRow, queueRow, pendingRow, packetLossRow, droppedFramesRow, lostFramesRow, enhancementRow })
             row->setVisible(!line);
         QFont titleFont;
         QFont valueFont;
@@ -454,6 +462,8 @@ private:
     QLabel *fpsValue = nullptr;
     QWidget *displayFpsRow = nullptr;
     QLabel *displayFpsValue = nullptr;
+    QWidget *latencyRow = nullptr;
+    QLabel *latencyValue = nullptr;
     QWidget *queueRow = nullptr;
     QWidget *pendingRow = nullptr;
     QWidget *packetLossRow = nullptr;
@@ -672,6 +682,8 @@ struct DeferredSwapTask
     // The present shows a new image (counted in the display fps): 0 no, 1 a real picture, 2 a
     // frame made by frame generation.
     int new_image = 0;
+    // Decoder stamp of the real picture shown (0: not measured), see recordPictureLatency().
+    qint64 shown_decoded_us = 0;
 };
 
 class DeferredSwapThread final : public QThread
@@ -744,7 +756,8 @@ protected:
                                                task.pending_overflow_waiting,
                                                task.present_interval_us,
                                                task.present_submit_interval_us,
-                                               task.new_image);
+                                               task.new_image,
+                                               task.shown_decoded_us);
             }
 
             {
@@ -2928,6 +2941,25 @@ QString QmlMainWindow::streamFpsText() const
     return text;
 }
 
+QString QmlMainWindow::latencyText() const
+{
+    if (latency_avg_ms < 0.0)
+        return QString();
+    return tr("%1 ms (max %2)").arg(latency_avg_ms, 0, 'f', 0).arg(latency_max_ms, 0, 'f', 0);
+}
+
+void QmlMainWindow::recordPictureLatency(qint64 shown_us, qint64 decoded_us)
+{
+    const qint64 latency_us = shown_us - decoded_us;
+    // No stamp, or one from before a pause or a stall: no measurement.
+    if (decoded_us <= 0 || latency_us < 0 || latency_us > 2000000)
+        return;
+    QMutexLocker locker(&latency_mutex);
+    // Taken every second by the GUI thread; the cap only matters if that thread stalls.
+    if (latency_window_us.size() < 4096)
+        latency_window_us.push_back(static_cast<int>(latency_us));
+}
+
 QString QmlMainWindow::displayFpsText() const
 {
     const int shown = qRound(display_fps);
@@ -3253,7 +3285,7 @@ static DuplicateFrameDetector::Luma frameLuma(const AVFrame *f)
     return luma;
 }
 
-void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us)
+void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us, qint64 decoder_pulled_us)
 {
     const qint64 present_entry_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     if (decoder_delivery_us > 0 && present_entry_us >= decoder_delivery_us) {
@@ -3359,8 +3391,12 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
         }
         const int gap = qMin(dup_frames_since_kept, kMaxFrameGap);
         dup_frames_since_kept = 0;
+        const qint64 decoded_us = decoder_pulled_us > 0 ? decoder_pulled_us
+                                  : decoder_delivery_us > 0 ? decoder_delivery_us : present_entry_us;
         {
             QMutexLocker locker(&direct_frame_mutex);
+            // The waiting frame's own stamp: a frame replaced before it was shown is not measured.
+            direct_pending_decoded_us = decoded_us;
             if (direct_pending_frame) {
                 av_frame_free(&direct_pending_frame);
                 dropped_frames_current.fetchAndAddRelaxed(1);
@@ -5527,6 +5563,7 @@ renderer_backend_ready:
                 av_frame_free(&direct_pending_frame);
                 direct_pending_gap = 1;
                 direct_pending_fg_reset = false;
+                direct_pending_decoded_us = 0;
                 direct_frame_reset.storeRelease(1);
             }
             {
@@ -5768,6 +5805,56 @@ renderer_backend_ready:
         if (status != video_enhancement_status) {
             video_enhancement_status = status;
             emit videoEnhancementStatusChanged();
+        }
+
+        // Decoded -> shown time of the real pictures (see recordPictureLatency): the last second for the
+        // overlay, and a log line every 10 s with what ran (to compare settings).
+        std::vector<int> latency;
+        {
+            QMutexLocker locker(&latency_mutex);
+            latency.swap(latency_window_us);
+        }
+        double next_latency_avg_ms = -1.0;
+        double next_latency_max_ms = -1.0;
+        if (!latency.empty()) {
+            long long latency_sum_us = 0;
+            int latency_peak_us = 0;
+            for (const int v : latency) {
+                latency_sum_us += v;
+                latency_peak_us = qMax(latency_peak_us, v);
+            }
+            next_latency_avg_ms = static_cast<double>(latency_sum_us) / 1000.0 / static_cast<double>(latency.size());
+            next_latency_max_ms = latency_peak_us / 1000.0;
+            if (latency_log_us.size() < 20000)
+                latency_log_us.insert(latency_log_us.end(), latency.begin(), latency.end());
+        }
+        if (qRound(next_latency_avg_ms) != qRound(latency_avg_ms) || qRound(next_latency_max_ms) != qRound(latency_max_ms)) {
+            latency_avg_ms = next_latency_avg_ms;
+            latency_max_ms = next_latency_max_ms;
+            emit fpsChanged();
+        }
+        if (!latency_log_since_us)
+            latency_log_since_us = fps_now_us;
+        if (fps_now_us - latency_log_since_us >= 10000000) {
+            if (!latency_log_us.empty()) {
+                std::vector<int> &v = latency_log_us;
+                std::sort(v.begin(), v.end());
+                long long latency_sum_us = 0;
+                for (const int x : v)
+                    latency_sum_us += x;
+                auto ms_at = [&v](double q) {
+                    const size_t i = static_cast<size_t>(q * static_cast<double>(v.size() - 1) + 0.5);
+                    return QString::number(v[qMin(i, v.size() - 1)] / 1000.0, 'f', 1);
+                };
+                qCInfo(chiakiGui).nospace().noquote()
+                    << "[picture latency] " << QString::number((fps_now_us - latency_log_since_us) / 1e6, 'f', 1) << " s: "
+                    << v.size() << " real pictures, decoded -> shown avg "
+                    << QString::number(static_cast<double>(latency_sum_us) / 1000.0 / static_cast<double>(v.size()), 'f', 1)
+                    << " ms, p50 " << ms_at(0.5) << ", p95 " << ms_at(0.95) << ", max " << ms_at(1.0) << " ms ("
+                    << (video_enhancement_status.isEmpty() ? QStringLiteral("no enhancement") : video_enhancement_status) << ")";
+            }
+            latency_log_us.clear();
+            latency_log_since_us = fps_now_us;
         }
     });
 
@@ -6149,12 +6236,14 @@ bool QmlMainWindow::enqueueDeferredSwap(qint64 submit_begin_us,
                                         bool pending_overflow_waiting,
                                         qint64 present_interval_us,
                                         qint64 present_submit_interval_us,
-                                        int new_image)
+                                        int new_image,
+                                        qint64 shown_decoded_us)
 {
     if (!vulkan_deferred_swap_enabled || !deferred_swap_thread || render_backend != RenderBackend::Vulkan || !placebo_swapchain)
         return false;
     DeferredSwapTask task;
     task.new_image = new_image;
+    task.shown_decoded_us = shown_decoded_us;
     task.submit_request_us = submit_begin_us;
     task.queue_depth_at_submit = queue_depth_at_submit;
     task.depth_limit = depth_limit;
@@ -6176,7 +6265,8 @@ void QmlMainWindow::processDeferredSwapTask(qint64 submit_begin_us,
                                             bool pending_overflow_waiting,
                                             qint64 present_interval_us,
                                             qint64 present_submit_interval_us,
-                                            int new_image)
+                                            int new_image,
+                                            qint64 shown_decoded_us)
 {
     auto snapshot_render_schedule_state = [this]() {
         QMutexLocker locker(&render_schedule_mutex);
@@ -6256,6 +6346,8 @@ void QmlMainWindow::processDeferredSwapTask(qint64 submit_begin_us,
             pl_swapchain_swap_buffers(placebo_swapchain);
 
             const qint64 swap_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+            if (new_image == 1 && shown_decoded_us > 0)
+                recordPictureLatency(swap_us, shown_decoded_us);
             logSwapInterval(swap_us);
             this->last_swap_return_us.storeRelease(swap_us);
             this->last_present_complete_us.storeRelease(swap_us);
@@ -7281,6 +7373,7 @@ void QmlMainWindow::render()
     } else if (bypass_frame_queue && fg_pipe_stage == FgPipeStage::Ready && !fg_pipe_outputs.empty()) {
         // Every frame of the last stream frame is out: the pipelined one's frames follow.
         fg_pending_frames = std::move(fg_pipe_outputs);
+        fg_pending_real_decoded_us = fg_pipe_decoded_us;
         fg_pipe_outputs.clear();
         fg_pipe_stage = FgPipeStage::Idle;
         fg_override_frame = fg_pending_frames.front();
@@ -7298,14 +7391,17 @@ void QmlMainWindow::render()
         bool reset_direct_frame = false;
         int incoming_gap = 1;
         bool incoming_fg_reset = false;
+        qint64 incoming_decoded_us = 0;
         {
             QMutexLocker locker(&direct_frame_mutex);
             std::swap(incoming, direct_pending_frame);
             if (incoming) {
                 incoming_gap = direct_pending_gap;
                 incoming_fg_reset = direct_pending_fg_reset;
+                incoming_decoded_us = direct_pending_decoded_us;
                 direct_pending_gap = 1;
                 direct_pending_fg_reset = false;
+                direct_pending_decoded_us = 0;
             }
             reset_direct_frame = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
         }
@@ -7319,6 +7415,7 @@ void QmlMainWindow::render()
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
             direct_frame_gap = 1;
+            direct_frame_decoded_us = 0;
         }
         bool mapped = false;
         if (incoming) {
@@ -7336,6 +7433,7 @@ void QmlMainWindow::render()
             } else {
                 direct_frame_serial++;
                 direct_frame_gap = qBound(1, incoming_gap, kMaxFrameGap);
+                direct_frame_decoded_us = incoming_decoded_us;
                 mapped = true;
             }
             av_frame_free(&incoming);
@@ -7343,10 +7441,12 @@ void QmlMainWindow::render()
         return mapped;
     };
     if (fg_pipe_take) {
-        if (take_incoming_frame())
+        if (take_incoming_frame()) {
             fg_pipe_stage = FgPipeStage::Taken;
-        else
+            fg_pipe_decoded_us = direct_frame_decoded_us;
+        } else {
             fg_pipe_take = false;
+        }
     }
     if (bypass_frame_queue && fg_override) {
         direct_render_frame = fg_override_frame;
@@ -7599,8 +7699,9 @@ void QmlMainWindow::render()
         logLatencyStats("render_to_start_frame", render_to_start_frame_us - render_entry_us_local);
     // Submit immediately and let the swapchain / render path enforce pacing.
     // `new_image`: the present shows a new stream frame (1) or a generated one (2), not the same
-    // image again (0); only those count in the display fps.
-    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present, int new_image = 0) -> bool {
+    // image again (0); only those count in the display fps. `shown_decoded_us`: the decoder stamp of
+    // the real picture it shows (0: not measured), see recordPictureLatency().
+    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present, int new_image = 0, qint64 shown_decoded_us = 0) -> bool {
         const qint64 submit_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         const int queue_depth_now = snapshotQueueDepth();
         if (detailedVerboseTelemetryEnabled()) {
@@ -7671,7 +7772,8 @@ void QmlMainWindow::render()
                                                             pending_overflow_waiting,
                                                             present_interval_us,
                                                             static_cast<qint64>(qMax(1.0, present_submit_interval_s * 1000000.0) + 0.5),
-                                                            new_image);
+                                                            new_image,
+                                                            shown_decoded_us);
             if (async_enqueued) {
                 async_present_completion = true;
                 present_complete_us = submit_ready_us;
@@ -7753,6 +7855,8 @@ void QmlMainWindow::render()
                     pl_swapchain_swap_buffers(placebo_swapchain);
                 }
                 const qint64 swap_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+                if (new_image == 1 && shown_decoded_us > 0)
+                    recordPictureLatency(swap_us, shown_decoded_us);
                 logSwapInterval(swap_us);
                 this->last_swap_return_us.storeRelease(swap_us);
                 present_complete_us = swap_us;
@@ -8196,7 +8300,9 @@ void QmlMainWindow::render()
         }
     }
     // Output size: a 1.5x or 2x step of the source toward the window (no more than 2x,
-    // the largest step DLSS Performance covers well), or the source size.
+    // the largest step DLSS Performance covers well), or the source size. The 4K target
+    // takes 2160 lines (also at most 2x: 1080p -> 3840x2160) whatever the window; a smaller
+    // window gets that picture downscaled (by frame generation's input copy or the final render).
     auto nr_options_for = [&](const struct pl_frame *src) {
         NeuralRender::Options options;
         options.model = settings->GetNeuralRenderModel();
@@ -8205,11 +8311,17 @@ void QmlMainWindow::render()
         if (!settings->GetNeuralRenderUpscale() || !src)
             return options;
         const float src_w = fabsf(pl_rect_w(src->crop)), src_h = fabsf(pl_rect_h(src->crop));
-        const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
         if (src_w < 1.0f || src_h < 1.0f)
             return options;
-        const float ratio = qMin(dst_w / src_w, dst_h / src_h);
-        const float scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
+        float scale = 1.0f;
+        if (settings->GetNeuralRenderUpscaleTarget() == 1) {
+            const float to_4k = qMin(2160.0f / src_h, 2.0f);
+            scale = to_4k >= 1.05f ? to_4k : 1.0f;
+        } else {
+            const float dst_w = fabsf(pl_rect_w(target_frame.crop)), dst_h = fabsf(pl_rect_h(target_frame.crop));
+            const float ratio = qMin(dst_w / src_w, dst_h / src_h);
+            scale = ratio >= 1.9f ? 2.0f : ratio >= 1.4f ? 1.5f : 1.0f;
+        }
         if (scale > 1.0f) {
             // Even sizes keep the chroma-free RGB textures and the upscaler's ratios exact.
             options.out_width = static_cast<int>(lroundf(src_w * scale / 2.0f)) * 2;
@@ -8484,6 +8596,7 @@ void QmlMainWindow::render()
                 }
                 direct_render_frame = fg_outputs.front();
                 fg_pending_frames.assign(fg_outputs.begin() + 1, fg_outputs.end());
+                fg_pending_real_decoded_us = direct_frame_decoded_us;
                 if (fg_active_multiplier == 1 || fg_logged_setting != settings->GetFrameGenMultiplier()) {
                     fg_logged_setting = settings->GetFrameGenMultiplier();
                     qCInfo(chiakiGui).nospace() << "Frame generation active: " << FrameGen::backendName(backend_choice)
@@ -8619,18 +8732,24 @@ void QmlMainWindow::render()
     // generated from it (fg_override); the frame queue a frame it had not shown yet, or a blend
     // of several. Redraws of the image already on screen (UI, stats overlay) do not count.
     int new_image = 0;
+    // Decoder stamp of the real picture this present shows, for the decoded -> shown time.
+    qint64 shown_decoded_us = 0;
     if (bypass_frame_queue) {
         // Frames left for this picture: the one shown now was made by frame generation (the real
         // picture comes last in its batch, so once none are left it was the real one).
         if (fg_override || direct_frame_fresh)
             new_image = fg_pending_frames.empty() ? 1 : 2;
+        // A frame frame generation left over is the real one of its batch (fg_pending_real_decoded_us);
+        // a fresh stream frame shown now is direct_frame (without frame generation, or with one frame).
+        if (new_image == 1)
+            shown_decoded_us = fg_override ? fg_pending_real_decoded_us : direct_frame_decoded_us;
     } else if (queue_image_mixed) {
         new_image = 1;
     } else if (frame_mix.num_frames > 0 && queue_image_signature != display_count_signature) {
         display_count_signature = queue_image_signature;
         new_image = 1;
     }
-    close_started_frame(true, new_image);
+    close_started_frame(true, new_image, shown_decoded_us);
 
     if (startup_video_visible_refresh_pending.loadAcquire() != 0) {
         loading_transition_complete.storeRelease(1);

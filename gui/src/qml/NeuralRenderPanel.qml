@@ -543,11 +543,10 @@ Rectangle {
             selected: panel.tab === 0 && panel.currentRow === 11
             onActivated: panel.select(rowUpscale)
             label: qsTr("DLSS upscaling")
-            kind: 2
-            checkText: qsTr("Upscale to the window (1080p → 4K)")
-            checked: Chiaki.settings.neuralRenderUpscale
-            onStep: Chiaki.settings.neuralRenderUpscale = !Chiaki.settings.neuralRenderUpscale
-            onSetTo: (v) => Chiaki.settings.neuralRenderUpscale = v > 0.5
+            model: [qsTr("Off"), qsTr("To the window"), qsTr("4K (any window)")]
+            index: Chiaki.settings.neuralRenderUpscaleMode
+            onStep: (dir) => Chiaki.settings.neuralRenderUpscaleMode = Math.max(0, Math.min(2, Chiaki.settings.neuralRenderUpscaleMode + dir))
+            onPick: (i) => Chiaki.settings.neuralRenderUpscaleMode = i
         }
         PanelRow {
             id: rowSharpness

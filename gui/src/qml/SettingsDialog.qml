@@ -1122,11 +1122,11 @@ DialogView {
                         Layout.preferredWidth: 400
                         visible: Chiaki.settings.neuralRenderSupported
                         enabled: Chiaki.settings.neuralRender
-                        model: [qsTr("Off (stream resolution)"), qsTr("Up to 2x toward the window")]
-                        currentIndex: Chiaki.settings.neuralRenderUpscale ? 1 : 0
-                        onActivated: index => Chiaki.settings.neuralRenderUpscale = index === 1
+                        model: [qsTr("Off (stream resolution)"), qsTr("Up to 2x toward the window"), qsTr("4K (1080p to 2160p, any window)")]
+                        currentIndex: Chiaki.settings.neuralRenderUpscaleMode
+                        onActivated: index => Chiaki.settings.neuralRenderUpscaleMode = index
                         ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Upscales after neural rendering in 1.5x or 2x steps toward the window size (1080p on a 4K screen: 2x, DLSS Performance). RTX VSR is skipped while it upscales.\nNVIDIA: DLSS Super Resolution, needs nvngx_dlss.dll next to chiaki.exe (bundled).\nAMD: NeuralHub's upscaler, FSR 4 by the driver by default; \"[Upscaling]\" \"Provider=DLSS-SR\" in neuralhub.ini runs NeuralHub's DLSS Super Resolution port instead (sharper, about 3 ms more on an RX 9070 XT).")
+                        ToolTip.text: qsTr("Upscales after neural rendering in 1.5x or 2x steps toward the window size (1080p on a 4K screen: 2x, DLSS Performance). 4K always upscales to 2160 lines (at most 2x) and a smaller window gets that picture downscaled: sharper on a 1080p or 1440p screen, about 2-3 ms more GPU time per picture on an RTX 3080. RTX VSR is skipped while it upscales.\nNVIDIA: DLSS Super Resolution, needs nvngx_dlss.dll next to chiaki.exe (bundled).\nAMD: NeuralHub's upscaler, FSR 4 by the driver by default; \"[Upscaling]\" \"Provider=DLSS-SR\" in neuralhub.ini runs NeuralHub's DLSS Super Resolution port instead (sharper, about 3 ms more on an RX 9070 XT).")
                     }
 
                     Label {

@@ -43,7 +43,8 @@ DialogView {
             }
 
             Label {
-                text: Chiaki.session ? qsTr("stream %1 fps\ndisplay %2 fps").arg(Chiaki.window.streamFpsText).arg(Chiaki.window.displayFpsText) : ""
+                text: Chiaki.session ? qsTr("stream %1 fps\ndisplay %2 fps").arg(Chiaki.window.streamFpsText).arg(Chiaki.window.displayFpsText)
+                                       + (Chiaki.window.latencyText.length > 0 ? qsTr("\nlatency %1").arg(Chiaki.window.latencyText) : "") : ""
                 color: "#ffe082"
             }
 
@@ -126,9 +127,10 @@ DialogView {
                 Layout.preferredWidth: 600
                 visible: Chiaki.settings.neuralRenderSupported
                 enabled: Chiaki.settings.neuralRender
-                model: [qsTr("Off (stream resolution)"), qsTr("Up to 2x toward the window (1080p to 4K: DLSS Performance)")]
-                currentIndex: Chiaki.settings.neuralRenderUpscale ? 1 : 0
-                onActivated: index => Chiaki.settings.neuralRenderUpscale = index === 1
+                model: [qsTr("Off (stream resolution)"), qsTr("Up to 2x toward the window (1080p to 4K: DLSS Performance)"),
+                    qsTr("4K whatever the window (1080p to 2160p, downscaled to a smaller window)")]
+                currentIndex: Chiaki.settings.neuralRenderUpscaleMode
+                onActivated: index => Chiaki.settings.neuralRenderUpscaleMode = index
             }
 
             Label {

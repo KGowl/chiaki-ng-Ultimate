@@ -87,6 +87,9 @@ class QmlMainWindow : public QWindow
     // the display shows ("120 (30 real + 90 FG)").
     Q_PROPERTY(QString streamFpsText READ streamFpsText NOTIFY fpsChanged)
     Q_PROPERTY(QString displayFpsText READ displayFpsText NOTIFY fpsChanged)
+    // Decoded -> shown time of the real pictures over the last second ("38 ms (max 45)"), empty
+    // without samples (no stream, or not Direct Mapping).
+    Q_PROPERTY(QString latencyText READ latencyText NOTIFY fpsChanged)
     Q_PROPERTY(bool keepVideo READ keepVideo WRITE setKeepVideo NOTIFY keepVideoChanged)
     Q_PROPERTY(bool loadingTransitionComplete READ loadingTransitionComplete NOTIFY loadingTransitionCompleteChanged)
     Q_PROPERTY(VideoMode videoMode READ videoMode WRITE setVideoMode NOTIFY videoModeChanged)
@@ -146,6 +149,8 @@ public:
     double generatedFps() const { return generated_fps; }
     QString streamFpsText() const;
     QString displayFpsText() const;
+    QString latencyText() const;
+    double latencyAvgMs() const { return latency_avg_ms; }
     void increaseDroppedFrames();
 
     bool directStream() const;
@@ -212,7 +217,8 @@ public slots:
     void updateVSync();
     void updateVulkanDeferredSwap();
     void show();
-    void presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us = 0);
+    // decoder_pulled_us: when the decoder's frame was taken (start of the decoded -> shown time).
+    void presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us = 0, qint64 decoder_pulled_us = 0);
 
     AVBufferRef *vulkanHwDeviceCtx();
 
@@ -272,7 +278,8 @@ private:
                              bool pending_overflow_waiting,
                              qint64 present_interval_us,
                              qint64 present_submit_interval_us,
-                             int new_image);
+                             int new_image,
+                             qint64 shown_decoded_us);
     void finalizeDeferredPresentIfIdle();
     void processDeferredSwapTask(qint64 submit_begin_us,
                                  int queue_depth_at_submit,
@@ -281,7 +288,8 @@ private:
                                  bool pending_overflow_waiting,
                                  qint64 present_interval_us,
                                  qint64 present_submit_interval_us,
-                                 int new_image);
+                                 int new_image,
+                                 qint64 shown_decoded_us);
     void drainDeferredSwaps();
     void setStreamMaxFPS(unsigned int max_fps);
     void createSwapchain();
@@ -353,9 +361,16 @@ private:
     static constexpr int kMaxFrameGap = 8;
     int direct_pending_gap = 1;
     bool direct_pending_fg_reset = false;
+    // When the decoder handed the waiting frame over (monotonic us), for the decoded -> shown time.
+    qint64 direct_pending_decoded_us = 0;
     struct pl_frame direct_frame = {};
     // Render thread: direct_pending_gap of the frame mapped in direct_frame.
     int direct_frame_gap = 1;
+    // Render thread: direct_pending_decoded_us of the frame in direct_frame, of the stream frame the
+    // pipeline took (fg_pipe_*), and of the real picture at the end of fg_pending_frames.
+    qint64 direct_frame_decoded_us = 0;
+    qint64 fg_pipe_decoded_us = 0;
+    qint64 fg_pending_real_decoded_us = 0;
     QAtomicInteger<int> direct_frame_reset = 0;
     uint64_t ts_start = 0;
     double queue_pts_origin = -1.0;
@@ -405,6 +420,18 @@ private:
     double picture_fps = -1.0;
     double generated_fps = 0.0;
     qint64 fps_sample_us = 0;
+    // Decoded -> shown time of each real picture (Direct Mapping): from the decoder handing the frame
+    // over to the swap that presents it, so DLSS 5, DLSS SR, frame generation (its compute and the
+    // generated frames shown before the real one) and the pacing are in it; the network, the PS5's
+    // encoder and decoding are not. Recorded by the render or the deferred swap thread, read every
+    // second by the GUI thread (overlay) and logged every 10 s.
+    void recordPictureLatency(qint64 shown_us, qint64 decoded_us);
+    QMutex latency_mutex;
+    std::vector<int> latency_window_us;
+    std::vector<int> latency_log_us;
+    qint64 latency_log_since_us = 0;
+    double latency_avg_ms = -1.0;
+    double latency_max_ms = -1.0;
     // Written by the render thread, shown in the stats overlay.
     // Configured RTX VSR mode (0 = off) and its state: 1 active, 2 idle, 3 mode unsupported.
     QAtomicInteger<int> vsr_status_quality = 0;
