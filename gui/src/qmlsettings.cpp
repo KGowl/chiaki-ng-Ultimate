@@ -1133,10 +1133,12 @@ void QmlSettings::setNeuralRenderUpscaleMode(int mode)
     mode = qBound(0, mode, 2);
     if (mode == neuralRenderUpscaleMode())
         return;
-    settings->SetNeuralRenderUpscale(mode > 0);
-    // Off keeps the last target, so switching back on returns to it.
+    // Off keeps the last target, so switching back on returns to it. The target goes first: the render
+    // thread reads both again after each write, and on with the old target would set DLSS 5 up for a
+    // size it is about to leave (a warm-up of a few seconds for nothing).
     if (mode > 0)
         settings->SetNeuralRenderUpscaleTarget(mode == 2 ? 1 : 0);
+    settings->SetNeuralRenderUpscale(mode > 0);
     emit neuralRenderChanged();
 }
 

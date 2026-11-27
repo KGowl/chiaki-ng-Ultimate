@@ -305,7 +305,17 @@ private:
     // D3D12 side is done (all of them when `drain`), moving the stage on.
     void fgPipeAdvance(bool drain);
     void fgPipeCancel();
+    // Drops the frames frame generation left to present and a pipelined stream frame, and its active
+    // multiplier (render thread).
+    void fgDropFrames();
     static bool fgPipeEnabled();
+    // Render thread: the window's video area as the sizes that are expensive to change see it, see
+    // the definition.
+    QSize settledVideoSize(int width, int height, qint64 now_us);
+    // Render thread: reads render_settings again when the settings changed.
+    void refreshRenderSettings();
+    // The window's native handle for the render thread (the GUI thread's cached one).
+    void *renderWindowHandle();
     void handleVulkanDeviceLost(const QString &reason);
     void handleVulkanRendererFallback(const QString &title, const QString &message, const QString &fallback_reason);
     void applyPendingFrame();
@@ -461,6 +471,12 @@ private:
     // thread would read it.
     std::atomic<double> screen_refresh_hz{60.0};
     std::atomic<double> screen_dpr{1.0};
+    // The window itself as the GUI thread last saw it (QWindow belongs to the GUI thread): its native
+    // handle (0 until the platform window exists), whether it can be drawn to (exposed, not empty), and
+    // its size in device-independent pixels (width << 32 | height, one value so both change together).
+    std::atomic<quintptr> window_native_id{0};
+    std::atomic<bool> window_renderable{false};
+    std::atomic<quint64> window_logical_size{0};
     void cacheScreenState();
     QAtomicInteger<int> nr_status_out_h = 0; // output height when neural rendering upscales, else 0
     QAtomicInteger<int> nr_status_hdr = 0;
@@ -476,6 +492,40 @@ private:
     uint32_t nr_tuning_rev = 0;
     int nr_passes = 1;
     std::array<NeuralRenderTuning, NeuralRenderTuning::kMaxPasses> nr_tuning = {};
+    // Render thread: the settings render() reads for every present or picture, as last read. Settings
+    // is QSettings, which on Windows is the registry with no cache (an open, a read and a close for every
+    // Get): they are read again only when Settings::GetRenderSettingsRevision() changes, which every
+    // setter of one of them bumps after its write.
+    struct RenderSettings
+    {
+        uint32_t rev = 0; // 0: not read yet (the settings' revision starts at 1)
+        PlaceboUpscaler placebo_upscaler = PlaceboUpscaler::None;
+        int display_target_trc = 0;
+        int display_target_prim = 0;
+        int display_target_peak = 0;
+        int display_target_contrast = 0;
+        bool ambient_border = false;
+        int rcas_strength = 0;
+        bool neural_render = false;
+        int neural_render_model = 0;
+        bool neural_render_upscale = false;
+        int neural_render_upscale_target = 0;
+        int rtx_vsr_quality = 0;
+        int frame_gen_backend = 0;
+        int frame_gen_multiplier = 2;
+        bool frame_gen_flow_high_quality = false;
+        int frame_gen_dlss_motion = 1;
+        int frame_gen_cleanup = 2;
+        int frame_gen_vfg_mode = 2;
+    };
+    RenderSettings render_settings;
+    // Render thread, settledVideoSize(): the size in use (0: none yet), and the video area last seen and
+    // since when.
+    int video_size_settled_w = 0;
+    int video_size_settled_h = 0;
+    int video_size_seen_w = 0;
+    int video_size_seen_h = 0;
+    qint64 video_size_seen_since_us = 0;
     // Game pictures, not stream frames, go to frame generation (GUI thread, presentFrame): a
     // stream frame that repeats the last picture (a game under 60 fps) is dropped while frame
     // generation runs, and the next new picture carries the stream frames it stands for.
@@ -659,6 +709,8 @@ private:
     QOpenGLFramebufferObject *quick_fbo = {};
     VkSemaphore quick_sem = VK_NULL_HANDLE;
     uint64_t quick_sem_value = 0;
+    // Render thread: pl_vulkan_hold_ex failures on quick_tex (for a log that does not repeat every frame).
+    quint64 quick_hold_failures = 0;
     VkImage quick_vk_image = VK_NULL_HANDLE;
     bool quick_frame = false;
     QAtomicInteger<int> quick_need_sync = 0;
