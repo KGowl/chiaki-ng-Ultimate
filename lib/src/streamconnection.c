@@ -94,9 +94,13 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnecti
 	stream_connection->audio_receiver = NULL;
 	stream_connection->haptics_receiver = NULL;
 
-	err = chiaki_mutex_init(&stream_connection->feedback_sender_mutex, false);
+	err = chiaki_mutex_init(&stream_connection->video_receiver_mutex, false);
 	if(err != CHIAKI_ERR_SUCCESS)
 		goto error_packet_stats;
+
+	err = chiaki_mutex_init(&stream_connection->feedback_sender_mutex, false);
+	if(err != CHIAKI_ERR_SUCCESS)
+		goto error_video_receiver_mutex;
 
 	stream_connection->state = STATE_IDLE;
 	stream_connection->state_finished = false;
@@ -107,6 +111,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnecti
 
 	return CHIAKI_ERR_SUCCESS;
 
+error_video_receiver_mutex:
+	chiaki_mutex_fini(&stream_connection->video_receiver_mutex);
 error_packet_stats:
 	chiaki_packet_stats_fini(&stream_connection->packet_stats);
 error_state_cond:
@@ -131,9 +137,55 @@ CHIAKI_EXPORT void chiaki_stream_connection_fini(ChiakiStreamConnection *stream_
 	chiaki_packet_stats_fini(&stream_connection->packet_stats);
 
 	chiaki_mutex_fini(&stream_connection->feedback_sender_mutex);
+	chiaki_mutex_fini(&stream_connection->video_receiver_mutex);
 
 	chiaki_cond_fini(&stream_connection->state_cond);
 	chiaki_mutex_fini(&stream_connection->state_mutex);
+}
+
+CHIAKI_EXPORT void chiaki_stream_connection_reset_for_retry(ChiakiStreamConnection *stream_connection)
+{
+	chiaki_mutex_lock(&stream_connection->state_mutex);
+	stream_connection->state = STATE_IDLE;
+	stream_connection->state_finished = false;
+	stream_connection->state_failed = false;
+	stream_connection->should_stop = false;
+	stream_connection->remote_disconnected = false;
+	free(stream_connection->remote_disconnect_reason);
+	stream_connection->remote_disconnect_reason = NULL;
+	free(stream_connection->streaminfo_early_buf);
+	stream_connection->streaminfo_early_buf = NULL;
+	stream_connection->streaminfo_early_buf_size = 0;
+	// Keys of the last bang (their key threads too): the next bang derives new ones and expects none.
+	chiaki_gkcrypt_free(stream_connection->gkcrypt_remote);
+	stream_connection->gkcrypt_remote = NULL;
+	chiaki_gkcrypt_free(stream_connection->gkcrypt_local);
+	stream_connection->gkcrypt_local = NULL;
+	free(stream_connection->ecdh_secret);
+	stream_connection->ecdh_secret = NULL;
+	stream_connection->player_index = 0;
+	memset(stream_connection->led_state, 0, sizeof(stream_connection->led_state));
+	stream_connection->haptic_intensity = Strong;
+	stream_connection->trigger_intensity = Strong;
+	chiaki_mutex_unlock(&stream_connection->state_mutex);
+}
+
+CHIAKI_EXPORT int32_t chiaki_stream_connection_get_frames_lost_total(ChiakiStreamConnection *stream_connection)
+{
+	int32_t total = 0;
+	chiaki_mutex_lock(&stream_connection->video_receiver_mutex);
+	if(stream_connection->video_receiver)
+		total = chiaki_video_receiver_get_frames_lost_total(stream_connection->video_receiver);
+	chiaki_mutex_unlock(&stream_connection->video_receiver_mutex);
+	return total;
+}
+
+CHIAKI_EXPORT void chiaki_stream_connection_set_video_waiting_for_idr(ChiakiStreamConnection *stream_connection, bool waiting_for_idr)
+{
+	chiaki_mutex_lock(&stream_connection->video_receiver_mutex);
+	if(stream_connection->video_receiver)
+		chiaki_video_receiver_set_waiting_for_idr(stream_connection->video_receiver, waiting_for_idr);
+	chiaki_mutex_unlock(&stream_connection->video_receiver_mutex);
 }
 
 static bool state_finished_cond_check(void *user)
@@ -198,7 +250,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 		goto err_audio_receiver;
 	}
 
+	chiaki_mutex_lock(&stream_connection->video_receiver_mutex);
 	stream_connection->video_receiver = chiaki_video_receiver_new(session, &stream_connection->packet_stats);
+	chiaki_mutex_unlock(&stream_connection->video_receiver_mutex);
 	if(!stream_connection->video_receiver)
 	{
 		CHIAKI_LOGE(session->log, "StreamConnection failed to initialize Video Receiver");
@@ -228,7 +282,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 
 	err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
-	CHECK_STOP(close_takion);
+	// Congestion control runs from here on: a stop must end it too, before takion closes its socket.
+	CHECK_STOP(err_congestion_control);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
 		CHIAKI_LOGE(session->log, "StreamConnection Takion connect failed");
@@ -363,8 +418,10 @@ close_takion:
 
 err_video_receiver:
 	chiaki_mutex_lock(&stream_connection->state_mutex);
+	chiaki_mutex_lock(&stream_connection->video_receiver_mutex);
 	chiaki_video_receiver_free(stream_connection->video_receiver);
 	stream_connection->video_receiver = NULL;
+	chiaki_mutex_unlock(&stream_connection->video_receiver_mutex);
 	chiaki_mutex_unlock(&stream_connection->state_mutex);
 
 err_haptics_receiver:

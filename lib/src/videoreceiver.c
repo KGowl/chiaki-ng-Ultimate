@@ -229,7 +229,9 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 				event.video_fec_failure.idr_request_sent = idr_request_sent;
 				chiaki_session_send_event(video_receiver->session, &event);
 			}
-		int32_t lost = video_receiver->frame_index_cur - next_frame_expected + 1;
+		// Frame indices are 16 bit: count across the wrap (65534 -> 1 is 4 frames, not -65532).
+		ChiakiSeqNum16 lost_span = (ChiakiSeqNum16)((ChiakiSeqNum16)video_receiver->frame_index_cur - next_frame_expected);
+		int32_t lost = lost_span < 0x8000 ? (int32_t)lost_span + 1 : 1;
 		chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
 		video_receiver->frames_lost += lost;
 		video_receiver->frames_lost_total += lost;

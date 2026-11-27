@@ -39,6 +39,9 @@
 // VERY similar to SCTP, see RFC 4960
 
 #define TAKION_A_RWND 0x19000
+// The socket receive buffer, separate from the a_rwnd advertised in the handshake: a 1080p frame is over
+// 100 KB and arrives as one burst, so any short stall of the receive thread overflowed an a_rwnd sized buffer.
+#define TAKION_SOCKET_RCVBUF_SIZE (8 * 1024 * 1024)
 #define TAKION_OUTBOUND_STREAMS 0x64
 #define TAKION_INBOUND_STREAMS 0x64
 
@@ -189,6 +192,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
 static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion);
 static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uint8_t *buf, size_t buf_size);
 static ChiakiErrorCode takion_read_extra_sock_messages(ChiakiTakion *takion);
+static ChiakiErrorCode takion_set_rcvbuf(ChiakiTakion *takion);
 
 // mingw-w64's qos2.h uses QOS_FLOWID before declaring it, so qWAVE is only
 // used with the Windows SDK (MSVC / clang-cl builds).
@@ -320,14 +324,10 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 			CHIAKI_LOGE(takion->log, "Takion had problem reading extra messages from socket using PSN Connection with error: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
 			goto error_sock;
 		}
-		const int rcvbuf_val = takion->a_rwnd;
-		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
-		if(r < 0)
-		{
-			CHIAKI_LOGE(takion->log, "Takion failed to setsockopt SO_RCVBUF: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
-			ret = CHIAKI_ERR_NETWORK;
+		ret = takion_set_rcvbuf(takion);
+		if(ret != CHIAKI_ERR_SUCCESS)
 			goto error_sock;
-		}
+		int r = 0;
 
 #if defined(__APPLE__) && TARGET_OS_OSX
 		SInt32 majorVersion;
@@ -408,14 +408,10 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 			ret = CHIAKI_ERR_NETWORK;
 			goto error_pipe;
 		}
-		const int rcvbuf_val = takion->a_rwnd;
-		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
-		if(r < 0)
-		{
-			CHIAKI_LOGE(takion->log, "Takion failed to setsockopt SO_RCVBUF: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
-			ret = CHIAKI_ERR_NETWORK;
+		ret = takion_set_rcvbuf(takion);
+		if(ret != CHIAKI_ERR_SUCCESS)
 			goto error_sock;
-		}
+		int r = 0;
 		if(info->ip_dontfrag)
 		{
 #if defined(__APPLE__) && TARGET_OS_OSX
@@ -528,6 +524,37 @@ error_seq_num_local_mutex:
 error_gkcrypt_local_mutex:
 	chiaki_mutex_fini(&takion->gkcrypt_local_mutex);
 	return ret;
+}
+
+static ChiakiErrorCode takion_set_rcvbuf(ChiakiTakion *takion)
+{
+	// Ask for TAKION_SOCKET_RCVBUF_SIZE, halving while the OS refuses (some cap SO_RCVBUF with an error), never
+	// below a_rwnd, the size this always used. Linux and Windows cap silently: getsockopt() says what we got.
+	int size = TAKION_SOCKET_RCVBUF_SIZE;
+	const int min_size = (int)takion->a_rwnd;
+	int r;
+	int actual = 0;
+	socklen_t actual_len = sizeof(actual);
+	while(true)
+	{
+		r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&size, sizeof(size));
+		if(r == 0 || size <= min_size)
+			break;
+		size /= 2;
+		if(size < min_size)
+			size = min_size;
+	}
+	if(r < 0)
+	{
+		CHIAKI_LOGE(takion->log, "Takion failed to setsockopt SO_RCVBUF: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
+		return CHIAKI_ERR_NETWORK;
+	}
+	if(getsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (CHIAKI_SOCKET_BUF_TYPE)&actual, &actual_len) == 0)
+		CHIAKI_LOGI(takion->log, "Takion socket receive buffer: %d bytes (requested %d)", actual, size);
+	else
+		CHIAKI_LOGW(takion->log, "Takion set the socket receive buffer to %d bytes, reading it back failed: " CHIAKI_SOCKET_ERROR_FMT,
+			size, CHIAKI_SOCKET_ERROR_VALUE);
+	return CHIAKI_ERR_SUCCESS;
 }
 
 CHIAKI_EXPORT void chiaki_takion_close(ChiakiTakion *takion)
@@ -1025,13 +1052,63 @@ static void takion_data_drop(uint64_t seq_num, void *elem_user, void *cb_user)
 	free(entry);
 }
 
+#define TAKION_AV_QUEUE_STATS_LOG_INTERVAL_US 1000000
+
+/**
+ * One line for everything the video reorder queue gave up on since the last one, at most once per
+ * TAKION_AV_QUEUE_STATS_LOG_INTERVAL_US unless force: a loss burst must not add a disk write per packet
+ * on the receive thread.
+ */
+static void takion_av_queue_stats_log(ChiakiTakion *takion, int64_t now, bool force)
+{
+	if(!takion->video_queue_stats.dropped && !takion->video_queue_stats.timeout_skips && !takion->video_queue_stats.evicted)
+		return;
+	if(!force && now - takion->video_queue_stats.last_log_us < TAKION_AV_QUEUE_STATS_LOG_INTERVAL_US)
+		return;
+	CHIAKI_LOGD(takion->log, "Takion video reorder: %llu reorder timeout(s) skipped %llu missing packet(s), "
+		"%llu packet(s) delivered early on queue overflow, %llu late or duplicate packet(s) dropped (last %#llx)",
+		(unsigned long long)takion->video_queue_stats.timeout_skips,
+		(unsigned long long)takion->video_queue_stats.timeout_skipped_packets,
+		(unsigned long long)takion->video_queue_stats.evicted,
+		(unsigned long long)takion->video_queue_stats.dropped,
+		(unsigned long long)takion->video_queue_stats.dropped_last_index);
+	memset(&takion->video_queue_stats, 0, sizeof(takion->video_queue_stats));
+	takion->video_queue_stats.last_log_us = now;
+}
+
 static void takion_av_drop(uint64_t seq_num, void *elem_user, void *cb_user)
 {
 	ChiakiTakion *takion = cb_user;
-	CHIAKI_LOGD(takion->log, "Takion dropping AV packet with index %#llx", (unsigned long long)seq_num);
+	takion->video_queue_stats.dropped++;
+	takion->video_queue_stats.dropped_last_index = seq_num;
 	TakionAVPacketEntry *entry = elem_user;
 	free(entry->buf);
 	free(entry);
+}
+
+static void takion_av_dispatch(ChiakiTakion *takion, TakionAVPacketEntry *entry)
+{
+	if(takion->cb)
+	{
+		ChiakiTakionEvent event = { 0 };
+		event.type = CHIAKI_TAKION_EVENT_TYPE_AV;
+		event.av = &entry->packet;
+		takion->cb(&event, takion->cb_user);
+	}
+	free(entry->buf);
+	free(entry);
+}
+
+/**
+ * The video queue is full while its head is still missing: what was received behind the head is delivered
+ * in order now (the missing packets in between count as lost) instead of being thrown away.
+ */
+static void takion_av_evict(uint64_t seq_num, void *elem_user, void *cb_user)
+{
+	ChiakiTakion *takion = (ChiakiTakion *)cb_user;
+	(void)seq_num;
+	takion->video_queue_stats.evicted++;
+	takion_av_dispatch(takion, (TakionAVPacketEntry *)elem_user);
 }
 
 /**
@@ -1054,15 +1131,7 @@ static void takion_av_queue_flush_with_timeout(ChiakiTakion *takion, ChiakiReord
 		while(chiaki_reorder_queue_pull(queue, &seq_num, (void **)&entry))
 		{
 			made_progress = true;
-			if(takion->cb)
-			{
-				ChiakiTakionEvent event = { 0 };
-				event.type = CHIAKI_TAKION_EVENT_TYPE_AV;
-				event.av = &entry->packet;
-				takion->cb(&event, takion->cb_user);
-			}
-			free(entry->buf);
-			free(entry);
+			takion_av_dispatch(takion, entry);
 		}
 
 		if(made_progress)
@@ -1113,14 +1182,15 @@ static void takion_av_queue_flush_with_timeout(ChiakiTakion *takion, ChiakiReord
 		if(skipped >= queue->count)
 			break;
 
-		CHIAKI_LOGD(takion->log, "Takion AV reorder timeout: skipping %llu missing packet(s) before %#llx",
-			(unsigned long long)skipped,
-			(unsigned long long)queue->seq_num_add(queue->begin, skipped));
+		takion->video_queue_stats.timeout_skips++;
+		takion->video_queue_stats.timeout_skipped_packets += skipped;
 		queue->begin = queue->seq_num_add(queue->begin, skipped);
 		queue->count -= skipped;
 		*head_wait_start_us = 0;
 		made_progress = true;
 	}
+
+	takion_av_queue_stats_log(takion, now, false);
 }
 
 static void takion_av_queues_flush_with_timeout(ChiakiTakion *takion)
@@ -1166,6 +1236,7 @@ static void *takion_thread_func(void *user)
 	takion->video_queue_initialized = false;
 	takion->video_queue_head_wait_start_us = 0;
 	takion->video_queue_head_wait_seq_num = 0;
+	memset(&takion->video_queue_stats, 0, sizeof(takion->video_queue_stats));
 
 	uint32_t seq_num_remote_initial;
 	if(takion_handshake(takion, &seq_num_remote_initial) != CHIAKI_ERR_SUCCESS)
@@ -1271,6 +1342,8 @@ static void *takion_thread_func(void *user)
 	chiaki_mutex_unlock(&takion->send_buffer_active_mutex);
 	chiaki_takion_send_buffer_fini(&takion->send_buffer);
 
+	// The last summary, before the queue's leftovers are dropped on fini (those are not losses).
+	takion_av_queue_stats_log(takion, (int64_t)chiaki_time_now_monotonic_us(), true);
 	if(takion->video_queue_initialized)
 	{
 		chiaki_reorder_queue_fini(&takion->video_queue);
@@ -1804,6 +1877,7 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
 		}
 		chiaki_reorder_queue_set_drop_strategy(queue, CHIAKI_REORDER_QUEUE_DROP_STRATEGY_BEGIN);
 		chiaki_reorder_queue_set_drop_cb(queue, takion_av_drop, takion);
+		chiaki_reorder_queue_set_evict_cb(queue, takion_av_evict, takion);
 		*initialized = true;
 		*head_wait = 0;
 		*head_wait_seq_num = queue_begin;

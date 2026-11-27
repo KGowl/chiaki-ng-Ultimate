@@ -25,6 +25,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_reorder_queue_init(ChiakiReorderQueue *queu
 	queue->drop_strategy = CHIAKI_REORDER_QUEUE_DROP_STRATEGY_END;
 	queue->drop_cb = NULL;
 	queue->drop_cb_user = NULL;
+	queue->evict_cb = NULL;
+	queue->evict_cb_user = NULL;
 	queue->queue = calloc(1 << size_exp, sizeof(ChiakiReorderQueueEntry));
 	if(!queue->queue)
 		return CHIAKI_ERR_MEMORY;
@@ -34,7 +36,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_reorder_queue_init(ChiakiReorderQueue *queu
 #define REORDER_QUEUE_INIT(bits) \
 static bool seq_num_##bits##_gt(uint64_t a, uint64_t b) { return chiaki_seq_num_##bits##_gt((ChiakiSeqNum##bits)a, (ChiakiSeqNum##bits)b); } \
 static bool seq_num_##bits##_lt(uint64_t a, uint64_t b) { return chiaki_seq_num_##bits##_lt((ChiakiSeqNum##bits)a, (ChiakiSeqNum##bits)b); } \
-static uint64_t seq_num_##bits##_add(uint64_t a, uint64_t b) { return (uint64_t)((ChiakiSeqNum##bits)a + (ChiakiSeqNum##bits)b); } \
+/* the sum is cast back: two uint16_t add as int, so 0xffff + 1 stayed 0x10000 and the == in ge()/le() broke at the wrap */ \
+static uint64_t seq_num_##bits##_add(uint64_t a, uint64_t b) { return (uint64_t)(ChiakiSeqNum##bits)((ChiakiSeqNum##bits)a + (ChiakiSeqNum##bits)b); } \
 \
 CHIAKI_EXPORT ChiakiErrorCode chiaki_reorder_queue_init_##bits(ChiakiReorderQueue *queue, size_t size_exp, ChiakiSeqNum##bits seq_num_start) \
 { \
@@ -101,16 +104,25 @@ CHIAKI_EXPORT void chiaki_reorder_queue_push(ChiakiReorderQueue *queue, uint64_t
 		if(queue->drop_strategy == CHIAKI_REORDER_QUEUE_DROP_STRATEGY_END)
 			goto drop_it;
 
-		// drop first until empty or enough space
+		// remove first until empty or enough space: received elements go to evict_cb in order if set, else they are dropped
 		while(queue->count > 0 && lt(total_end, new_end))
 		{
 			ChiakiReorderQueueEntry *entry = &queue->queue[idx(queue->begin)];
-			if(entry->set && queue->drop_cb)
-				queue->drop_cb(queue->begin, entry->user, queue->drop_cb_user);
+			uint64_t removed_seq_num = queue->begin;
+			bool removed_set = entry->set;
+			void *removed_user = entry->user;
+			entry->set = false;
 			queue->begin = add(queue->begin, 1);
 			queue->count--;
 			free_elems = QUEUE_SIZE - queue->count;
 			total_end = add(end, free_elems);
+			if(removed_set)
+			{
+				if(queue->evict_cb)
+					queue->evict_cb(removed_seq_num, removed_user, queue->evict_cb_user);
+				else if(queue->drop_cb)
+					queue->drop_cb(removed_seq_num, removed_user, queue->drop_cb_user);
+			}
 		}
 
 		// empty, just shift to the seq_num
@@ -167,8 +179,11 @@ CHIAKI_EXPORT bool chiaki_reorder_queue_peek(ChiakiReorderQueue *queue, uint64_t
 	if(!entry->set)
 		return false;
 
-	*seq_num = seq_num_val;
-	*user = entry->user;
+	// either may be NULL, like in chiaki_reorder_queue_pull()
+	if(seq_num)
+		*seq_num = seq_num_val;
+	if(user)
+		*user = entry->user;
 	return true;
 }
 
