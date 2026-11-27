@@ -188,8 +188,9 @@ frames that are not copied to system memory, and `CHIAKI_FG_DEDUP=0`, fall back
 to judging by the frame size alone. `chiaki-duplicateframetest` (not built by
 default) runs the detector on synthetic 60, 45, 30, 20 fps and uneven scenes.
 
-The stats overlay shows two lines: *stream fps* (with the game's rate, e.g.
-`60 (game 30)`) and *display fps* (e.g. `120 (30 real + 90 FG)`). The log has
+The stats overlay shows *stream fps* (with the game's rate, e.g.
+`60 (game 30)`), *display fps* (e.g. `120 (30 real + 90 FG)`) and *latency*
+(see Latency below). The log has
 `Repeated pictures: judged from the decoded picture` and, every 10 s, a
 `[dedup]` line with the pictures, repeats dropped and gaps.
 Pick a multiplier whose output divides your refresh rate evenly (on 240 Hz:
@@ -197,10 +198,19 @@ Pick a multiplier whose output divides your refresh rate evenly (on 240 Hz:
 
 ## Latency
 
-Frame generation has to wait for the next stream frame before it can show the
-frames in between, so it adds about half a stream frame interval (≈8 ms at
-60 fps) plus a few milliseconds of GPU time. Turn it off for latency
-sensitive games.
+Frame generation has to wait for the next game picture before it can show the
+frames in between, and that real picture comes after them: it adds
+(multiplier − 1) / multiplier of a picture interval (60 fps: 2x ≈ 8 ms, 4x
+≈ 12.5 ms; a 30 fps game twice that) plus its GPU time. DLSS 5 and DLSS
+Super Resolution add their GPU time on top. Turn frame generation off for
+latency sensitive games.
+
+The stats overlay's *latency* line measures it: the time from the decoder
+handing a frame over to the present that shows its real picture, averaged over
+the last second with the maximum (e.g. `38 ms (max 45)`), Direct Mapping only.
+The network, the PS5's encoder and decoding are not in it. Every 10 s the log
+has a `[picture latency]` line (average, p50, p95, max, and the enhancements
+that ran), to compare settings.
 
 ## Limitations
 

@@ -43,7 +43,8 @@ DialogView {
             }
 
             Label {
-                text: Chiaki.session ? qsTr("stream %1 fps\ndisplay %2 fps").arg(Chiaki.window.streamFpsText).arg(Chiaki.window.displayFpsText) : ""
+                text: Chiaki.session ? qsTr("stream %1 fps\ndisplay %2 fps").arg(Chiaki.window.streamFpsText).arg(Chiaki.window.displayFpsText)
+                                       + (Chiaki.window.latencyText.length > 0 ? qsTr("\nlatency %1").arg(Chiaki.window.latencyText) : "") : ""
                 color: "#ffe082"
             }
 

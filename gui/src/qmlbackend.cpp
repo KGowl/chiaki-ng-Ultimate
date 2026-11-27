@@ -1111,6 +1111,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         ChiakiFfmpegFrame frame = chiaki_ffmpeg_decoder_pull_frame(decoder, &frames_lost);
         if (!frame.frame)
             return;
+        // Start of the decoded -> shown time in the stats overlay.
+        const qint64 pulled_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         logDecoderDeliveryStats(static_cast<qint64>(chiaki_time_now_monotonic_us()), frames_lost, frame.recovered);
         logDecoderFramePtsStats(static_cast<qint64>(chiaki_time_now_monotonic_us()), frame.pts, frame.duration);
         if (frame.recovered)
@@ -1135,8 +1137,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
 
         const qint64 delivery_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         QmlMainWindow *target_window = window;
-        QMetaObject::invokeMethod(target_window, [target_window, frame, frames_lost, delivery_us]() mutable {
-            target_window->presentFrame(frame, frames_lost, delivery_us);
+        QMetaObject::invokeMethod(target_window, [target_window, frame, frames_lost, delivery_us, pulled_us]() mutable {
+            target_window->presentFrame(frame, frames_lost, delivery_us, pulled_us);
         });
     });
 

@@ -513,6 +513,26 @@ Item {
                     }
                 }
 
+                // Decoded -> shown time of the real pictures (DLSS 5, DLSS SR, frame generation, pacing).
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    text: qsTr("latency")
+                    font.pixelSize: 15
+                    visible: Chiaki.session && Chiaki.window.latencyText.length > 0
+
+                    Label {
+                        anchors {
+                            right: parent.left
+                            baseline: parent.baseline
+                            rightMargin: 5
+                        }
+                        text: parent.visible ? Chiaki.window.latencyText : ""
+                        font.bold: true
+                        color: "#ce93d8"
+                        font.pixelSize: 18
+                    }
+                }
+
                 Label {
                     Layout.alignment: Qt.AlignRight
                     text: Chiaki.window.videoEnhancementStatus
