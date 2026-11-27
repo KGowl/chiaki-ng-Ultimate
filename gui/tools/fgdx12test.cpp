@@ -986,6 +986,7 @@ int runEval(Rig &rig, const std::string &dir, const std::string &out_dir, FrameG
         int index;
     };
     std::vector<Worst> worst;
+    double sum_static_bad = 0, sum_static_err = 0, sum_moving_bad = 0, sum_static_share = 0;
     double sum_fg_mae = 0, sum_fg_psnr = 0, sum_fg_art = 0, sum_fg_worse = 0, sum_rep_mae = 0, sum_rep_psnr = 0,
            sum_rep_art = 0, sum_blend_mae = 0, sum_blend_psnr = 0, sum_blend_art = 0, sum_real_mae = 0;
     int scored = 0, cuts = 0, failures = 0, warmup = 6, real_reads = 0;
@@ -1086,6 +1087,39 @@ int runEval(Rig &rig, const std::string &dir, const std::string &out_dir, FrameG
                 const EvalScore rep = evalScore(prev, truth, nullptr);
                 const EvalScore bl = evalScore(blend, truth, nullptr);
                 const EvalScore s = evalScore(got, truth, &rep);
+                // Static blocks (HUD, text, still parts): the same in the two real frames and in the truth. Any
+                // error there shows; the moving blocks are where interpolation has to work.
+                {
+                    const int bw = (w + 15) / 16, bh = (h + 15) / 16;
+                    std::vector<double> still(static_cast<size_t>(bw) * bh, 0.0);
+                    std::vector<int> cnt(still.size(), 0);
+                    for (int yy = 0; yy < h; yy++)
+                        for (int x = 0; x < w; x++) {
+                            const size_t i = static_cast<size_t>(yy) * w + x;
+                            const size_t b = static_cast<size_t>(yy / 16) * bw + x / 16;
+                            still[b] += std::max(std::fabs(prev.y[i] - real.y[i]), std::fabs(prev.y[i] - truth.y[i]));
+                            cnt[b]++;
+                        }
+                    int n_static = 0, bad_static = 0, n_moving = 0, bad_moving = 0;
+                    double err_static = 0.0;
+                    for (size_t b = 0; b < still.size(); b++) {
+                        const bool is_static = still[b] / std::max(cnt[b], 1) < 1.0;
+                        if (is_static) {
+                            n_static++;
+                            err_static += s.blocks[b];
+                            if (s.blocks[b] > 4.0f)
+                                bad_static++;
+                        } else {
+                            n_moving++;
+                            if (s.blocks[b] > 12.0f)
+                                bad_moving++;
+                        }
+                    }
+                    sum_static_bad += n_static ? 100.0 * bad_static / n_static : 0.0;
+                    sum_static_err += n_static ? err_static / n_static : 0.0;
+                    sum_moving_bad += n_moving ? 100.0 * bad_moving / n_moving : 0.0;
+                    sum_static_share += 100.0 * n_static / std::max<size_t>(still.size(), 1);
+                }
                 std::printf("frame %5d (t=%.2f): FG psnr %5.2f mae %5.2f art %5.2f%% worse %5.2f%% | repeat psnr %5.2f art %5.2f%% "
                             "| blend psnr %5.2f art %5.2f%%\n",
                             ti, t, s.psnr, s.mae, s.art, s.worse, rep.psnr, rep.art, bl.psnr, bl.art);
@@ -1144,6 +1178,9 @@ int runEval(Rig &rig, const std::string &dir, const std::string &out_dir, FrameG
     std::printf("-- FG      psnr %.2f dB, mae %.2f, art %.2f%% of blocks, worse than repeating %.2f%%\n", sum_fg_psnr / scored,
                 sum_fg_mae / scored, sum_fg_art / scored, sum_fg_worse / scored);
     std::printf("-- repeat  psnr %.2f dB, mae %.2f, art %.2f%%\n", sum_rep_psnr / scored, sum_rep_mae / scored, sum_rep_art / scored);
+    std::printf("-- FG static blocks (%.1f%% of the frame: HUD, text, still parts): mean error %.2f, %.2f%% off by more than 4; "
+                "moving blocks: %.2f%% off by more than 12\n",
+                sum_static_share / scored, sum_static_err / scored, sum_static_bad / scored, sum_moving_bad / scored);
     std::printf("-- blend   psnr %.2f dB, mae %.2f, art %.2f%%\n", sum_blend_psnr / scored, sum_blend_mae / scored,
                 sum_blend_art / scored);
     std::printf("-- worst frames (art + worse):");
