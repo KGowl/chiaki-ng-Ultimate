@@ -324,7 +324,7 @@ DialogView {
                 currentIndex: (Chiaki.settings.frameGenBackend === 1 || Chiaki.settings.frameGenBackend === 3 || Chiaki.settings.frameGenBackend === 4 || Chiaki.settings.frameGenBackend === 5) ? Chiaki.settings.frameGenMultiplier - 2 : 0
                 onActivated: index => Chiaki.settings.frameGenMultiplier = index + 2
                 ToolTip.visible: hovered
-                ToolTip.text: qsTr("Output frames per stream frame. FSR always uses 2x; the display refresh rate also limits it.")
+                ToolTip.text: qsTr("Output frames per game picture: a 30 fps game at 2x shows 60 fps. FSR always uses 2x; the display refresh rate also limits it.")
             }
 
             Label {
