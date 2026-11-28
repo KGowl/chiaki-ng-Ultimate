@@ -8441,20 +8441,21 @@ void QmlMainWindow::render()
         nr_out_h = static_cast<int>(lroundf(fabsf(pl_rect_h(out.crop))));
         nr_hdr = pl_color_space_is_hdr(&out.color);
     };
-    // How many frames frame generation makes per source picture: the multiplier asked for,
+    // How many frames frame generation makes per game picture: the multiplier asked for,
     // held back by the display. Also sets the status note on what the display holds back.
-    auto plan_fg_multiplier = [&](int cadence, double source_interval_s, double refresh_hz) {
+    // The setting counts per game picture, not per stream frame: 2x of a 30 fps game (every picture
+    // sent twice in a 60 fps stream, the repeats dropped) is 60 fps, 4x is 120 fps.
+    auto plan_fg_multiplier = [&](double source_interval_s, double refresh_hz) {
         // More output frames than the display can show only adds latency.
         const int refresh_cap = source_interval_s > 0.0
             ? static_cast<int>(std::floor(refresh_hz * source_interval_s + 0.15))
             : 2;
-        const int multiplier = qMin(rs.frame_gen_multiplier * cadence, refresh_cap);
+        const int multiplier = qMin(rs.frame_gen_multiplier, refresh_cap);
         // When the display holds back the multiplier asked for, the status says what it would take.
-        // Counted per source picture like the status's own number: 4x of a 30 fps stream needs 120 Hz.
-        // Never more than the backend can make (4 until it has started), so a half-rate source with 4x
-        // at 150 Hz, already at the backend's 4 per picture, gets no note.
+        // Counted per game picture like the status's own number: 4x of a 30 fps game needs 120 Hz.
+        // Never more than the backend can make (4 until it has started).
         const int fg_max_known = frame_gen && frame_gen->maxMultiplier() > 1 ? frame_gen->maxMultiplier() : 4;
-        const int fg_requested = qMin(rs.frame_gen_multiplier * cadence, fg_max_known);
+        const int fg_requested = qMin(rs.frame_gen_multiplier, fg_max_known);
         const bool fg_capped = refresh_cap < fg_requested && source_interval_s > 0.0;
         fg_status_requested.storeRelaxed(fg_capped ? fg_requested : 0);
         fg_status_needed_hz.storeRelaxed(fg_capped ? static_cast<int>(std::lround(fg_requested / source_interval_s)) : 0);
@@ -8468,7 +8469,7 @@ void QmlMainWindow::render()
         // The stream frames this picture stands for (more than one when repeats were dropped).
         const int cadence = direct_frame_gap;
         const double source_interval_s = stream_interval_s * cadence;
-        const int multiplier = qMin(plan_fg_multiplier(cadence, source_interval_s, refresh_rate),
+        const int multiplier = qMin(plan_fg_multiplier(source_interval_s, refresh_rate),
                                     frame_gen->maxMultiplier());
         const bool nr_on = nr_wanted && neural_render->ensureInitialized(placebo_vulkan);
         if (!nr_on) {
@@ -8662,12 +8663,11 @@ void QmlMainWindow::render()
     if (!fg_override && direct_frame_fresh && fg_run_backend > 0 && stream_active && direct_render_frame.num_planes > 0) {
         const auto backend_choice = static_cast<FrameGen::Backend>(fg_run_backend);
         // With repeats dropped a picture lasts `cadence` stream frames. The multiplier asked for counts per
-        // stream frame (the setting x cadence), so the output stays the setting's times the stream rate,
-        // but only up to the display's refresh rate and to frame generation's maxMultiplier() frames per
-        // picture (4): a 30 fps game (cadence 2) at 4x gets 4 frames per picture, 120 fps, not 240.
+        // game picture, whatever the cadence: a 30 fps game (cadence 2) gets 60 fps at 2x, 90 at 3x and
+        // 120 at 4x, up to the display's refresh rate and to frame generation's maxMultiplier().
         const int cadence = direct_frame_gap;
         const double source_interval_s = stream_interval_s * cadence;
-        int multiplier = plan_fg_multiplier(cadence, source_interval_s, refresh_rate);
+        int multiplier = plan_fg_multiplier(source_interval_s, refresh_rate);
         fg_refresh_limited = multiplier < 2;
         if (fg_refresh_limited && fg_skip_logged != 3) {
             fg_skip_logged = 3;
@@ -8710,7 +8710,7 @@ void QmlMainWindow::render()
                 fg_pending_real_decoded_us = direct_frame_decoded_us;
                 if (fg_active_multiplier == 1 || fg_logged_setting != rs.frame_gen_multiplier) {
                     fg_logged_setting = rs.frame_gen_multiplier;
-                    // The setting is per stream frame; what a picture gets is capped (see `cadence` above).
+                    // The setting is per game picture (see `cadence` above).
                     qCInfo(chiakiGui).nospace() << "Frame generation active: " << FrameGen::backendName(backend_choice)
                                       << " " << fg_logged_setting << "x set, game pictures only (now "
                                       << multiplier << " frames from a picture that stood for " << cadence
